@@ -1,0 +1,85 @@
+# CostGuard scorer + model-cost-extractor (both with default parameters),
+# wired for the kind-sim-multi stack that ipp_deploy.sh stands up.
+#
+# This file is the authoritative values file consumed by:
+#   ipp_benchmarking/tools/ipp_deploy.sh
+#
+# The plugin set below is the minimum group that must be configured together
+# with costguard for a working request pipeline:
+#
+#   body-field-to-header    -- lifts the JSON body's "model" field to the
+#                              X-Gateway-Model-Name header so downstream
+#                              routing can see it
+#   base-model-to-header    -- resolves BaseModel ConfigMaps (opt-125m/350m)
+#                              into the canonical base-model header
+#   model-selector          -- reads X-Gateway-Model-Name and expands the
+#                              request against the datastore's model set
+#   model-group-name-filter       -- narrows the candidate pool to the requested
+#                              model name (string-array semantics)
+#   costguard               -- the scorer under test; per-backend score
+#                              driven by cost + explore/exploit epochs
+#   max-score-picker        -- picks the highest-scoring backend from
+#                              costguard's output
+#   model-cost-extractor    -- extracts request-cost metadata (input/output
+#                              token counts, model name, pricing) that
+#                              costguard's epoch bookkeeping consumes
+#   model-config-datasource -- populates the datastore's model set from
+#                              /config/models.json (rendered below from
+#                              payloadProcessor.models via chart PR #277)
+#
+# The payloadProcessor.models block feeds model-config-datasource. Without
+# it, the pod CrashLoopBackOffs because modelsPath does not exist. Pricing
+# values are placeholders reflecting rough relative cost -- edit to match
+# real per-token prices when running realistic scenarios.
+payloadProcessor:
+  listModels:
+    - facebook/opt-125m
+    - facebook/opt-350m
+  customConfig:
+    plugins:
+    - type: body-field-to-header
+      parameters:
+        fieldName: model
+        headerName: X-Gateway-Model-Name
+    - type: base-model-to-header
+    - type: model-selector
+    - type: model-group-name-filter
+    - type: costguard
+    - type: max-score-picker
+    - type: model-cost-extractor
+    - type: model-config-datasource
+      parameters:
+        modelsPath: /config/models.json
+    profiles:
+    - name: default
+      plugins:
+        request:
+        - pluginRef: model-selector
+        - pluginRef: model-group-name-filter
+        - pluginRef: costguard
+          weight: 1.0
+        - pluginRef: max-score-picker
+        - pluginRef: body-field-to-header
+        - pluginRef: base-model-to-header
+    datalayer:
+      extractors:
+      - pluginRef: model-cost-extractor
+      datasources:
+      - pluginRef: model-config-datasource
+  # Rendered by chart PR #277 into /config/models.json inside the pod.
+  # model-config-datasource reads this to populate the datastore's model
+  # set; the two entries here mirror listModels above and the BaseModel
+  # ConfigMaps applied by ipp_deploy.sh.
+  models:
+    models:
+      - name: facebook/opt-125m
+        pricing:
+          inputPerMillion: 0.5
+          outputPerMillion: 1.5
+      - name: facebook/opt-350m
+        pricing:
+          inputPerMillion: 0.1
+          outputPerMillion: 0.3
+    groups:
+      - name: fast
+        models: [facebook/opt-125m, facebook/opt-350m]

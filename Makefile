@@ -332,3 +332,66 @@ print-project-name: ## Print the current project name
 .PHONY: install-hooks
 install-hooks: ## Install git hooks
 	git config core.hooksPath hooks
+
+##@ IPP simulation environment (Kind on Mac + Colima)
+
+# Sim environment defaults. Override on the make command line, e.g.:
+#   make sim-colima IPP_PATH=/path/to/llm-d-inference-payload-processor NAMESPACE=my-ns
+#
+# IPP_PATH is required by ipp-deploy. The rest have sane defaults that match
+# what mac_colima_bootstrap.sh + ipp_deploy.sh set internally.
+SIM_KIND_CLUSTER_NAME ?= ipp-e2e
+SIM_NAMESPACE         ?= llmdbench
+SIM_SPEC              ?= cicd/kind-sim-multi
+SIM_RELEASE           ?= payload-processor
+
+# Full simulation environment (bootstrap + IPP deploy) as one command.
+# End state: Colima up, kind cluster stood up with two asymmetric sim stacks
+# (opt-125m slow, opt-350m fast), CostGuard IPP installed and Ready, HTTPRoutes
+# in place -- ready to receive traffic from `llmdbenchmark run`.
+.PHONY: sim-colima
+sim-colima: bootstrap-colima ipp-deploy ## Set up a full simulation environment for IPP on Kind on Mac with Colima
+	@echo "✅ sim-colima: full simulation environment is ready in ns/$(SIM_NAMESPACE)."
+
+# Bootstrap Colima, the kind cluster, and both sim stacks (opt-125m + opt-350m).
+# Idempotent -- re-running skips work that's already done. Does NOT install IPP;
+# that's the ipp-deploy step below.
+.PHONY: bootstrap-colima
+bootstrap-colima: ## Set up Colima, Kind cluster, and simulators
+	@printf "\033[33;1m==== Running mac_colima_bootstrap.sh ====\033[0m\n"
+	KIND_CLUSTER_NAME=$(SIM_KIND_CLUSTER_NAME) NAMESPACE=$(SIM_NAMESPACE) \
+	  ./ipp_benchmarking/tools/mac_colima_bootstrap.sh
+
+# Install IPP into the already-stood-up namespace via ipp_deploy.sh (builds the
+# IPP image from $$IPP_PATH, side-loads it into kind, helm-installs the chart
+# with CostGuard values). Requires IPP_PATH to point at a checkout of
+# llm-d-inference-payload-processor.
+.PHONY: ipp-deploy
+ipp-deploy: ## Install IPP (builds image from $$IPP_PATH, helm-installs the chart with CostGuard values)
+	@printf "\033[33;1m==== Running ipp_deploy.sh ====\033[0m\n"
+	@if [ -z "$$IPP_PATH" ]; then \
+	  echo "❌ IPP_PATH is unset. Export it, e.g.: export IPP_PATH=/path/to/llm-d-inference-payload-processor"; \
+	  exit 1; \
+	fi
+	KIND_CLUSTER_NAME=$(SIM_KIND_CLUSTER_NAME) NAMESPACE=$(SIM_NAMESPACE) RELEASE=$(SIM_RELEASE) \
+	  ./ipp_benchmarking/tools/ipp_deploy.sh
+
+# Undeploy IPP (Helm release only). Leaves the sim standup and Colima/kind
+# alive so a re-deploy is fast. Use `make tear-down-sim` for a full wipe.
+.PHONY: ipp-undeploy
+ipp-undeploy: ## Undeploy IPP (helm uninstall of the payload-processor release)
+	@printf "\033[33;1m==== Uninstalling IPP release $(SIM_RELEASE) from ns/$(SIM_NAMESPACE) ====\033[0m\n"
+	-helm uninstall $(SIM_RELEASE) -n $(SIM_NAMESPACE)
+
+# Full teardown of everything sim-colima brought up: IPP release, sim stacks
+# (via llmdbenchmark teardown), kind cluster, and Colima VM (stopped, not
+# deleted -- run `colima delete default` if you also want to reclaim the
+# ~45GB VM disk).
+.PHONY: tear-down-sim
+tear-down-sim: ## Remove the full environment set up by sim-colima
+	@printf "\033[33;1m==== Tearing down the full sim environment ====\033[0m\n"
+	-helm uninstall $(SIM_RELEASE) -n $(SIM_NAMESPACE)
+	-llmdbenchmark --spec $(SIM_SPEC) teardown -p $(SIM_NAMESPACE)
+	-kind delete cluster --name $(SIM_KIND_CLUSTER_NAME)
+	-colima stop
+	@echo "✅ tear-down-sim: environment removed. Colima VM disk retained under ~/.colima -- run 'colima delete default' to reclaim it."
