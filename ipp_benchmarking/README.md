@@ -100,6 +100,134 @@ helm uninstall payload-processor -n llmdbench               # IPP isn't torn dow
 
 ---
 
+## Mac + Colima quick-start (CostGuard)
+
+Same `cicd/kind-sim-multi` scenario as `# A` above, but on macOS via
+[Colima](https://github.com/abiosoft/colima). Docker-for-Mac substitutes work
+too, but Colima is what this path is tested on. The cluster side needs three
+extras that plain-Docker Linux gets for free — MetalLB to give the Istio
+Gateway a real IP, a static route from the Mac into the Colima VM so that IP
+is reachable, and an iptables `FORWARD` rule inside the VM. The bootstrap
+script below sets all of that up, then runs `llmdbenchmark ... standup` and
+patches the two sims so they have **asymmetric latency and completion-token
+output** (opt-125m: TTFT 3s, ITL 200ms, max-tokens 512; opt-350m: TTFT 1s,
+ITL 50ms, max-tokens 64). That asymmetry is the routing decision the
+[CostGuard](https://github.com/kubernetes-sigs/gateway-api-inference-extension/)
+picker is being evaluated on: one backend is slower **and** produces more
+completion tokens per response than the other.
+
+**Prereqs (Homebrew):** `colima`, `docker` CLI, `kind`, `kubectl`, `helm`,
+`bash 4+`, `sudo` for the route add. Pinned versions the script drives:
+kind node `v1.34.0`, MetalLB `v0.15.2`, benchmark image `v0.7.0`, sim `v0.8.2`.
+
+```bash
+./ipp_benchmarking/tools/mac_colima_bootstrap.sh
+```
+
+The script is idempotent — re-running skips Colima/kind/MetalLB steps that
+are already done. Pass `--skip-standup` to only refresh the cluster/MetalLB
+side without re-running `llmdbenchmark standup`. On completion it prints the
+Gateway's MetalLB IP, a smoke-test `curl` line, and the exact `helm upgrade`
+block to run next.
+
+What the script leaves ready: Colima up, single-node kind cluster,
+MetalLB with a pool in the kind Docker-network CIDR (last-octet .200–.250),
+the `cicd/kind-sim-multi` stack stood up in namespace `llmdbench` with two
+`InferencePool`s + two header-match `HTTPRoute`s (created via
+`gen_httproutes.sh` as a fallback for the modelservice chart), and both
+decode sims patched with the asymmetric flags above. **IPP is not
+installed** — that's the CostGuard step below.
+
+Install IPP with your CostGuard values file:
+
+```bash
+export IPP_PATH=/path/to/llm-d-inference-payload-processor
+./ipp_benchmarking/tools/ipp_deploy.sh
+```
+
+`ipp_deploy.sh` builds the IPP image from `$IPP_PATH` (`make image-kind`),
+side-loads it into the kind node, and helm-installs the chart with the
+default CostGuard values file at
+[`ipp_configs/kind-costguard/costguard-kind-values.yaml`](./ipp_configs/kind-costguard/costguard-kind-values.yaml).
+That file wires the `costguard` scorer + `model-cost-extractor` extractor
++ `model-config-datasource` populated from a `payloadProcessor.models`
+block (rendered as `/config/models.json` inside the pod). See the file
+for tunable pricing values.
+
+Run + collect + teardown:
+
+```bash
+llmdbenchmark --spec cicd/kind-sim-multi run -l inference-perf -w sanity_random.yaml
+NAMESPACE=llmdbench ./ipp_benchmarking/collect_logs.sh
+helm uninstall payload-processor -n llmdbench
+llmdbenchmark --spec cicd/kind-sim-multi teardown -p llmdbench
+```
+
+Or use the `Makefile` targets: `make sim-colima IPP_PATH=...` runs
+bootstrap + deploy in one shot; `make tear-down-sim` wipes everything.
+
+**Exercising the CostGuard cost signal (large `max_tokens`).** The upstream
+`sanity_random.yaml` profile is a generic smoke test — it samples
+`max_tokens ~ N(mean=50, max=100)`, which is small enough that
+`llm-d-inference-sim` frequently falls back to its default
+`Gaussian(mean=40, sd=20)` output length. Both sims then produce ~identical
+responses, the deliberate `--max-model-len` asymmetry described above
+(opt-125m len=512 vs opt-350m len=64) never materializes on the wire, and
+CostGuard has no cost delta to score against. To force the asymmetry into
+per-request metrics, use the dedicated profile shipped alongside CostGuard:
+
+```bash
+llmdbenchmark --spec cicd/kind-sim-multi run \
+  -l inference-perf -w kind-costguard-large-tokens.yaml
+NAMESPACE=llmdbench ./ipp_benchmarking/collect_logs.sh
+```
+
+The profile
+([`workload/profiles/inference-perf/kind-costguard-large-tokens.yaml.in`](./workload/profiles/inference-perf/kind-costguard-large-tokens.yaml.in))
+pins client-side `max_tokens=512` (via `data.output_distribution` with
+`std_dev=0`) so opt-125m runs to its 512-token cap while opt-350m's server-side
+`--max-model-len=64` truncates output to ~48 tokens — two clean output-length
+modes, deterministically. Input is pinned tiny (`mean=16`) to keep
+`input_len + max_tokens` clear of opt-350m's model-length ceiling; if
+`input_len` exceeded the cap the 350m stack would reject requests entirely
+rather than truncate, which would *mask* the asymmetry rather than expose it.
+`model_name` is a JSON-array-encoded string (`'["facebook/opt-125m","facebook/opt-350m"]'`),
+so IPP's `model-group-name-filter` treats both as candidates and hands the routing
+decision to the CostGuard scorer — a single-model `model_name` would pin
+routing and defeat the test. `api.type: completion` means the wire field is
+OpenAI's `max_tokens` (not `max_completion_tokens`, which is the
+`chat/completions` field), and `ignore_eos: true` prevents small models from
+stopping early regardless of the client cap. Successful runs should show two
+distinct output-length clusters in
+`per_request_lifecycle_metrics.json` (~512 tokens for opt-125m routes, ~48 for
+opt-350m routes) and non-trivial per-request cost deltas in the
+`payload-processor` pod logs.
+
+Note: `-o "max_tokens=512"` on the `llmdbenchmark run` command line **does not
+work** for inference-perf profiles — the override walker only writes to keys
+whose parent dict already exists, and inference-perf has no top-level
+`max_tokens`. Authoring a dedicated profile (as above) is the correct path;
+the equivalent dotted overrides would be
+`-o "data.output_distribution.mean=512,data.output_distribution.min=512,data.output_distribution.max=512,data.output_distribution.std_dev=0"`.
+
+**Mac-specific gotchas.**
+
++ The `sudo route add` in the script will prompt for your password once.
++ If Colima was already running the script does **not** restart it — it
+  reuses the running VM. If you want a clean-slate Colima VM, run
+  `colima stop && colima delete default` first.
++ The MetalLB pool is derived from `docker network inspect kind`. The kind
+  network CIDR is stable across cluster re-creates on the same host, but if
+  you `docker network prune` between runs the pool will shift; re-run the
+  script to reconfigure.
++ IPP config changes don't restart the pod (chart has no ConfigMap checksum
+  annotation) — after a `helm upgrade` that only changes `customConfig` or
+  `listModels`, run
+  `kubectl rollout restart deploy/payload-processor -n llmdbench` and
+  verify the new pod picked it up: `kubectl logs <new-pod> | grep "Loaded raw configuration"`.
+
+---
+
 # B. OpenShift (real GPUs)
 
 Prereqs: `oc whoami` works, ≥2 nodes with `NVIDIA-H100-80GB-HBM3`, NVIDIA GPU
@@ -189,6 +317,41 @@ Compare with the plot tools (in `ipp_benchmarking/tools/`), passing
 `collected-logs-<N>/gpu-dcgm/`. Plot with `ipp_benchmarking/tools/query_gpu_utilization.py`;
 compute MFU with `ipp_benchmarking/tools/compute_mfu.py`. (Dense = compute-bound,
 MoE = memory-bound — see AGENTS.md.)
+
+## OpenShift A/B: smart routing vs static single-model baselines (ocp-qwen3-8b-32b)
+
+Alternate OCP scenario `cicd/ocp-qwen3-8b-32b`, orchestrated by
+`tools/ab_routing_run.sh`.
+
+**One script, one run at a time.** `tools/ab_routing_run.sh <arm> <ipp_values_file>
+[profile]` runs exactly one thing per invocation — it patches the values file's
+routing config into the IPP, restarts, runs the given profile (no planner, so the
+decision log is clean), streams the **full IPP log** live to `ipp-full-live.log`
+(so per-request predicted/actual TTFT survives the kubelet's container-log
+rotation, which at `v=4` under load drops early stages within minutes), then
+collects logs + the slim extract. The A/B is three such runs:
+
+- **static baselines** — register **only one model** (the values file's `listModels`
+  has a single entry, so there is no routing choice) and drive its **half-conc**
+  profile. `static-8b-only-values.yaml` + `half_8b.yaml` and
+  `static-32b-only-values.yaml` + `half_32b.yaml`, each C=25→275→25 so that
+  **8B@C/2 + 32B@C/2 sums to the smart run's full C**. The static split has no spill
+  path: when the 8B leg saturates there is nowhere to offload.
+- **smart** (`median-ttft-ocp-values.yaml`, **both** models registered, **no**
+  `model-group-name-filter` so `sweep_8stage`'s single-string `model_name` lets the
+  model-selector pick from both `listModels`): `queue-ttft-scorer` (predicts
+  per-request TTFT under load via the `ttft-percentile-extractor`, routes to the
+  lowest predicted TTFT, with `explorationRate: 0.1`) + `max-score-picker` keeps
+  most traffic on the fast 8B and offloads overflow to the 32B as load climbs.
+  Drives the full `sweep_8stage.yaml` (C=50→550→50, 11 stages, ~43k reqs,
+  ~5 min/stage; the symmetric up/down legs expose routing hysteresis). Needs an
+  IPP image built with the queue-ttft-scorer (set its tag in step 2). For the
+  avg-ttft scorer instead, swap in `avgttft-ocp-values.yaml` (also no filter).
+
+All timeouts are lifted (route + client `request_timeout` to 1200s, ext-proc
+`messageTimeout` to 1200s) so nothing is shed — the delta is latency/throughput,
+not failures. Smart keeps **85–96%** of load on the fast 8B and spills overflow
+to the 32B; the static split cannot.
 
 ---
 

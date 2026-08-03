@@ -1,0 +1,39 @@
+# A/B summarizer workload (the crawl phase). Offers BOTH models via the JSON-array
+# string -> the IPP model-group-name-filter treats it as "choose among", and the scorer
+# (latency arm) or random-picker (baseline arm) decides 8B vs 32B per request.
+#
+# Concurrency ramp starting at 100, +50/stage. The stage list below is a PLACEHOLDER
+# centered on a guessed K_small ~= 100-150; after running summarization_calibrate_8b,
+# reset these so they straddle the real knee (~0.5x K_small up to ~2-3x K_small) so
+# the 8B saturates and overflow onto the idle 32B is visible.
+load:
+  type: concurrent
+  interval: 15
+  request_timeout: 1200        # no client-side cap; with the route timeout lifted, requests complete instead of being shed
+  stages:
+  - {concurrency_level: 100, num_requests: 400}
+  - {concurrency_level: 200, num_requests: 800}
+  - {concurrency_level: 300, num_requests: 1200}
+  - {concurrency_level: 400, num_requests: 1600}
+  - {concurrency_level: 500, num_requests: 2000}
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  # "Choose among these": JSON-array-encoded string for the model-group-name-filter.
+  # For a single-model pinned baseline instead, replace with: "Qwen/Qwen3-8B".
+  model_name: '["Qwen/Qwen3-8B","Qwen/Qwen3-32B"]'
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  pretrained_model_name_or_path: Qwen/Qwen3-8B
+data:
+  type: random
+  # Page-summarization shape: ~2048 in (max 4096) / ~256 out.
+  input_distribution:  {min: 1024, max: 4096, mean: 2048, std_dev: 512, total_count: 200}
+  output_distribution: {min: 128,  max: 512,  mean: 256,  std_dev: 64,  total_count: 200}
+report:
+  request_lifecycle: {summary: true, per_stage: true, per_request: true}
+storage:
+  local_storage: {path: /workspace}

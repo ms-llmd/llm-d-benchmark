@@ -687,8 +687,30 @@ install_yq_mac()       { brew install yq; }
 # enforce loop re-verifies the resulting version >= the pin and fails loud
 # otherwise. macOS uses Homebrew (not pinned tarballs like Linux) because
 # Homebrew owns the PATH/prefix here and brew stable already tracks the pins.
-install_helmfile_mac() { brew install helmfile 2>/dev/null || true; brew upgrade helmfile 2>/dev/null || true; }
-install_helm_mac()     { brew install helm 2>/dev/null || true; brew upgrade helm 2>/dev/null || true; }
+# Pin helm to v3 on macOS. `brew install helmfile` pulls the current `helm`
+# formula as a dependency, which since 2026 is v4.x -- but helm-diff v3.13.0
+# (the pinned helm plugin the llm-d Istio helmfile invokes) still passes
+# `--validate` to `helm diff upgrade` and dies on v4 with:
+#   Error: Failed to render chart: exit status 1: Flag --validate has been deprecated
+# Installing the keg-only helm@3 formula and force-linking it over any v4 that
+# helmfile drags in keeps helm on v3 without blocking the helmfile upgrade.
+install_helmfile_mac() {
+  brew install helmfile 2>/dev/null || true
+  brew upgrade helmfile 2>/dev/null || true
+  _mac_pin_helm_v3
+}
+install_helm_mac() {
+  # Do NOT install the unversioned `helm` formula on mac -- it tracks v4 and
+  # breaks helm-diff. Install helm@3 and link it as `helm` instead.
+  _mac_pin_helm_v3
+}
+_mac_pin_helm_v3() {
+  brew install helm@3 2>/dev/null || true
+  # If the unversioned `helm` formula is currently linked (v4), unlink it so
+  # helm@3 can claim the /opt/homebrew/bin/helm symlink.
+  brew unlink helm 2>/dev/null || true
+  brew link --overwrite --force helm@3 2>/dev/null || true
+}
 install_kubectl_mac()  { brew install kubectl; }
 install_oc_mac()       { brew install openshift-cli; }
 install_kustomize_mac(){ brew install kustomize; }

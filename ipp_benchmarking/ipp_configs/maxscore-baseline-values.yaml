@@ -1,3 +1,9 @@
+# Load-blind A/B baseline: max-score-picker with NO scorer (the maxScoreOnly image).
+# With no scorer feeding scores, the picker is blind to per-backend latency/load —
+# it cannot offload away from a saturating model. This is the control the PR #46
+# inflight-aware avg-ttft scorer is measured against (mirrors the "random / load-blind"
+# baseline panel in benchmark_story_4.html).
+# model-group-name-filter is kept so the string-array model_name is interpreted as "choose among".
 payloadProcessor:
   listModels:
     - facebook/opt-125m
@@ -11,10 +17,7 @@ payloadProcessor:
     - type: base-model-to-header
     - type: model-selector
     - type: model-group-name-filter
-    - type: avg-ttft-scorer
-    - type: inflight-requests-scorer
     - type: max-score-picker
-    - type: request-metadata-extractor
     - type: model-config-datasource
       parameters:
         modelsPath: /config/models.json
@@ -24,18 +27,9 @@ payloadProcessor:
         request:
         - pluginRef: model-selector
         - pluginRef: model-group-name-filter
-        - pluginRef: avg-ttft-scorer
-          weight: 1.0
-        # Inflight count updates at request time (no EMA lag): each pick
-        # immediately lowers the picked model's next score, damping the
-        # winner-take-all stampedes seen with avg-ttft alone.
-        - pluginRef: inflight-requests-scorer
-          weight: 1.0
         - pluginRef: max-score-picker
         - pluginRef: body-field-to-header
         - pluginRef: base-model-to-header
     datalayer:
-      extractors:
-      - pluginRef: request-metadata-extractor
       datasources:
       - pluginRef: model-config-datasource

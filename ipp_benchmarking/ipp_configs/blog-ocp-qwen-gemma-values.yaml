@@ -1,5 +1,5 @@
 # IPP helm values for the latency-blog benchmark on ocp-qwen-gemma-multi.
-# Same pipeline validated on Kind (avgttft-blog-values.yaml): model-name-filter
+# Same pipeline validated on Kind (avgttft-blog-values.yaml): model-group-name-filter
 # + avg-ttft/inflight blended scoring + max-score picker.
 payloadProcessor:
   listModels:
@@ -13,7 +13,7 @@ payloadProcessor:
         headerName: X-Gateway-Model-Name
     - type: base-model-to-header
     - type: model-selector
-    - type: model-name-filter
+    - type: model-group-name-filter
     - type: avg-ttft-scorer
     - type: inflight-requests-scorer
     - type: max-score-picker
@@ -26,7 +26,7 @@ payloadProcessor:
       plugins:
         request:
         - pluginRef: model-selector
-        - pluginRef: model-name-filter
+        - pluginRef: model-group-name-filter
         - pluginRef: avg-ttft-scorer
           weight: 1.0
         # Per-request negative feedback; damps the winner-take-all stampedes

@@ -9,6 +9,13 @@
 #     HTTPRoute A: X-Gateway-Base-Model-Name: Qwen/Qwen3-8B          -> InferencePool A (small/fast)
 #     HTTPRoute B: X-Gateway-Base-Model-Name: Qwen/Qwen3-32B  -> InferencePool B (big/slow)
 #
+# Story: a deep-research agent runs the 8B hundreds of times per task (summarize each
+# crawled page: long-in/short-out) and the 32B only twice (plan + synthesize). The IPP
+# latency scorer routes summarization OVERFLOW onto the idle 32B when the 8B TTFT spikes.
+# The model-group-name-filter does the gating: planner requests name "Qwen/Qwen3-32B" (pinned
+# big-only); summarizer requests name the JSON array ["Qwen/Qwen3-8B","Qwen/Qwen3-32B"]
+# ("choose among" -> scorer/picker decides).
+#
 # BIG MODEL: the user story says "Gemma 4 31B"; this scenario uses
 # Qwen/Qwen3-32B (the originally intended google/gemma-3-27b-it is a gated
 # HF repo — 403 unless the HF_TOKEN account accepted the license). To swap,
