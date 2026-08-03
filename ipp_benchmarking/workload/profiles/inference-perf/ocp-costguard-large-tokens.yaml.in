@@ -1,0 +1,128 @@
+# ocp-costguard-large-tokens
+#
+# Companion workload profile for the OCP CostGuard evaluation
+# (values file: ipp_configs/ocp-costguard/costguard-ocp-values.yaml).
+#
+# Pins per-request output at 1024 tokens so the pricing-only asymmetry
+# baked into the OCP values file becomes a deterministic per-request cost
+# delta CostGuard can score against.
+#
+# Contrast with the kind sibling profile:
+#
+#   kind-costguard-large-tokens.yaml.in exploits --max-model-len asymmetry
+#   between opt-125m (len=512) and opt-350m (len=64) to force divergent
+#   OUTPUT LENGTHS between the two backends. That approach does not work
+#   on OCP because AGENTS.md #2 requires both Qwen decode pods to run with
+#   --max-model-len=8192 (Qwen3-32B crash-loops otherwise). Both models
+#   therefore emit the same number of output tokens for any given
+#   max_tokens value.
+#
+#   This profile instead relies on the pricing table in
+#   costguard-ocp-values.yaml (Qwen3-8B: $1.2 / 1M output tokens;
+#   Qwen3-32B: $6.4 / 1M output tokens). With output pinned at 1024
+#   tokens the per-request cost delta is:
+#
+#     Qwen3-8B  cost = 1024 * 1.2  / 1_000_000 = $0.00123
+#     Qwen3-32B cost = 1024 * 6.4  / 1_000_000 = $0.00655
+#
+#   ~5.3x cost ratio, driven entirely by pricing x output-token count.
+#
+# Design choices baked in below (mirroring the kind sibling profile's
+# structure; only the numeric shapes and model ids differ):
+#
+# 1. output_distribution pinned at 1024 with std_dev=0. Deterministic
+#    output length so the per-request dollar delta is constant across
+#    requests. Nonzero std_dev would spread the cost signal and reintroduce
+#    noise CostGuard has to average out.
+#
+# 2. input_distribution pinned at 512 with std_dev=0. Summarization-shaped
+#    prompt (deep-research summarizer story: long-in, short-out is served
+#    by both models). 512 + 1024 = 1536, well under both models'
+#    max-model-len=8192, so neither model truncates.
+#
+# 3. ignore_eos: true. Without it a small model can EOS early and the
+#    output-token count collapses back to something smaller than the client
+#    max_tokens cap, muting the cost delta.
+#
+# 4. model_name is a JSON-array-encoded string so IPP's
+#    model-group-name-filter treats it as "choose among {Qwen3-8B,Qwen3-32B}"
+#    and hands the decision to the CostGuard scorer -- which is exactly the
+#    code path we need to exercise. A single scalar model_name would pin
+#    routing and defeat the test.
+#
+# 5. api.type: completion -> hits /v1/completions -> wire field is
+#    `max_tokens` (not `max_completion_tokens`, which is the
+#    /v1/chat/completions field). inference-perf sends `max_tokens` iff
+#    data.output_distribution is set.
+#
+# 6. Low load (rate: 1 rps, 60s). This profile is a signal-verification
+#    tool, not a saturation test -- it exists to confirm CostGuard produces
+#    non-trivial cost deltas and routes traffic accordingly. Ramp separately
+#    with a concurrency profile if you want to see how CostGuard responds
+#    under load.
+#
+# Runbook:
+#   export NAMESPACE=llm-d-<you>
+#   llmdbenchmark --spec cicd/ocp-qwen-gemma-multi run \
+#     -l inference-perf -w ocp-costguard-large-tokens.yaml -p "$NAMESPACE"
+#   NAMESPACE="$NAMESPACE" ./ipp_benchmarking/collect_logs.sh
+#
+# Expected artifacts (in the collected results dir):
+#   * per_request_lifecycle_metrics.json shows output_tokens ~= 1024 for
+#     every request (both models honor the client cap), and the `model` field
+#     alternates between Qwen/Qwen3-8B and Qwen/Qwen3-32B based on
+#     CostGuard's per-request scoring.
+#   * payload-processor pod logs show costguard scoring decisions with
+#     ~5x cost deltas between the two model routes.
+load:
+  type: constant
+  stages:
+  - rate: 1
+    duration: 60
+  request_timeout: 60
+  num_workers: 1
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  # "Choose among these": JSON-array-encoded string for model-group-name-filter.
+  # Both Qwen decode pods must be up (standup via cicd/ocp-qwen-gemma-multi).
+  # If you only want to smoke one stack, replace with "Qwen/Qwen3-8B" -- but
+  # then CostGuard has no choice to make and the profile stops testing
+  # anything.
+  model_name: '["Qwen/Qwen3-8B","Qwen/Qwen3-32B"]'
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  # Qwen3-8B and Qwen3-32B share a tokenizer family; the 8B tokenizer is
+  # cheaper to load client-side inside inference-perf. Not routing-relevant --
+  # the tokenizer runs on the client to build synthetic prompts.
+  pretrained_model_name_or_path: Qwen/Qwen3-8B
+data:
+  type: random
+  # Pinned so input_len is deterministic. Summarization-shape (~512 in),
+  # comfortably under 8192 with 1024 output tokens on top.
+  input_distribution:
+    min: 512
+    max: 512
+    mean: 512
+    std_dev: 0
+    total_count: 60
+  # Pinned at 1024 so per-request output-token count is constant. Combined
+  # with the pricing table in costguard-ocp-values.yaml this produces a
+  # deterministic ~$0.005 cost delta between Qwen3-8B and Qwen3-32B routes.
+  output_distribution:
+    min: 1024
+    max: 1024
+    mean: 1024
+    std_dev: 0
+    total_count: 60
+report:
+  request_lifecycle:
+    summary: true
+    per_stage: true
+    per_request: true
+storage:
+  local_storage:
+    path: /workspace

@@ -1,0 +1,100 @@
+# CostGuard scorer + model-cost-extractor (both with default parameters),
+# wired for the OCP `cicd/ocp-qwen-gemma-multi` scenario (Qwen3-8B + Qwen3-32B
+# on H100-80GB).
+#
+# This file is the authoritative values file consumed by:
+#   ipp_benchmarking/tools/ipp_deploy_ocp.sh
+#
+# The plugin set below MIRRORS the kind CostGuard values file at
+#   ipp_benchmarking/ipp_configs/kind-costguard/costguard-kind-values.yaml
+# byte-for-byte in `customConfig` -- only listModels and payloadProcessor.models
+# differ. Do not diverge the plugin ordering; the request pipeline sequence
+# (model-selector -> model-group-name-filter -> costguard -> max-score-picker
+# -> body-field-to-header -> base-model-to-header) is what CostGuard was
+# designed against.
+#
+# Asymmetry model: pricing-only (option A).
+# ------------------------------------------
+# The kind path leans on --max-model-len asymmetry (opt-125m len=512 vs
+# opt-350m len=64) so that a large client max_tokens produces a truncation
+# delta CostGuard can score. On OCP both Qwen decode pods run with the same
+# --max-model-len 8192 (per AGENTS.md must-do #2), so we CANNOT rely on
+# truncation asymmetry -- both models will return whatever token count the
+# client asked for.
+#
+# Instead the cost signal is driven entirely by the pricing table below:
+#
+#   Qwen3-8B  (Qwen-Plus tier):  $0.4 in / $1.2 out per million tokens
+#   Qwen3-32B (Qwen-Max  tier):  $1.6 in / $6.4 out per million tokens
+#
+# Ratio: ~4x on input, ~5.3x on output. At 1024 output tokens per request
+# (the shape the paired workload profile pins), that's:
+#
+#   Qwen3-8B  cost = 1024 * 1.2  / 1_000_000 = $0.00123 per request
+#   Qwen3-32B cost = 1024 * 6.4  / 1_000_000 = $0.00655 per request
+#
+# A ~5x cost delta is large enough that CostGuard's [0, 1] per-backend score
+# will differentiate cleanly and pick the cheaper backend when quality
+# constraints don't force a route to the more expensive model.
+#
+# Pricing source: public Alibaba Cloud Model Studio (DashScope) API rates for
+# Qwen-Plus and Qwen-Max at time of authoring. If you want to use internal
+# per-token costs derived from $/GPU-hour, swap the four fields below and
+# leave the rest of the file alone.
+payloadProcessor:
+  listModels:
+    - Qwen/Qwen3-8B
+    - Qwen/Qwen3-32B
+  customConfig:
+    plugins:
+    - type: body-field-to-header
+      parameters:
+        fieldName: model
+        headerName: X-Gateway-Model-Name
+    - type: base-model-to-header
+    - type: model-selector
+    - type: model-group-name-filter
+    - type: costguard
+    - type: max-score-picker
+    - type: model-cost-extractor
+    - type: model-config-datasource
+      parameters:
+        modelsPath: /config/models.json
+    profiles:
+    - name: default
+      plugins:
+        request:
+        - pluginRef: model-selector
+        - pluginRef: model-group-name-filter
+        - pluginRef: costguard
+          weight: 1.0
+        - pluginRef: max-score-picker
+        - pluginRef: body-field-to-header
+        - pluginRef: base-model-to-header
+    datalayer:
+      extractors:
+      - pluginRef: model-cost-extractor
+      datasources:
+      - pluginRef: model-config-datasource
+  # Rendered by the chart into /config/models.json inside the pod.
+  # model-config-datasource reads this to populate the datastore's model
+  # set; the two entries here mirror listModels above and the BaseModel
+  # ConfigMaps applied by ipp_deploy_ocp.sh (Phase D).
+  #
+  # Pricing values are DashScope-anchored (Qwen-Plus + Qwen-Max tiers) --
+  # see the header of this file for the source and the derivation. To swap
+  # in internal $/GPU-hour-derived numbers, replace inputPerMillion and
+  # outputPerMillion below; do not change the plugin block above.
+  models:
+    models:
+      - name: Qwen/Qwen3-8B
+        pricing:
+          inputPerMillion: 0.4
+          outputPerMillion: 1.2
+      - name: Qwen/Qwen3-32B
+        pricing:
+          inputPerMillion: 1.6
+          outputPerMillion: 6.4
+    groups:
+      - name: qwen3
+        models: [Qwen/Qwen3-8B, Qwen/Qwen3-32B]

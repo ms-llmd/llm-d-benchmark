@@ -395,3 +395,93 @@ tear-down-sim: ## Remove the full environment set up by sim-colima
 	-kind delete cluster --name $(SIM_KIND_CLUSTER_NAME)
 	-colima stop
 	@echo "✅ tear-down-sim: environment removed. Colima VM disk retained under ~/.colima -- run 'colima delete default' to reclaim it."
+
+##@ IPP OCP environment (real Qwen models on H100-80GB)
+
+# OCP CostGuard evaluation environment. No simulators are deployed here --
+# real Qwen3-8B + Qwen3-32B on real H100-80GB GPUs, standup driven by
+# llmdbenchmark's `cicd/ocp-qwen-gemma-multi` scenario, IPP deploy driven by
+# ipp_benchmarking/tools/ipp_deploy_ocp.sh.
+#
+# OCP_NAMESPACE has NO default -- it must be set explicitly on the command
+# line because OpenShift projects are typically per-user (e.g. llm-d-<you>).
+# Override the rest as needed:
+#   make env-ocp OCP_NAMESPACE=llm-d-<you> \
+#     IPP_PATH=/path/to/llm-d-inference-payload-processor \
+#     IPP_IMAGE_REPO=ghcr.io/<you>/llm-d-inference-payload-processor \
+#     IPP_IMAGE_TAG=costguard
+#
+# Prereqs: `oc login <cluster>` is complete, `$$HF_TOKEN` is set, the IPP
+# image at $$IPP_IMAGE_REPO:$$IPP_IMAGE_TAG is already pushed to a registry
+# the OCP cluster can pull from (build + push with `make image-build` +
+# `docker push` in the IPP repo checkout). See
+# ipp_benchmarking/ipp_configs/ocp-costguard/README.md for the full runbook.
+OCP_SPEC        ?= cicd/ocp-qwen-gemma-multi
+OCP_RELEASE     ?= payload-processor
+# OCP_NAMESPACE has no default on purpose -- fail loud if it's not set.
+
+# Guard used by every OCP target: fails immediately if OCP_NAMESPACE is unset.
+# `origin` is "undefined" for variables that were never assigned (either
+# explicitly or with `?=`).
+_require-ocp-namespace:
+	@if [ "$(origin OCP_NAMESPACE)" = "undefined" ] || [ -z "$(OCP_NAMESPACE)" ]; then \
+	  echo "❌ OCP_NAMESPACE is unset. Pass it on the command line, e.g.:"; \
+	  echo "     make $(MAKECMDGOALS) OCP_NAMESPACE=llm-d-<you>"; \
+	  exit 1; \
+	fi
+
+# Full OCP CostGuard environment (models standup + IPP deploy). End state:
+# both Qwen decode pools stood up in $$OCP_NAMESPACE, IPP installed with
+# CostGuard values, HTTPRoutes applied, ready to receive traffic from
+# `llmdbenchmark run`.
+.PHONY: env-ocp
+env-ocp: models-deploy-ocp ipp-deploy-ocp ## Set up the full OCP CostGuard environment (real Qwen models on H100-80GB)
+	@echo "✅ env-ocp: full OCP CostGuard environment is ready in ns/$(OCP_NAMESPACE)."
+
+# Stand up the two Qwen decode pools via llmdbenchmark. This is the OCP
+# analog of bootstrap-colima's kind side, minus everything simulator-related:
+# no sim images, no post-standup TTFT/ITL patches. Real vLLM on real GPUs.
+# Idempotent -- llmdbenchmark handles re-runs.
+.PHONY: models-deploy-ocp
+models-deploy-ocp: _require-ocp-namespace ## Stand up the real Qwen3-8B + Qwen3-32B model pools on OCP
+	@printf "\033[33;1m==== llmdbenchmark standup ($(OCP_SPEC)) in ns/$(OCP_NAMESPACE) ====\033[0m\n"
+	llmdbenchmark --spec $(OCP_SPEC) standup -p $(OCP_NAMESPACE)
+
+# Install IPP into the already-stood-up OCP project via ipp_deploy_ocp.sh
+# (verifies the image is pullable, helm-installs the chart with the CostGuard
+# OCP values file, applies Qwen BaseModel CRs, renders + applies HTTPRoutes,
+# verifies plugins load, reminds you to patch --max-model-len 8192 onto the
+# Qwen3-32B decode).
+.PHONY: ipp-deploy-ocp
+ipp-deploy-ocp: _require-ocp-namespace ## Install IPP on OCP (helm-installs the chart with the OCP CostGuard values file)
+	@printf "\033[33;1m==== Running ipp_deploy_ocp.sh ====\033[0m\n"
+	@if [ -z "$$IPP_PATH" ]; then \
+	  echo "❌ IPP_PATH is unset. Export it, e.g.: export IPP_PATH=/path/to/llm-d-inference-payload-processor"; \
+	  exit 1; \
+	fi
+	NAMESPACE=$(OCP_NAMESPACE) RELEASE=$(OCP_RELEASE) \
+	  ./ipp_benchmarking/tools/ipp_deploy_ocp.sh
+
+# Undeploy IPP (Helm release only). Leaves the model standup alive so an
+# IPP re-deploy is fast. Use `make tear-down-ocp` for a full wipe.
+.PHONY: ipp-undeploy-ocp
+ipp-undeploy-ocp: _require-ocp-namespace ## Undeploy IPP from OCP (helm uninstall of the payload-processor release)
+	@printf "\033[33;1m==== Uninstalling IPP release $(OCP_RELEASE) from ns/$(OCP_NAMESPACE) ====\033[0m\n"
+	-helm uninstall $(OCP_RELEASE) -n $(OCP_NAMESPACE)
+
+# Tear down the Qwen model pools via llmdbenchmark. Leaves IPP alone (use
+# `make ipp-undeploy-ocp` first, or `make tear-down-ocp` for both).
+.PHONY: models-teardown-ocp
+models-teardown-ocp: _require-ocp-namespace ## Tear down the real Qwen model pools on OCP (llmdbenchmark teardown)
+	@printf "\033[33;1m==== llmdbenchmark teardown ($(OCP_SPEC)) in ns/$(OCP_NAMESPACE) ====\033[0m\n"
+	-llmdbenchmark --spec $(OCP_SPEC) teardown -p $(OCP_NAMESPACE)
+
+# Full teardown of everything env-ocp brought up: IPP release + Qwen model
+# pools. Does NOT delete the OCP project itself (`oc delete project` is
+# expensive to re-provision). Does NOT log out of the cluster.
+.PHONY: tear-down-ocp
+tear-down-ocp: _require-ocp-namespace ## Remove the full OCP environment set up by env-ocp
+	@printf "\033[33;1m==== Tearing down the full OCP CostGuard environment ====\033[0m\n"
+	-helm uninstall $(OCP_RELEASE) -n $(OCP_NAMESPACE)
+	-llmdbenchmark --spec $(OCP_SPEC) teardown -p $(OCP_NAMESPACE)
+	@echo "✅ tear-down-ocp: IPP release + model pools removed from ns/$(OCP_NAMESPACE). Project itself is retained -- run 'oc delete project $(OCP_NAMESPACE)' if you want to fully clean up."
