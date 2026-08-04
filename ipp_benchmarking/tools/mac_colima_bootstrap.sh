@@ -44,8 +44,12 @@ KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-ipp-e2e}"
 # In `mode=random` (the sim default) with a large client max_tokens, output
 # is sampled up to min(client_max_tokens, max_model_len - input_len). Without
 # a large client max_tokens the sim falls back to Gaussian(mean=40, sd=20)
-# and there is no asymmetry -- the smoke test and workload both send
-# max_tokens=$SIM_SMOKE_MAX_TOKENS to exercise the cap.
+# and there is no asymmetry -- the smoke test sends a per-model
+# max_tokens (SIM_125M_SMOKE_MAX_TOKENS / SIM_350M_SMOKE_MAX_TOKENS) that
+# is large enough for each model's own --max-model-len to be the binding
+# constraint but not so large that it exceeds the cap and gets rejected
+# with HTTP 400 ("maximum context length is N tokens"). The workload has
+# to make the same per-model split.
 SIM_125M_TTFT="3s"
 SIM_125M_ITL="200ms"
 SIM_125M_MAXMODELLEN="512"
@@ -53,7 +57,15 @@ SIM_350M_TTFT="1s"
 SIM_350M_ITL="50ms"
 SIM_350M_MAXMODELLEN="64"
 SIM_MAX_NUM_SEQS="10"
-SIM_SMOKE_MAX_TOKENS="256"
+# Per-model smoke-test max_tokens. Each is chosen to be:
+#   (a) >= its model's --max-model-len minus the 1-token prompt, so the
+#       server-side cap is what binds output length (asymmetry visible), and
+#   (b) < its model's --max-model-len, so the request itself is not
+#       rejected before the sim gets to produce a completion.
+# For a 1-token prompt: 125m's cap is 512 (headroom 511); 350m's is 64
+# (headroom 63). Values below sit safely under those caps.
+SIM_125M_SMOKE_MAX_TOKENS="510"
+SIM_350M_SMOKE_MAX_TOKENS="60"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -63,16 +75,22 @@ NC='\033[0m'
 SKIP_STANDUP=0
 POSITIONAL=()
 
-# Label selector for the sim (decode) deployments the scenario creates. Kept
-# as a constant so Phase C / D use the same selector -- a substring `grep decode`
-# match against `kubectl get deploy -o name` would false-positive on any deploy
-# with "decode" anywhere in its name.
-DECODE_SELECTOR="llm-d.ai/role=decode"
+# Match the sim (decode) deployments the scenario creates by name suffix.
+# The older llm-d-modelservice chart set an `llm-d.ai/role=decode` label we
+# used to select on, but v0.4.15 dropped it -- decode deploys now carry only
+# `app.kubernetes.io/managed-by=Helm` + `helm.sh/chart=llm-d-modelservice-*`
+# plus version, none of which distinguish them from prefill deploys.
+# Naming has been stable across chart versions: `<stack>-<hash>-<model>-decode`,
+# so anchoring on the `-decode` suffix reliably picks decode-only deploys
+# without touching prefill, EPP, gateway, or the payload-processor.
+_decode_deploys() {
+  kubectl get deploy -n "$NAMESPACE" -o name 2>/dev/null | grep -E '\-decode$' || true
+}
 
-# The inference Gateway svc name comes from the scenario's Helm release.
-# `standup` renders it as infra-<release>-inference-gateway, so with -p llmdbench
-# that becomes infra-llmdbench-inference-gateway.
-GATEWAY_SVC="infra-${NAMESPACE}-inference-gateway"
+# The inference Gateway ClusterIP service name (Istio's gateway-controller
+# suffixes the class name onto the Gateway's release name). Used by Phase D
+# for the in-cluster curl smoke test and by Phase E's next-steps banner.
+GATEWAY_SVC="infra-${NAMESPACE}-inference-gateway-istio"
 
 show_help() {
   cat <<EOF
@@ -302,7 +320,7 @@ else
   # already-stood-up short-circuit: if decode deploys exist we assume the
   # standup ran previously and skip. Users who want a re-standup can
   # `llmdbenchmark --spec ${SPEC} teardown -p ${NAMESPACE}` first.
-  if [ -n "$(kubectl get deploy -n "$NAMESPACE" -l "$DECODE_SELECTOR" -o name 2>/dev/null)" ]; then
+  if [ -n "$(_decode_deploys)" ]; then
     echo -e "${GREEN}▶ Standup already present in namespace ${NAMESPACE} -- skipping.${NC}"
   else
     echo -e "${GREEN}▶ Running llmdbenchmark standup (${SPEC})...${NC}"
@@ -320,7 +338,7 @@ else
        llmdbenchmark --spec "$SPEC" standup -p "$NAMESPACE")
     standup_rc=$?
     set -e
-    if [ -z "$(kubectl get deploy -n "$NAMESPACE" -l "$DECODE_SELECTOR" -o name 2>/dev/null)" ]; then
+    if [ -z "$(_decode_deploys)" ]; then
       echo -e "${RED}▶ FAIL: llmdbenchmark standup exited $standup_rc and no decode deploys exist in ns/${NAMESPACE}.${NC}"
       exit "$standup_rc"
     fi
@@ -360,9 +378,9 @@ else
   # by min(client-request max_tokens, max-model-len - input_len). See the
   # SIM_*_MAXMODELLEN comment above.
   echo -e "${GREEN}▶ Patching sims with asymmetric flags...${NC}"
-  decode_deploys=$(kubectl get deploy -n "$NAMESPACE" -l "$DECODE_SELECTOR" -o name)
+  decode_deploys=$(_decode_deploys)
   if [ -z "$decode_deploys" ]; then
-    echo -e "${RED}▶ FAIL: no deploys match -l $DECODE_SELECTOR in ns/${NAMESPACE}${NC}"
+    echo -e "${RED}▶ FAIL: no *-decode deploys found in ns/${NAMESPACE}${NC}"
     kubectl get deploy -n "$NAMESPACE" || true
     exit 1
   fi
@@ -391,14 +409,15 @@ fi
 # Phase D -- verify decode pods, sim-arg patch, and end-to-end curl reachability
 # ---------------------------------------------------------------------------
 
-GATEWAY_IP=""
-
 if [[ "$SKIP_STANDUP" == "1" ]]; then
   echo -e "${YELLOW}▶ --skip-standup set; skipping decode-pod / sim-arg / curl verification.${NC}"
 else
-  decode_deploys=$(kubectl get deploy -n "$NAMESPACE" -l "$DECODE_SELECTOR" -o name)
+  # Reuse the name-suffix-based selector defined at the top of the script.
+  # An earlier version selected on `llm-d.ai/role=decode`, but chart v0.4.15
+  # dropped that label -- see the comment above _decode_deploys() for why.
+  decode_deploys=$(_decode_deploys)
   if [ -z "$decode_deploys" ]; then
-    echo -e "${RED}▶ FAIL: no deploys match -l $DECODE_SELECTOR in ns/${NAMESPACE} -- standup missing?${NC}"
+    echo -e "${RED}▶ FAIL: no *-decode deploys found in ns/${NAMESPACE} -- standup missing?${NC}"
     kubectl get deploy -n "$NAMESPACE" || true
     exit 1
   fi
@@ -435,58 +454,73 @@ else
   done
 
   echo
-  echo -e "${GREEN}▶ Phase D.3 -- resolving ${GATEWAY_SVC} LoadBalancer IP...${NC}"
-  for _ in $(seq 1 15); do
-    GATEWAY_IP=$(kubectl get svc "$GATEWAY_SVC" -n "$NAMESPACE" \
-      -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-    if [ -n "$GATEWAY_IP" ]; then
-      break
-    fi
-    sleep 2
-  done
-  if [ -z "$GATEWAY_IP" ]; then
-    echo -e "${RED}▶ FAIL: svc ${GATEWAY_SVC} has no LoadBalancer IP after 30s${NC}"
-    kubectl get svc -n "$NAMESPACE" || true
-    exit 1
-  fi
-  echo -e "${GREEN}▶   Gateway IP: $GATEWAY_IP${NC}"
-
-  echo
-  echo -e "${GREEN}▶ Phase D.4 -- curl smoke test against both sims via the Gateway...${NC}"
-  # Only /v1/completions is header-routed by the scenario's HTTPRoutes; /health
-  # and /v1/models on the Gateway don't reach the sims (no matching route),
-  # so testing them would either 404 at the Gateway or return the Gateway's
-  # own health -- neither proves the sim is answering. Skip them.
+  echo -e "${GREEN}▶ Phase D.3 -- in-cluster curl smoke test against both sims via the Gateway...${NC}"
+  # In-cluster curl rather than curl-from-mac. Rationale:
+  # The scenario's llm-d-infra chart deploys the Gateway as a NodePort
+  # service (see `service.type: NodePort` in its parametersRef ConfigMap),
+  # so there is no LoadBalancer IP for MetalLB to advertise and no
+  # mac-host-reachable endpoint to hit. An ephemeral curl pod against
+  # the ClusterIP service exercises the same header-match HTTPRoute that
+  # the follow-on IPP install and the harness will use at run time, so
+  # the assertion this phase makes ("both sims respond end-to-end via
+  # the Gateway with the header-match route") still holds.
+  #
+  # Only /v1/completions is header-routed by the scenario's HTTPRoutes;
+  # /health and /v1/models don't match any rule without the header, so
+  # testing them would 404 at the Gateway and prove nothing about the
+  # sim. Skip them.
   sleep 2
   for model in "facebook/opt-125m" "facebook/opt-350m"; do
     echo -e "${GREEN}▶   --- $model ---${NC}"
 
-    # Send a large client-side max_tokens so the sim's --max-model-len cap is
-    # actually what bounds the response -- with a small max_tokens the sim
-    # would fall back to Gaussian(mean=40) and both models would look ~equal.
-    set +e
-    code=$(curl -sS --max-time 30 -o /tmp/mac_colima_bootstrap_resp.json -w "%{http_code}" \
-      -H "Content-Type: application/json" \
-      -H "X-Gateway-Base-Model-Name: $model" \
-      "http://$GATEWAY_IP/v1/completions" \
-      -d "{\"model\":\"$model\",\"prompt\":\"hi\",\"max_tokens\":$SIM_SMOKE_MAX_TOKENS}")
-    rc=$?
-    set -e
-    if [ "$rc" -ne 0 ] || [ "$code" != "200" ] || ! grep -q '"choices"' /tmp/mac_colima_bootstrap_resp.json; then
-      echo -e "${RED}▶   FAIL: POST /v1/completions for $model (curl rc=$rc http=$code)${NC}"
-      cat /tmp/mac_colima_bootstrap_resp.json || true
-      exit 1
-    fi
-    # Report the observed completion length so a human can eyeball the asymmetry.
-    # usage.completion_tokens is the sim's reported output count; grep-based
-    # extraction avoids a jq dependency.
-    ctok=$(grep -oE '"completion_tokens"[[:space:]]*:[[:space:]]*[0-9]+' /tmp/mac_colima_bootstrap_resp.json \
-           | grep -oE '[0-9]+$' || true)
-    echo -e "${GREEN}▶   POST /v1/completions -> 200 (has \"choices\", completion_tokens=${ctok:-?})${NC}"
-
+    # Send a per-model client-side max_tokens sized to exercise this
+    # model's --max-model-len cap (see SIM_*_SMOKE_MAX_TOKENS above for
+    # sizing rationale). Using a single large value across both models
+    # would 400 on 350m ("maximum context length is 64 tokens") because
+    # its cap is deliberately tight.
+    case "$model" in
+      *125m*) max_tokens="$SIM_125M_SMOKE_MAX_TOKENS" ;;
+      *)      max_tokens="$SIM_350M_SMOKE_MAX_TOKENS" ;;
+    esac
+    body="{\"model\":\"$model\",\"prompt\":\"hi\",\"max_tokens\":$max_tokens}"
+    attempt=0
+    while : ; do
+      attempt=$((attempt+1))
+      pod="curl-smoketest-$RANDOM$RANDOM"
+      # One kubectl invocation captures both HTTP code and body:
+      # curl writes the body to /tmp/r and prints the status code, we
+      # then echo a delimiter and cat the body so the caller can split
+      # them apart. --quiet keeps kubectl's own attach chatter out.
+      set +e
+      out=$(kubectl -n "$NAMESPACE" run "$pod" --rm -i --restart=Never \
+              --image=quay.io/fedora/fedora --quiet --command -- \
+              sh -c "curl -sS --max-time 30 -o /tmp/r -w '%{http_code}' \
+                          -H 'Content-Type: application/json' \
+                          -H 'X-Gateway-Base-Model-Name: $model' \
+                          http://${GATEWAY_SVC}.${NAMESPACE}.svc.cluster.local:80/v1/completions \
+                          -d '$body'; echo; echo '---BODY---'; cat /tmp/r")
+      rc=$?
+      set -e
+      code=$(printf '%s\n' "$out" | sed -n '1p')
+      resp=$(printf '%s\n' "$out" | sed -n '/^---BODY---$/,$p' | sed '1d')
+      if [ "$rc" -eq 0 ] && [ "$code" = "200" ] && printf '%s' "$resp" | grep -q '"choices"'; then
+        # usage.completion_tokens is the sim's reported output count;
+        # grep-based extraction avoids a jq dependency.
+        ctok=$(printf '%s' "$resp" | grep -oE '"completion_tokens"[[:space:]]*:[[:space:]]*[0-9]+' \
+               | grep -oE '[0-9]+$' || true)
+        echo -e "${GREEN}▶   POST /v1/completions -> 200 (has \"choices\", completion_tokens=${ctok:-?})${NC}"
+        break
+      fi
+      if [ "$attempt" -ge 3 ]; then
+        echo -e "${RED}▶   FAIL: POST /v1/completions for $model (curl rc=$rc http=$code) after 3 attempts${NC}"
+        printf '%s\n' "$resp"
+        exit 1
+      fi
+      echo -e "${YELLOW}▶   attempt $attempt failed (rc=$rc http=$code) -- retrying in 5s${NC}"
+      sleep 5
+    done
     sleep 2
   done
-  rm -f /tmp/mac_colima_bootstrap_resp.json
 
   echo -e "${GREEN}▶ Phase D complete -- both sims verified end-to-end.${NC}"
 fi
@@ -502,22 +536,25 @@ echo
 kubectl get httproute,gateway,inferencepool -n "$NAMESPACE" 2>/dev/null || true
 echo
 
-if [ -z "$GATEWAY_IP" ]; then
-  GATEWAY_IP=$(kubectl get svc "$GATEWAY_SVC" -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-fi
-
 cat <<EOF
 
 $(printf "${GREEN}▶ Bootstrap complete.${NC}\n")
 
-  Gateway LoadBalancer IP: ${GATEWAY_IP:-<not yet assigned; kubectl get svc -n ${NAMESPACE}>}
+  Gateway service: ${GATEWAY_SVC} (ClusterIP, NodePort-exposed).
 
-  Sims verified end-to-end above (/health, /v1/models, /v1/completions on both
-  facebook/opt-125m and facebook/opt-350m). To re-run a completion by hand:
+  Sims verified end-to-end above (POST /v1/completions on both
+  facebook/opt-125m and facebook/opt-350m, via an in-cluster curl pod
+  against the Gateway's ClusterIP -- the Gateway is not exposed on the
+  mac host). To re-run a completion from the mac by hand, port-forward
+  the Gateway first:
 
+    # In one shell:
+    kubectl port-forward -n ${NAMESPACE} svc/${GATEWAY_SVC} 8080:80
+
+    # In another:
     curl -s -H 'Content-Type: application/json' \\
          -H 'X-Gateway-Base-Model-Name: facebook/opt-125m' \\
-         http://${GATEWAY_IP:-<gateway-ip>}/v1/completions \\
+         http://localhost:8080/v1/completions \\
          -d '{"model":"facebook/opt-125m","prompt":"hi","max_tokens":32}'
 
   Next: install IPP (with your CostGuard values file) --

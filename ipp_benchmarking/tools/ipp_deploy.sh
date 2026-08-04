@@ -374,22 +374,47 @@ sleep 2
 kubectl rollout restart "deploy/${RELEASE}" -n "$NAMESPACE"
 kubectl rollout status "deploy/${RELEASE}" -n "$NAMESPACE" --timeout=300s
 
-# Grab the newest pod and assert both plugin types appear in its loaded config.
-pod=$(kubectl get pod -n "$NAMESPACE" -l "app.kubernetes.io/name=${RELEASE}" \
-  --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || true)
+# Wait for the rolling restart to fully settle: old ReplicaSet's pods
+# gone, exactly one Running pod for the current revision. `rollout
+# status` above only guarantees Ready-replica count against the desired
+# count; the old RS's pods can still be Terminating for several seconds
+# after that returns, and picking the "newest" pod during that window
+# is a coin flip -- if we pick the terminating one, `kubectl logs`
+# either returns empty or fails with "pod not found" a moment later.
+echo -e "${GREEN}▶   waiting for old ReplicaSet pods to terminate...${NC}"
+for _ in $(seq 1 30); do
+  npods=$(kubectl get pod -n "$NAMESPACE" -l "app=${RELEASE}" \
+    --field-selector=status.phase=Running -o name 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$npods" == "1" ]]; then break; fi
+  sleep 2
+done
+
+# The payload-processor chart labels its pods `app=<release>` (not the
+# k8s conventional `app.kubernetes.io/name`). Selecting on that label
+# is deterministic; do NOT fall back to a name-substring grep -- when
+# two revisions overlap during a rolling restart, sort-by-name picks
+# whichever pod name happens to sort last and can silently return the
+# terminating old pod.
+pod=$(kubectl get pod -n "$NAMESPACE" -l "app=${RELEASE}" \
+  --field-selector=status.phase=Running \
+  --sort-by=.metadata.creationTimestamp \
+  -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || true)
 if [[ -z "$pod" ]]; then
-  # Fallback: label may be different across chart versions.
-  pod=$(kubectl get pod -n "$NAMESPACE" -o name 2>/dev/null | grep "$RELEASE" | tail -1 | sed 's|pod/||')
-fi
-if [[ -z "$pod" ]]; then
-  echo -e "${RED}▶ FAIL: could not locate a ${RELEASE} pod to inspect logs.${NC}"
+  echo -e "${RED}▶ FAIL: no Running ${RELEASE} pod matches -l app=${RELEASE} in ns/${NAMESPACE}.${NC}"
+  kubectl get pods -n "$NAMESPACE" -l "app=${RELEASE}" -o wide || true
   exit 1
 fi
 echo -e "${GREEN}▶   inspecting pod: $pod${NC}"
 
 # Give the pod a moment to log the loaded configuration before we grep.
+# Surface `kubectl logs` errors -- swallowing them with `|| true` turns a
+# "pod vanished" or auth failure into a misleading "plugin(s) missing".
 sleep 2
-logs=$(kubectl logs "$pod" -n "$NAMESPACE" 2>/dev/null || true)
+if ! logs=$(kubectl logs "$pod" -n "$NAMESPACE" 2>&1); then
+  echo -e "${RED}▶ FAIL: kubectl logs $pod -n $NAMESPACE failed:${NC}"
+  echo "$logs"
+  exit 1
+fi
 
 missing=""
 for plugin in "costguard" "model-cost-extractor"; do
@@ -411,8 +436,6 @@ echo -e "${GREEN}▶   both plugins present in loaded config: costguard, model-c
 echo
 deployed_image=$(kubectl get pod "$pod" -n "$NAMESPACE" \
   -o jsonpath='{.spec.containers[0].image}' 2>/dev/null || echo "<unknown>")
-gateway_ip=$(kubectl get svc "$GATEWAY_SVC" -n "$NAMESPACE" \
-  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "<not-assigned>")
 
 cat <<EOF
 
@@ -422,13 +445,19 @@ $(printf "${GREEN}▶ IPP deploy complete.${NC}\n")
   Namespace:        ${NAMESPACE}
   Deployed image:   ${deployed_image}
   Values file:      ${IPP_VALUES}
-  Gateway IP:       ${gateway_ip}
+  Gateway service:  ${GATEWAY_SVC} (ClusterIP, NodePort-exposed)
   Plugins verified: costguard, model-cost-extractor
 
-  Send a completion through the Gateway (IPP now injects the model header):
+  Send a completion through the Gateway from the mac (IPP now injects
+  the model header, so the client no longer needs X-Gateway-Base-Model-Name).
+  The Gateway is NodePort, not exposed on the mac host, so port-forward first:
 
+    # In one shell:
+    kubectl port-forward -n ${NAMESPACE} svc/${GATEWAY_SVC} 8080:80
+
+    # In another:
     curl -s -H 'Content-Type: application/json' \\
-         http://${gateway_ip}/v1/completions \\
+         http://localhost:8080/v1/completions \\
          -d '{"model":"facebook/opt-125m","prompt":"hi","max_tokens":256}'
 
   Re-run this script to rebuild + redeploy (stale IPP images are removed
