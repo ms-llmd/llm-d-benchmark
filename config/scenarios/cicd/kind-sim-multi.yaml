@@ -3,9 +3,13 @@
 # Two InferencePools (facebook/opt-125m, facebook/opt-350m) behind a shared
 # Istio Gateway on a Kind cluster. No GPUs required.
 #
-# HTTPRoutes are created out-of-band by ipp_benchmarking/tools/gen_httproutes.sh,
-# matching on the X-Gateway-Base-Model-Name header that IPP injects. (The old
-# experimentalHttpRoute self-registration is gone with the llm-d-router chart.)
+# HTTPRoutes are applied post-standup by mac_colima_bootstrap.sh (Phase B.1
+# via ipp_benchmarking/tools/gen_httproutes.sh); the modelservice chart
+# currently used (llm-d-modelservice v0.4.15) does NOT render per-pool
+# HTTPRoutes even when `inferenceExtension.experimentalHttpRoute.enabled:
+# true` is set on a stack, so the `experimentalHttpRoute` blocks in this
+# file are retained for forward-compatibility but are inert with the
+# current chart. See AGENTS.md #4 for the workaround.
 #
 # Topology:
 #   Gateway (infra-llmdbench, shared)
@@ -179,6 +183,16 @@ scenario:
       maxModelLen: 1024
       gpuMemoryUtilization: 0
 
+    inferenceExtension:
+      # NOTE: inert with llm-d-modelservice v0.4.15 -- the chart does not
+      # render this HTTPRoute. gen_httproutes.sh applies the equivalent
+      # header-match route post-standup. Kept here for
+      # forward-compatibility. See the top-of-file comment + AGENTS.md #4.
+      experimentalHttpRoute:
+        enabled: true
+        inferenceGatewayName: infra-llmdbench-inference-gateway
+        baseModel: "facebook/opt-125m"
+
   # --------------------------------------------------------------------------
   # facebook/opt-350m
   # --------------------------------------------------------------------------
@@ -191,6 +205,14 @@ scenario:
       huggingfaceId: facebook/opt-350m
       maxModelLen: 1024
       gpuMemoryUtilization: 0
+
+    inferenceExtension:
+      # NOTE: inert with llm-d-modelservice v0.4.15 -- see the sibling stack
+      # comment (opt-125m) and the top-of-file explanation.
+      experimentalHttpRoute:
+        enabled: true
+        inferenceGatewayName: infra-llmdbench-inference-gateway
+        baseModel: "facebook/opt-350m"
 
     decode:
       resources:
