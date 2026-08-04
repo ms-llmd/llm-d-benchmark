@@ -267,6 +267,13 @@ payloadProcessor:
   listModels:
     - facebook/opt-125m
     - facebook/opt-350m
+  # Runner verbosity. v=4 (= logutil.DEBUG) enables the DEBUG-gated
+  # per-request cost-metadata log events emitted by the
+  # request-cost-metadata extractor (IPP PR #269) -- required for
+  # post-mortem CostGuard analysis. Chart default is v=3; anything below
+  # 4 silences the DEBUG stream.
+  flags:
+    v: 4
   customConfig:
     plugins:
     - type: body-field-to-header
