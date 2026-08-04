@@ -45,6 +45,20 @@ payloadProcessor:
   listModels:
     - Qwen/Qwen3-8B
     - Qwen/Qwen3-32B
+  # Runner verbosity. v=4 (= logutil.DEBUG in
+  # pkg/common/observability/logging/const.go) enables the DEBUG-gated
+  # per-request cost-metadata log events emitted by the
+  # request-cost-metadata extractor (IPP PR #269). These are what
+  # post-mortem CostGuard analysis is expected to consume from the
+  # payload-processor pod's stdout -- e.g.:
+  #   {"msg":"request-cost-metadata observation","model":"Qwen/Qwen3-8B","cost":...}
+  #   {"msg":"request-cost-metadata epoch-end digest","model":"...","centroids":[...]}
+  # Chart default is v=3; anything below 4 silences the DEBUG stream. Under
+  # sustained load v=4 can be noisy -- collect the pod log continuously
+  # (kubectl logs -f) or bump the container log-rotation buffer if you
+  # expect long runs.
+  flags:
+    v: 4
   customConfig:
     plugins:
     - type: body-field-to-header
