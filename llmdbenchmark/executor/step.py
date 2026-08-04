@@ -21,6 +21,32 @@ class Phase(Enum):
     TEARDOWN = "teardown"
 
 
+def any_stack_sets_run_config_flag(rendered_stacks: list[Path], flag: str) -> bool:
+    """Return True iff any rendered stack's ``config.yaml`` sets
+    ``runConfig.<flag>`` to a truthy value.
+
+    Scenario-wide ``shared`` blocks are merged into each stack at render
+    time, so ``runConfig`` appears at the top level of every stack's
+    rendered ``config.yaml``. Callers use this to honor scenario-level
+    opt-outs like ``runConfig.skipSmoketest`` /
+    ``runConfig.skipModelVerify``: if any stack in a multi-stack scenario
+    opts out, the gated behavior is skipped for the whole run (matching
+    the all-or-nothing shape the scenario YAMLs express today).
+    """
+    for stack_path in rendered_stacks or []:
+        config_file = stack_path / "config.yaml"
+        if not config_file.exists():
+            continue
+        try:
+            with open(config_file, encoding="utf-8") as f:
+                plan_config = yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        if (plan_config.get("runConfig") or {}).get(flag):
+            return True
+    return False
+
+
 @dataclass
 class StepResult:
     """Result of executing a single step."""
