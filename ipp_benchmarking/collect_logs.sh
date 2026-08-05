@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# nullglob makes an unmatched glob expand to nothing, so
+# `for c in dir/pattern*/; do ...` skips the loop entirely instead of
+# passing the literal pattern as one iteration.
+shopt -s nullglob
 
 NAMESPACE="${NAMESPACE:-llmdbench}"
 
@@ -26,7 +30,12 @@ done
 # Resolution order (matches llmdbenchmark itself):
 #   1. LLMDBENCH_WORKSPACE env var
 #   2. ~/data/kind-sim-multi  (workDir from config/scenarios/cicd/kind-sim-multi.yaml)
-#   3. Most-recently-modified /tmp/workspace_llmdbench_* directory
+#   3. Most-recently-modified workspace_llmdbench_* directory under
+#      ${TMPDIR:-/tmp}. On macOS Python's tempfile.mkdtemp() writes under
+#      $TMPDIR (a per-user path like /var/folders/.../T/), NOT /tmp, so
+#      hard-coding /tmp misses every workspace `llmdbenchmark run`
+#      creates. Searching both locations covers Linux (/tmp) and macOS
+#      ($TMPDIR) without needing per-OS branches.
 _find_workspace() {
   if [[ -n "${LLMDBENCH_WORKSPACE:-}" && -d "${LLMDBENCH_WORKSPACE}" ]]; then
     echo "${LLMDBENCH_WORKSPACE}"
@@ -37,25 +46,49 @@ _find_workspace() {
     echo "${default_workdir}"
     return
   fi
-  # Fall back to the most recently modified tmp workspace
-  local latest
-  latest=$(find /tmp -maxdepth 1 -name "workspace_llmdbench_*" -type d \
-    -printf "%T@ %p\n" 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
-  echo "${latest:-}"
+  # Fall back to the most recently modified tmp workspace. Search both
+  # ${TMPDIR:-/tmp} and /tmp -- de-duplicated when TMPDIR == /tmp.
+  # `ls -td` sorts by mtime descending and is portable across BSD (macOS)
+  # and GNU (Linux); do NOT use `find -printf`, which BSD find does not
+  # support and would silently produce no output here.
+  local -a search_roots=("${TMPDIR:-/tmp}")
+  if [[ "${TMPDIR:-/tmp}" != "/tmp" && -d "/tmp" ]]; then
+    search_roots+=("/tmp")
+  fi
+  local root candidates=() latest=""
+  for root in "${search_roots[@]}"; do
+    # `nullglob` (set at file top) makes an unmatched glob expand to
+    # nothing rather than the literal string. Strip trailing slash from
+    # $root ($TMPDIR on macOS ends with '/') to avoid `//` in paths.
+    root="${root%/}"
+    for c in "${root}"/workspace_llmdbench_*/; do
+      candidates+=("${c%/}")
+    done
+  done
+  if (( ${#candidates[@]} > 0 )); then
+    latest=$(ls -td -- "${candidates[@]}" 2>/dev/null | head -1)
+  fi
+  echo "${latest}"
 }
 
 WORKSPACE=$(_find_workspace)
 if [[ -n "${WORKSPACE}" ]]; then
   # Each llmdbenchmark run creates a timestamped subdir inside the workspace.
   # Find the most recently modified one that has a results/ or analysis/ child.
+  # Enumerate the workspace's immediate subdirs newest-first via `ls -td`
+  # (portable across BSD and GNU; `find -printf` is not BSD-portable and
+  # would silently produce no output on macOS -- see _find_workspace).
   RUN_SUBDIR=""
-  while IFS= read -r d; do
-    if [[ -d "${d}/results" || -d "${d}/analysis" ]]; then
-      RUN_SUBDIR="${d}"
-      break
-    fi
-  done < <(find "${WORKSPACE}" -maxdepth 1 -mindepth 1 -type d \
-             -printf "%T@ %p\n" 2>/dev/null | sort -rn | awk '{print $2}')
+  ws_subdirs=("${WORKSPACE}"/*/)
+  if (( ${#ws_subdirs[@]} > 0 )); then
+    while IFS= read -r d; do
+      d="${d%/}"
+      if [[ -d "${d}/results" || -d "${d}/analysis" ]]; then
+        RUN_SUBDIR="${d}"
+        break
+      fi
+    done < <(ls -td -- "${ws_subdirs[@]}" 2>/dev/null)
+  fi
 
   if [[ -n "${RUN_SUBDIR}" ]]; then
     BENCH_RESULTS_DIR="${LOG_DIR}/benchmark-results"
