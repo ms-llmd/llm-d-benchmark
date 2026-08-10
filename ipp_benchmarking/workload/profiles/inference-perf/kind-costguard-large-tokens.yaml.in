@@ -1,0 +1,112 @@
+# kind-costguard-large-tokens
+#
+# Forces client-side `max_tokens=512` on every request so the deliberate
+# --max-model-len asymmetry between the two kind sims actually materializes:
+#
+#   opt-125m: --max-model-len 512  (long output honored)
+#   opt-350m: --max-model-len 64   (output truncated ~4x shorter)
+#
+# In llm-d-inference-sim's default `mode=random`, output length is sampled up
+# to min(client_max_tokens, max_model_len - input_len). Without a large client
+# max_tokens the sim falls back to Gaussian(mean=40, sd=20) and BOTH stacks
+# produce ~identical output -- CostGuard sees no cost signal and its routing
+# decisions become indistinguishable from random. Upstream `sanity_random.yaml`
+# uses mean=50/max=100 output which is TOO SMALL for this purpose (see
+# mac_colima_bootstrap.sh:36-48 for the sim-arg contract).
+#
+# Design choices baked in below:
+#
+# 1. output_distribution pinned at 512 with std_dev=0. Deterministic client cap
+#    so opt-125m runs to its cap and opt-350m is truncated to (max-model-len -
+#    input_len) server-side. Nonzero std_dev would smear the asymmetry across
+#    requests and re-introduce noise CostGuard has to average out.
+#
+# 2. input_distribution pinned small (mean=16, std_dev=0). MUST keep
+#    input_len + max_tokens under opt-350m's max-model-len=64. If it exceeds,
+#    opt-350m rejects the request with a length error rather than truncating,
+#    which MASKS the asymmetry (errors are not truncated responses -- CostGuard
+#    doesn't see a shorter output, it sees a failure). Bumping output_tokens
+#    without also verifying input_len < (max_model_len_min - output_tokens) is
+#    the most common way this profile silently stops working.
+#
+# 3. ignore_eos: true. Without it a small model can EOS at token 3 regardless
+#    of the client cap and the whole exercise collapses back to Gaussian-ish
+#    output lengths.
+#
+# 4. model_name is a JSON-array-encoded string so IPP's model-group-name-filter
+#    treats it as "choose among {opt-125m, opt-350m}" and hands the decision
+#    to the scorer -- which is exactly the code path CostGuard needs to exercise.
+#    A single scalar model_name would pin routing and defeat the test.
+#
+# 5. api.type: completion -> hits /v1/completions -> wire field is `max_tokens`
+#    (not `max_completion_tokens`, which is the /v1/chat/completions field).
+#    inference-perf sends `max_tokens` iff data.output_distribution is set.
+#
+# 6. Low load (rate: 1 rps, 60s). This profile is a signal-verification tool,
+#    not a saturation test -- it exists to confirm asymmetry appears in
+#    per-request metrics and IPP logs. Ramp separately with a concurrency
+#    profile if you want to see how CostGuard responds under load.
+#
+# Runbook:
+#   llmdbenchmark --spec cicd/kind-sim-multi run \
+#     -l inference-perf -w kind-costguard-large-tokens.yaml
+#   NAMESPACE=llmdbench ./ipp_benchmarking/collect_logs.sh
+#
+# Expected artifacts (in the collected results dir):
+#   * per_request_lifecycle_metrics.json shows output token counts clustered
+#     near ~512 for requests routed to opt-125m and near ~48 (=64-16) for
+#     requests routed to opt-350m. Two clean modes, not one blurry Gaussian.
+#   * payload-processor pod logs show costguard scoring decisions with
+#     non-trivial cost deltas between the two model routes.
+load:
+  type: constant
+  stages:
+  - rate: 1
+    duration: 60
+  request_timeout: 60
+  num_workers: 1
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  # "Choose among these": JSON-array-encoded string for model-group-name-filter.
+  # Both sims MUST be up (mac_colima_bootstrap.sh brings both). If you only
+  # want to smoke one stack, replace with "facebook/opt-125m" -- but then
+  # CostGuard has no choice to make and the profile stops testing anything.
+  model_name: '["facebook/opt-125m","facebook/opt-350m"]'
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  # Any small HF-hosted tokenizer works; opt-125m matches the shorter of the
+  # two models on the wire. Not routing-relevant -- the tokenizer runs
+  # client-side inside inference-perf to build synthetic prompts.
+  pretrained_model_name_or_path: facebook/opt-125m
+data:
+  type: random
+  # Pinned so input_len is deterministic. Keeps input_len + max_tokens well
+  # under opt-350m's max-model-len=64 (16 + 512 exceeds 64 -- but 350m only
+  # needs input_len < max_model_len; the OUTPUT is what gets truncated to
+  # (max_model_len - input_len) = 48).
+  input_distribution:
+    min: 16
+    max: 16
+    mean: 16
+    std_dev: 0
+    total_count: 60
+  # Pinned at 512 -- hits opt-125m's max-model-len exactly, and is well above
+  # opt-350m's 64 so 350m always truncates. std_dev=0 keeps the signal clean.
+  output_distribution:
+    min: 512
+    max: 512
+    mean: 512
+    std_dev: 0
+    total_count: 60
+report:
+  request_lifecycle:
+    summary: true
+    per_stage: true
+    per_request: true
+storage:
+  local_storage:
+    path: /workspace

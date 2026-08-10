@@ -1,9 +1,9 @@
 # Load-blind A/B baseline: max-score-picker with NO scorer (the maxScoreOnly image).
 # With no scorer feeding scores, the picker is blind to per-backend latency/load —
 # it cannot offload away from a saturating model. This is the control the PR #46
-# inflight-aware queue-ttft scorer is measured against (mirrors the "random / load-blind"
+# inflight-aware avg-ttft scorer is measured against (mirrors the "random / load-blind"
 # baseline panel in benchmark_story_4.html).
-# model-name-filter is kept so the string-array model_name is interpreted as "choose among".
+# model-group-name-filter is kept so the string-array model_name is interpreted as "choose among".
 payloadProcessor:
   listModels:
     - facebook/opt-125m
@@ -16,7 +16,7 @@ payloadProcessor:
         headerName: X-Gateway-Model-Name
     - type: base-model-to-header
     - type: model-selector
-    - type: auto-group-model-name-filter
+    - type: model-group-name-filter
     - type: max-score-picker
     - type: model-config-datasource
       parameters:
@@ -26,7 +26,7 @@ payloadProcessor:
       plugins:
         request:
         - pluginRef: model-selector
-        - pluginRef: auto-group-model-name-filter
+        - pluginRef: model-group-name-filter
         - pluginRef: max-score-picker
         - pluginRef: body-field-to-header
         - pluginRef: base-model-to-header
