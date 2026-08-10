@@ -2,7 +2,12 @@
 
 from pathlib import Path
 
-from llmdbenchmark.executor.step import Step, StepResult, Phase
+from llmdbenchmark.executor.step import (
+    Step,
+    StepResult,
+    Phase,
+    any_stack_sets_run_config_flag,
+)
 from llmdbenchmark.executor.context import ExecutionContext, is_fma_only_mode
 from llmdbenchmark.utilities.endpoint import test_model_serving, cleanup_ephemeral_pods
 
@@ -20,15 +25,33 @@ class VerifyModelStep(Step):
         )
 
     def should_skip(self, context: ExecutionContext) -> bool:
-        """Skip in skip-run mode, fma, or nok8s.
+        """Skip in skip-run mode, fma, nok8s, or when the scenario opts out
+        via ``runConfig.skipModelVerify: true``.
 
-        nok8s: ``test_model_serving`` probes from an in-cluster curl pod, which
-        cannot run without a cluster; standup already verified /v1/models
-        locally, so verification here would be a futile kubectl call.
+        nok8s: ``test_model_serving`` probes from an in-cluster curl pod,
+        which cannot run without a cluster; standup already verified
+        /v1/models locally, so verification here would be a futile kubectl
+        call.
+
+        Why a scenario would set skipModelVerify: this step probes
+        ``/v1/models`` against the inference gateway with no headers.
+        Scenarios whose HTTPRoutes are header-gated (e.g. header-match
+        routing keyed on ``X-Gateway-Base-Model-Name``, which IPP injects
+        into the data path but this probe does not) will 404 at the
+        gateway even though vLLM ``/v1/models`` on each pod is healthy --
+        the pods and route are fine, only the probe's request shape is
+        wrong for the route. Those scenarios opt out via
+        ``runConfig.skipModelVerify: true`` in the scenario YAML;
+        enforcement of that flag lives here (symmetric to
+        ``runConfig.skipSmoketest`` in ``_execute_standup``).
         """
         if "nok8s" in (context.deployed_methods or []):
             return True
-        return context.harness_skip_run or is_fma_only_mode(context)
+        if context.harness_skip_run or is_fma_only_mode(context):
+            return True
+        return any_stack_sets_run_config_flag(
+            context.rendered_stacks, "skipModelVerify"
+        )
 
     def execute(
         self, context: ExecutionContext, stack_path: Path | None = None

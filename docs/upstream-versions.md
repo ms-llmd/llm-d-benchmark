@@ -8,8 +8,8 @@
 > `auto` Helm/image versions are resolved against live registries at
 > generation time via the existing `VersionResolver`.
 
-- Generated at: `2026-08-03 13:59:31` (UTC)
-- Generated against git ref: `4b4046372ffda87268a2d5120e3728e2b037d2fe`
+- Generated at: `2026-08-04 12:42:57` (UTC)
+- Generated against git ref: `b9cb0c470cf23536e814eb756dc822ac88a35a8a`
 
 ## System Tool Dependencies
 
@@ -23,11 +23,11 @@ whatever the host's package manager provides.
 | **curl** | `8_20_0` | version | `install.sh` line 78 (`tool_version_for`) | [curl/curl](https://github.com/curl/curl) |
 | **git** | `system-provided` | system-provided | `install.sh`: `command -v` check (no pin) | [git/git](https://github.com/git/git) |
 | **helm** | `v3.19.0` | version | `install.sh` line 81 (`tool_version_for`) | [helm/helm](https://github.com/helm/helm) |
-| **helm-diff** | `v3.13.0` | plugin (version) | `install.sh` line 82 (`tool_version_for`) | [databus23/helm-diff](https://github.com/databus23/helm-diff) |
+| **helm-diff** | `v3.15.7` | plugin (version) | `install.sh` line 82 (`tool_version_for`) | [databus23/helm-diff](https://github.com/databus23/helm-diff) |
 | **helmfile** | `1.5.1` | version | `install.sh` line 80 (`tool_version_for`) | [helmfile/helmfile](https://github.com/helmfile/helmfile) |
 | **jq** | `1.8.1` | version | `install.sh` line 87 (`tool_version_for`) | [jqlang/jq](https://github.com/jqlang/jq) |
 | **kustomize** | `v5.8.1` | version | `install.sh` line 84 (`tool_version_for`) | [kubernetes-sigs/kustomize](https://github.com/kubernetes-sigs/kustomize) |
-| **llm-d-planner (git)** | `v0.1.0` | commit SHA | `install.sh` line 935 (`PLANNER_GIT`) | [llm-d-incubation/llm-d-planner](https://github.com/llm-d-incubation/llm-d-planner) |
+| **llm-d-planner (git)** | `v0.1.0` | commit SHA | `install.sh` line 938 (`PLANNER_GIT`) | [llm-d-incubation/llm-d-planner](https://github.com/llm-d-incubation/llm-d-planner) |
 | **oc** | `4.18.0` | version | `install.sh` line 83 (`tool_version_for`) | [openshift/oc](https://github.com/openshift/oc) |
 | **skopeo** | `1.20.1` | version | `install.sh` line 86 (`tool_version_for`) | [containers/skopeo](https://github.com/containers/skopeo) |
 | **yq** | `v4.53.2` | version | `install.sh` line 79 (`tool_version_for`) | [mikefarah/yq](https://github.com/mikefarah/yq) |

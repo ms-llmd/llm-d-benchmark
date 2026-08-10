@@ -47,7 +47,7 @@ from llmdbenchmark.exceptions.exceptions import TemplateError, ConfigurationErro
 from llmdbenchmark.parser.render_plans import RenderPlans
 from llmdbenchmark.parser.version_resolver import VersionResolver
 from llmdbenchmark.parser.cluster_resource_resolver import ClusterResourceResolver
-from llmdbenchmark.executor.step import Phase
+from llmdbenchmark.executor.step import Phase, any_stack_sets_run_config_flag
 from llmdbenchmark.executor.context import ExecutionContext
 from llmdbenchmark.executor.step_executor import StepExecutor
 from llmdbenchmark.standup.steps import get_standup_steps
@@ -537,13 +537,34 @@ def _execute_standup(args, logger, render_plan_errors):
 
     _print_standup_summary(context, result, logger)
 
-    # Auto-chain smoketest after standup unless --skip-smoketest.
-    # nok8s has no cluster/namespace for the smoketest pod and the deploy step
-    # already curls /v1/models for readiness, so skip the chained smoketest.
-    skip_smoketest = getattr(args, "skip_smoketest", False) or (
-        "nok8s" in (context.deployed_methods or [])
-    )
-    if not skip_smoketest:
+    # Auto-chain smoketest after standup unless the user set --skip-smoketest
+    # on the CLI, the scenario's rendered plan sets runConfig.skipSmoketest,
+    # or we're on nok8s.
+    #
+    # nok8s: no cluster/namespace for the smoketest pod, and the deploy step
+    # already curls /v1/models for readiness, so the chained smoketest would
+    # be redundant.
+    #
+    # Why a scenario would set skipSmoketest: the auto-smoketest issues a bare
+    # `GET /health` against the inference gateway with no headers. Scenarios
+    # whose HTTPRoutes are header-gated (e.g. header-match routing keyed on
+    # X-Gateway-Base-Model-Name, which IPP injects into the data path but the
+    # smoketest does not) will 404 at the gateway for every probe -- the pods
+    # and vLLM /health itself are healthy, only the smoketest's request shape
+    # is wrong for the route. Those scenarios opt out via
+    # `runConfig.skipSmoketest: true` in the scenario YAML; enforcement of
+    # that flag lives here.
+    skip_smoketest_cli = getattr(args, "skip_smoketest", False)
+    skip_smoketest_nok8s = "nok8s" in (context.deployed_methods or [])
+    skip_smoketest_scenario = _scenario_skips_smoketest(render_plan_errors)
+    if skip_smoketest_cli or skip_smoketest_nok8s or skip_smoketest_scenario:
+        if skip_smoketest_scenario and not (skip_smoketest_cli or skip_smoketest_nok8s):
+            logger.log_info(
+                "Skipping auto-chained smoketest -- scenario sets "
+                "runConfig.skipSmoketest: true.",
+                emoji="⏭️",
+            )
+    else:
         logger.log_info("")
         logger.log_info(
             "Running smoketests...",
@@ -554,6 +575,17 @@ def _execute_standup(args, logger, render_plan_errors):
         except PhaseError as e:
             logger.log_error(str(e))
             sys.exit(1)
+
+
+def _scenario_skips_smoketest(render_plan_errors) -> bool:
+    """Return True iff the rendered plan sets ``runConfig.skipSmoketest``.
+
+    Thin wrapper over ``any_stack_sets_run_config_flag`` that pulls
+    ``rendered_paths`` off the ``render_plan_errors`` object the CLI
+    threads through the standup/smoketest/run entry points.
+    """
+    rendered_paths = getattr(render_plan_errors, "rendered_paths", []) or []
+    return any_stack_sets_run_config_flag(rendered_paths, "skipSmoketest")
 
 
 def _do_smoketest(args, logger, render_plan_errors):

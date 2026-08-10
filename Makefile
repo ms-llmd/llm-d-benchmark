@@ -345,6 +345,14 @@ SIM_NAMESPACE         ?= llmdbench
 SIM_SPEC              ?= cicd/kind-sim-multi
 SIM_RELEASE           ?= payload-processor
 
+# CostGuard group-routing evaluation (auto/fast). Overridable on the command
+# line if you author a variant scenario/profile pair.
+SIM_COSTGUARD_GROUP_SPEC    ?= cicd/kind-sim-multi-costguard-group
+SIM_COSTGUARD_GROUP_PROFILE ?= kind-costguard-group.yaml
+# Root under which each `sim-costguard-group-run` archives its collected logs
+# in a timestamped subdir. Override for CI, e.g. SIM_COSTGUARD_ARCHIVE_DIR=/tmp/ipp-runs.
+SIM_COSTGUARD_ARCHIVE_DIR   ?= collected-logs-archive
+
 # Full simulation environment (bootstrap + IPP deploy) as one command.
 # End state: Colima up, kind cluster stood up with two asymmetric sim stacks
 # (opt-125m slow, opt-350m fast), CostGuard IPP installed and Ready, HTTPRoutes
@@ -383,6 +391,59 @@ ipp-undeploy: ## Undeploy IPP (helm uninstall of the payload-processor release)
 	@printf "\033[33;1m==== Uninstalling IPP release $(SIM_RELEASE) from ns/$(SIM_NAMESPACE) ====\033[0m\n"
 	-helm uninstall $(SIM_RELEASE) -n $(SIM_NAMESPACE)
 
+# Patch models.json (pricing + groups) in the payload-processor ConfigMap from
+# the current IPP values file, without re-running helm/rebuild. The
+# model-config-datasource plugin watches /config/models.json via fsnotify and
+# re-syncs pricing/groups in-memory, so no rollout restart is needed. Only
+# updates the models.json key -- customConfig edits still need `make ipp-deploy`.
+# Override IPP_VALUES=/path to point at a different values file.
+.PHONY: models-patch-kind
+models-patch-kind: ## Patch models.json in the payload-processor cm from IPP_VALUES (no helm, no restart)
+	@printf "\033[33;1m==== Running models_patch_kind.sh ====\033[0m\n"
+	KIND_CLUSTER_NAME=$(SIM_KIND_CLUSTER_NAME) NAMESPACE=$(SIM_NAMESPACE) RELEASE=$(SIM_RELEASE) \
+	  ./ipp_benchmarking/tools/models_patch_kind.sh
+
+# Run the CostGuard group-routing harness (auto/fast) end-to-end, collect the
+# IPP post-mortem logs, and archive them into a timestamped folder so a
+# subsequent run does not overwrite them.
+#
+# Preconditions: `make sim-colima IPP_PATH=...` (or equivalent) has completed
+# and payload-processor is Running in ns/$(SIM_NAMESPACE). This target does
+# NOT install IPP -- run `make ipp-deploy` first if it isn't already.
+#
+# Flow:
+#   1. `llmdbenchmark run` fires the kind-costguard-group workload profile
+#      ("auto/fast" request-body model) against the two-sim stack.
+#   2. collect_logs.sh gathers payload-processor + related pod logs and the
+#      benchmark run's results/analysis dirs into ./collected-logs-<N>.
+#   3. The newly-created collected-logs-<N> is renamed into a timestamped
+#      subdir of $(SIM_COSTGUARD_ARCHIVE_DIR)/, so runs never overwrite each
+#      other and can be diffed side-by-side.
+#
+# Override any of SIM_COSTGUARD_GROUP_SPEC / SIM_COSTGUARD_GROUP_PROFILE /
+# SIM_COSTGUARD_ARCHIVE_DIR on the command line if you're driving a variant.
+.PHONY: sim-costguard-group-run
+sim-costguard-group-run: ## Run CostGuard group-routing harness, collect IPP logs, archive to timestamped dir
+	@printf "\033[33;1m==== Running llmdbenchmark for $(SIM_COSTGUARD_GROUP_SPEC) ($(SIM_COSTGUARD_GROUP_PROFILE)) ====\033[0m\n"
+	llmdbenchmark --spec $(SIM_COSTGUARD_GROUP_SPEC) run \
+	  -l inference-perf -w $(SIM_COSTGUARD_GROUP_PROFILE)
+	@printf "\033[33;1m==== Collecting IPP post-mortem logs ====\033[0m\n"
+	@# Snapshot the highest existing collected-logs-<N> BEFORE running collect,
+	@# so we can identify the freshly-created dir without racing another run.
+	@existing_max="$$(ls -d collected-logs-* 2>/dev/null | sed -n 's/^collected-logs-\([0-9]\{1,\}\)$$/\1/p' | sort -n | tail -1)"; \
+	NAMESPACE=$(SIM_NAMESPACE) ./ipp_benchmarking/collect_logs.sh; \
+	new_max="$$(ls -d collected-logs-* 2>/dev/null | sed -n 's/^collected-logs-\([0-9]\{1,\}\)$$/\1/p' | sort -n | tail -1)"; \
+	if [ -z "$$new_max" ] || [ "$$new_max" = "$$existing_max" ]; then \
+	  echo "❌ collect_logs.sh did not create a new collected-logs-<N> directory"; \
+	  exit 1; \
+	fi; \
+	src="collected-logs-$$new_max"; \
+	stamp="$$(date +%Y%m%dT%H%M%S)"; \
+	dest="$(SIM_COSTGUARD_ARCHIVE_DIR)/$${stamp}-costguard-group"; \
+	mkdir -p "$(SIM_COSTGUARD_ARCHIVE_DIR)"; \
+	mv "$$src" "$$dest"; \
+	printf "\033[32;1m✅ sim-costguard-group-run: archived %s -> %s\033[0m\n" "$$src" "$$dest"
+
 # Full teardown of everything sim-colima brought up: IPP release, sim stacks
 # (via llmdbenchmark teardown), kind cluster, and Colima VM (stopped, not
 # deleted -- run `colima delete default` if you also want to reclaim the
@@ -395,3 +456,93 @@ tear-down-sim: ## Remove the full environment set up by sim-colima
 	-kind delete cluster --name $(SIM_KIND_CLUSTER_NAME)
 	-colima stop
 	@echo "✅ tear-down-sim: environment removed. Colima VM disk retained under ~/.colima -- run 'colima delete default' to reclaim it."
+
+##@ IPP OCP environment (real Qwen models on H100-80GB)
+
+# OCP CostGuard evaluation environment. No simulators are deployed here --
+# real Qwen3-8B + Qwen3-32B on real H100-80GB GPUs, standup driven by
+# llmdbenchmark's `cicd/ocp-qwen-gemma-multi` scenario, IPP deploy driven by
+# ipp_benchmarking/tools/ipp_deploy_ocp.sh.
+#
+# OCP_NAMESPACE has NO default -- it must be set explicitly on the command
+# line because OpenShift projects are typically per-user (e.g. llm-d-<you>).
+# Override the rest as needed:
+#   make env-ocp OCP_NAMESPACE=llm-d-<you> \
+#     IPP_PATH=/path/to/llm-d-inference-payload-processor \
+#     IPP_IMAGE_REPO=ghcr.io/<you>/llm-d-inference-payload-processor \
+#     IPP_IMAGE_TAG=costguard
+#
+# Prereqs: `oc login <cluster>` is complete, `$$HF_TOKEN` is set, the IPP
+# image at $$IPP_IMAGE_REPO:$$IPP_IMAGE_TAG is already pushed to a registry
+# the OCP cluster can pull from (build + push with `make image-build` +
+# `docker push` in the IPP repo checkout). See
+# ipp_benchmarking/ipp_configs/ocp-costguard/README.md for the full runbook.
+OCP_SPEC        ?= cicd/ocp-qwen-gemma-multi
+OCP_RELEASE     ?= payload-processor
+# OCP_NAMESPACE has no default on purpose -- fail loud if it's not set.
+
+# Guard used by every OCP target: fails immediately if OCP_NAMESPACE is unset.
+# `origin` is "undefined" for variables that were never assigned (either
+# explicitly or with `?=`).
+_require-ocp-namespace:
+	@if [ "$(origin OCP_NAMESPACE)" = "undefined" ] || [ -z "$(OCP_NAMESPACE)" ]; then \
+	  echo "❌ OCP_NAMESPACE is unset. Pass it on the command line, e.g.:"; \
+	  echo "     make $(MAKECMDGOALS) OCP_NAMESPACE=llm-d-<you>"; \
+	  exit 1; \
+	fi
+
+# Full OCP CostGuard environment (models standup + IPP deploy). End state:
+# both Qwen decode pools stood up in $$OCP_NAMESPACE, IPP installed with
+# CostGuard values, HTTPRoutes applied, ready to receive traffic from
+# `llmdbenchmark run`.
+.PHONY: env-ocp
+env-ocp: models-deploy-ocp ipp-deploy-ocp ## Set up the full OCP CostGuard environment (real Qwen models on H100-80GB)
+	@echo "✅ env-ocp: full OCP CostGuard environment is ready in ns/$(OCP_NAMESPACE)."
+
+# Stand up the two Qwen decode pools via llmdbenchmark. This is the OCP
+# analog of bootstrap-colima's kind side, minus everything simulator-related:
+# no sim images, no post-standup TTFT/ITL patches. Real vLLM on real GPUs.
+# Idempotent -- llmdbenchmark handles re-runs.
+.PHONY: models-deploy-ocp
+models-deploy-ocp: _require-ocp-namespace ## Stand up the real Qwen3-8B + Qwen3-32B model pools on OCP
+	@printf "\033[33;1m==== llmdbenchmark standup ($(OCP_SPEC)) in ns/$(OCP_NAMESPACE) ====\033[0m\n"
+	llmdbenchmark --spec $(OCP_SPEC) standup -p $(OCP_NAMESPACE)
+
+# Install IPP into the already-stood-up OCP project via ipp_deploy_ocp.sh
+# (verifies the image is pullable, helm-installs the chart with the CostGuard
+# OCP values file, applies Qwen BaseModel CRs, renders + applies HTTPRoutes,
+# verifies plugins load, reminds you to patch --max-model-len 8192 onto the
+# Qwen3-32B decode).
+.PHONY: ipp-deploy-ocp
+ipp-deploy-ocp: _require-ocp-namespace ## Install IPP on OCP (helm-installs the chart with the OCP CostGuard values file)
+	@printf "\033[33;1m==== Running ipp_deploy_ocp.sh ====\033[0m\n"
+	@if [ -z "$$IPP_PATH" ]; then \
+	  echo "❌ IPP_PATH is unset. Export it, e.g.: export IPP_PATH=/path/to/llm-d-inference-payload-processor"; \
+	  exit 1; \
+	fi
+	NAMESPACE=$(OCP_NAMESPACE) RELEASE=$(OCP_RELEASE) \
+	  ./ipp_benchmarking/tools/ipp_deploy_ocp.sh
+
+# Undeploy IPP (Helm release only). Leaves the model standup alive so an
+# IPP re-deploy is fast. Use `make tear-down-ocp` for a full wipe.
+.PHONY: ipp-undeploy-ocp
+ipp-undeploy-ocp: _require-ocp-namespace ## Undeploy IPP from OCP (helm uninstall of the payload-processor release)
+	@printf "\033[33;1m==== Uninstalling IPP release $(OCP_RELEASE) from ns/$(OCP_NAMESPACE) ====\033[0m\n"
+	-helm uninstall $(OCP_RELEASE) -n $(OCP_NAMESPACE)
+
+# Tear down the Qwen model pools via llmdbenchmark. Leaves IPP alone (use
+# `make ipp-undeploy-ocp` first, or `make tear-down-ocp` for both).
+.PHONY: models-teardown-ocp
+models-teardown-ocp: _require-ocp-namespace ## Tear down the real Qwen model pools on OCP (llmdbenchmark teardown)
+	@printf "\033[33;1m==== llmdbenchmark teardown ($(OCP_SPEC)) in ns/$(OCP_NAMESPACE) ====\033[0m\n"
+	-llmdbenchmark --spec $(OCP_SPEC) teardown -p $(OCP_NAMESPACE)
+
+# Full teardown of everything env-ocp brought up: IPP release + Qwen model
+# pools. Does NOT delete the OCP project itself (`oc delete project` is
+# expensive to re-provision). Does NOT log out of the cluster.
+.PHONY: tear-down-ocp
+tear-down-ocp: _require-ocp-namespace ## Remove the full OCP environment set up by env-ocp
+	@printf "\033[33;1m==== Tearing down the full OCP CostGuard environment ====\033[0m\n"
+	-helm uninstall $(OCP_RELEASE) -n $(OCP_NAMESPACE)
+	-llmdbenchmark --spec $(OCP_SPEC) teardown -p $(OCP_NAMESPACE)
+	@echo "✅ tear-down-ocp: IPP release + model pools removed from ns/$(OCP_NAMESPACE). Project itself is retained -- run 'oc delete project $(OCP_NAMESPACE)' if you want to fully clean up."

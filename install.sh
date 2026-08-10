@@ -79,7 +79,7 @@ tool_version_for() {
         yq)        echo "v4.53.3" ;;
         helmfile)  echo "1.5.1"   ;;
         helm)      echo "v3.19.0" ;;
-        helm-diff) echo "v3.13.0" ;;
+        helm-diff) echo "v3.15.7" ;;
         oc)        echo "4.18.0"  ;;
         kustomize) echo "v5.8.1"  ;;
         crane)     echo "0.21.7"  ;;
@@ -699,12 +699,15 @@ install_yq_mac()       { brew install yq; }
 # otherwise. macOS uses Homebrew (not pinned tarballs like Linux) because
 # Homebrew owns the PATH/prefix here and brew stable already tracks the pins.
 # Pin helm to v3 on macOS. `brew install helmfile` pulls the current `helm`
-# formula as a dependency, which since 2026 is v4.x -- but helm-diff v3.13.0
-# (the pinned helm plugin the llm-d Istio helmfile invokes) still passes
-# `--validate` to `helm diff upgrade` and dies on v4 with:
+# formula as a dependency, which since 2026 is v4.x -- but the helm-diff
+# plugin the llm-d Istio helmfile invokes still passes `--validate` to
+# `helm diff upgrade` on helm 3.x builds and dies on v4 with:
 #   Error: Failed to render chart: exit status 1: Flag --validate has been deprecated
-# Installing the keg-only helm@3 formula and force-linking it over any v4 that
-# helmfile drags in keeps helm on v3 without blocking the helmfile upgrade.
+# helm-diff v3.15.7+ (see tool_version_for above) restores compatibility
+# with helm 4, but the Istio helmfile expects helm 3, so we keep helm
+# pinned to v3 and let the plugin work on the v3 API. Installing the
+# keg-only helm@3 formula and force-linking it over any v4 that helmfile
+# drags in is what achieves this without blocking the helmfile upgrade.
 install_helmfile_mac() {
   brew install helmfile 2>/dev/null || true
   brew upgrade helmfile 2>/dev/null || true

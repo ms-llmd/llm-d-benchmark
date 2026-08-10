@@ -35,6 +35,17 @@ payloadProcessor:
   listModels:
     - facebook/opt-125m
     - facebook/opt-350m
+  # Runner verbosity. v=4 (= logutil.DEBUG in
+  # pkg/common/observability/logging/const.go) enables the DEBUG-gated
+  # per-request cost-metadata log events emitted by the
+  # request-cost-metadata extractor (IPP PR #269). These are what
+  # post-mortem CostGuard analysis is expected to consume from the
+  # payload-processor pod's stdout -- e.g.:
+  #   {"msg":"request-cost-metadata observation","model":"...","cost":...}
+  #   {"msg":"request-cost-metadata epoch-end digest","model":"...","centroids":[...]}
+  # Chart default is v=3; anything below 4 silences the DEBUG stream.
+  flags:
+    v: 4
   customConfig:
     plugins:
     - type: body-field-to-header
@@ -74,12 +85,12 @@ payloadProcessor:
     models:
       - name: facebook/opt-125m
         pricing:
-          inputPerMillion: 0.5
-          outputPerMillion: 1.5
-      - name: facebook/opt-350m
-        pricing:
           inputPerMillion: 0.1
           outputPerMillion: 0.3
+      - name: facebook/opt-350m
+        pricing:
+          inputPerMillion: 0.5
+          outputPerMillion: 1.5
     groups:
       - name: fast
         models: [facebook/opt-125m, facebook/opt-350m]

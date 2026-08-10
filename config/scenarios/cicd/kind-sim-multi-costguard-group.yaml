@@ -1,23 +1,32 @@
-# Kind Simulated Accelerators -- Multi-Model CI/CD Scenario
+# Kind Simulated Accelerators -- Multi-Model CI/CD Scenario (CostGuard, group routing)
+#
+# Sibling of kind-sim-multi.yaml. Same two-sim stack (facebook/opt-125m,
+# facebook/opt-350m) so mac_colima_bootstrap.sh's post-standup latency patch
+# still binds by the `-decode` selector. Only difference: the harness profile
+# is kind-costguard-group.yaml, which sends request-body `model: "auto/fast"`
+# and exercises IPP's model-group-name-filter "auto/<group>" branch against
+# the `fast` group declared in ipp_configs/kind-costguard/costguard-kind-values.yaml.
 #
 # Two InferencePools (facebook/opt-125m, facebook/opt-350m) behind a shared
 # Istio Gateway on a Kind cluster. No GPUs required.
 #
 # HTTPRoutes are applied post-standup by mac_colima_bootstrap.sh (Phase B.1
-# via ipp_benchmarking/tools/gen_httproutes.sh); the modelservice chart
-# currently used (llm-d-modelservice v0.4.15) does NOT render per-pool
-# HTTPRoutes even when `inferenceExtension.experimentalHttpRoute.enabled:
-# true` is set on a stack, so the `experimentalHttpRoute` blocks in this
-# file are retained for forward-compatibility but are inert with the
-# current chart. See AGENTS.md #4 for the workaround.
+# via tools/gen_httproutes.sh); the modelservice chart currently used
+# (llm-d-modelservice v0.4.15) does NOT render per-pool HTTPRoutes even
+# when `inferenceExtension.experimentalHttpRoute.enabled: true` is set on
+# a stack, so the `experimentalHttpRoute` blocks in this file are retained
+# for forward-compatibility but are inert with the current chart.
+# See AGENTS.md #4 for the workaround.
 #
 # Topology:
 #   Gateway (infra-llmdbench, shared)
 #     HTTPRoute A: X-Gateway-Base-Model-Name: facebook/opt-125m -> InferencePool A
 #     HTTPRoute B: X-Gateway-Base-Model-Name: facebook/opt-350m -> InferencePool B
 #
-# Based on config/scenarios/cicd/kind-sim.yaml (single-model) and
-# config/scenarios/examples/multi-model-wva.yaml (multi-stack pattern).
+# workDir is kept as ~/data/kind-sim-multi (same as kind-sim-multi.yaml) so
+# ipp_benchmarking/collect_logs.sh's default fallback still resolves. Runs
+# land in timestamped subdirs so there is no collision with kind-sim-multi
+# runs sharing the same workspace root.
 
 # ============================================================================
 # SHARED -- merged into every stack before per-stack overrides
@@ -48,7 +57,7 @@ shared:
   standalone:
     enabled: false
 
-  # Header-match routes are applied out-of-band by gen_httproutes.sh;
+  # Each InferencePool creates its own HTTPRoute via experimentalHttpRoute;
   # suppress the benchmark's per-stack HTTPRoute step entirely.
   httpRoute:
     enabled: false
@@ -64,17 +73,17 @@ shared:
         cpu: "250m"
         memory: 256Mi
 
-  # Minimal EPP resources for Kind (llm-d-router chart keys; the chart default
-  # is cpu 8 / memory 8Gi, which cannot schedule on a stock kind node)
-  router:
-    epp:
-      resources:
-        requests:
-          cpu: "100m"
-          memory: 256Mi
-        limits:
-          cpu: "1"
-          memory: 1Gi
+  # Minimal EPP resources for Kind
+  inferenceExtension:
+    experimentalHttpRoute:
+      requestTimeout: "30s"
+    resources:
+      requests:
+        cpu: "100m"
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
     monitoring:
       prometheus:
         enabled: false
@@ -151,7 +160,7 @@ shared:
 
   harness:
     name: inference-perf
-    experimentProfile: sanity_random.yaml
+    experimentProfile: kind-costguard-group.yaml
     resources:
       cpu: "1"
       memory: 8Gi

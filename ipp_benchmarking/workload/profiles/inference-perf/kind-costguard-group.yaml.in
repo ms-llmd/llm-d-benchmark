@@ -1,0 +1,127 @@
+# kind-costguard-group
+#
+# CostGuard evaluation on the Kind two-sim stack, driven by group-based
+# routing rather than name-based routing.
+#
+# Wire shape (verified against IPP filter.go:98-149):
+#
+#   Every request body sends {"model": "auto/fast"}. IPP's
+#   model-group-name-filter reads request.Body["model"] as a single string
+#   and takes the "auto/<group-name>" branch, which resolves member models
+#   from each candidate's model_groups attribute. That attribute is
+#   populated by the model-config-datasource plugin from the top-level
+#   `groups:` block in ipp_configs/kind-costguard/costguard-kind-values.yaml
+#   (currently: `- name: fast, models: [opt-125m, opt-350m]`).
+#
+# What NOT to use here, and why:
+#
+#   * '["facebook/opt-125m","facebook/opt-350m"]' (JSON array literal) --
+#     the filter never parses arrays. It falls into the exact-model-name
+#     branch, matches nothing, returns []. Pipeline rejects with 429.
+#     See filter.go:114-124 for the code path.
+#
+#   * "facebook/opt-125m" or "facebook/opt-350m" (pinned name) -- routes to
+#     that single model. CostGuard has no candidates to score between and
+#     the whole exercise collapses.
+#
+# Design choices baked in below:
+#
+# 1. Poisson load, not constant. Constant arrivals lock-step with the scorer
+#    tick and mask routing decisions. Poisson is the shape blog_rehearsal_
+#    sweep_hot.yaml.in validates against these sims.
+#
+# 2. Four stages traversing below/at/over/deep-over the fast-sim's ~4 rps
+#    capacity, so CostGuard's cost signal has increasing room to dominate
+#    the latency signal. Half-length compared to blog_rehearsal_sweep_hot
+#    so a laptop run finishes in ~5 min.
+#
+# 3. input_len 12 + max_output 48 = 60 tokens, safely under opt-350m's
+#    --max-model-len 64. If this budget is exceeded, opt-350m REJECTS the
+#    request rather than truncating -- turning the routing signal into
+#    request errors and masking the CostGuard decision. Any edit to
+#    input_distribution or output_distribution must preserve
+#    (input_max + output_max) < 64.
+#
+# 4. output_distribution std_dev=2 (small nonzero). Adds mild variation so
+#    the per-request cost signal isn't identical for every request in a
+#    stage while staying inside the 48-token budget for opt-350m.
+#
+# 5. ignore_eos: true. Without it a small model can EOS at token 3 regardless
+#    of the client cap, and requests all look the same on the wire.
+#
+# 6. api.type: completion -> hits /v1/completions -> wire field is `max_tokens`.
+#    inference-perf sends `max_tokens` iff data.output_distribution is set.
+#
+# Runbook:
+#   llmdbenchmark --spec cicd/kind-sim-multi-costguard-group standup
+#   IPP_PATH=<...> ./ipp_benchmarking/tools/ipp_deploy.sh
+#   llmdbenchmark --spec cicd/kind-sim-multi-costguard-group run \
+#     -l inference-perf -w kind-costguard-group.yaml
+#   NAMESPACE=llmdbench ./ipp_benchmarking/collect_logs.sh
+#
+# Expected artifacts (in the collected results dir):
+#   * payload-processor pod logs show "model-group filter applied group match"
+#     with group=fast for every request.
+#   * per_request_lifecycle_metrics.json shows requests distributed across
+#     BOTH facebook/opt-125m and facebook/opt-350m. A single-model result
+#     means the filter didn't fan out -- check the values file's `groups:`
+#     block.
+#   * At high stages (rate 8, rate 12), CostGuard's cost signal should skew
+#     routing toward the cheaper opt-350m (0.1/0.3 vs 0.5/1.5 per M tokens).
+load:
+  type: poisson
+  stages:
+    # Below fast-sim capacity -- CostGuard warms cost centroids without contention.
+    - rate: 2
+      duration: 60
+    # At fast-sim capacity (~4 rps) -- latency starts to diverge between sims.
+    - rate: 4
+      duration: 90
+    # Over capacity -- cost signal must force the routing trade.
+    - rate: 8
+      duration: 90
+    # Both sims saturated -- cost dominates.
+    - rate: 12
+      duration: 60
+  request_timeout: 90
+  num_workers: 1
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  # "auto/<group>": the ONLY request-body shape IPP's model-group-name-filter
+  # accepts for group routing. Do NOT change this to a JSON-array literal or
+  # a pinned model name -- see the top-of-file comment for why.
+  model_name: "auto/fast"
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  # Any small HF-hosted tokenizer works; opt-125m matches the shorter of the
+  # two models on the wire. Not routing-relevant -- the tokenizer runs
+  # client-side inside inference-perf to build synthetic prompts.
+  pretrained_model_name_or_path: facebook/opt-125m
+data:
+  type: random
+  # input_len + output_max MUST stay under opt-350m's --max-model-len=64.
+  # Current budget: 12 + 48 = 60. Preserve this if you edit either range.
+  input_distribution:
+    min: 12
+    max: 12
+    mean: 12
+    std_dev: 0
+    total_count: 300
+  output_distribution:
+    min: 40
+    max: 48
+    mean: 44
+    std_dev: 2
+    total_count: 300
+report:
+  request_lifecycle:
+    summary: true
+    per_stage: true
+    per_request: true
+storage:
+  local_storage:
+    path: /workspace
