@@ -281,6 +281,42 @@ whose parent dict already exists, and inference-perf has no top-level
 the equivalent dotted overrides would be
 `-o "data.output_distribution.mean=512,data.output_distribution.min=512,data.output_distribution.max=512,data.output_distribution.std_dev=0"`.
 
+**Group-based CostGuard variant (`auto/fast`).** Same infra as the CostGuard
+quick-start above; the workload profile changes to exercise **group-based
+routing** rather than the JSON-array-of-names shape. Every request body
+sends `{"model":"auto/fast"}`, which IPP's `model-group-name-filter` handles
+via its `"auto/<group-name>"` branch: it looks up members of the `fast`
+group declared in
+[`costguard-kind-values.yaml`](./ipp_configs/kind-costguard/costguard-kind-values.yaml)
+(`- name: fast, models: [opt-125m, opt-350m]`) and hands the resulting
+candidate pool to CostGuard. This is the only request shape the filter
+resolves against the `groups:` block — a JSON-array literal falls into the
+exact-model-name branch and rejects with 429, and a bare model name pins
+routing. Uses a dedicated scenario (`cicd/kind-sim-multi-costguard-group`)
+that mirrors `cicd/kind-sim-multi` so `mac_colima_bootstrap.sh`'s decode
+latency patch still applies.
+
+```bash
+llmdbenchmark --spec cicd/kind-sim-multi-costguard-group standup
+IPP_PATH=/path/to/llm-d-inference-payload-processor ./ipp_benchmarking/tools/ipp_deploy.sh
+llmdbenchmark --spec cicd/kind-sim-multi-costguard-group run \
+  -l inference-perf -w kind-costguard-group.yaml
+NAMESPACE=llmdbench ./ipp_benchmarking/collect_logs.sh
+```
+
+Verify the fan-out actually happened (both models should appear):
+
+```bash
+kubectl logs -n llmdbench deploy/payload-processor \
+  | grep -E "model-group filter applied group match|group=fast"
+kubectl logs -n llmdbench deploy/payload-processor \
+  | grep "request-cost-metadata observation" | jq -r .model | sort | uniq -c
+```
+
+If only one model appears, or every request 429s with `no candidate models`,
+the `groups:` block in the values file the pod was deployed with is missing
+or misspelled.
+
 **Mac-specific gotchas.**
 
 - If Colima was already running the script does **not** restart it — it

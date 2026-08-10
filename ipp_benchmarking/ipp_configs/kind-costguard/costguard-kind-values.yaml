@@ -85,12 +85,12 @@ payloadProcessor:
     models:
       - name: facebook/opt-125m
         pricing:
-          inputPerMillion: 0.5
-          outputPerMillion: 1.5
-      - name: facebook/opt-350m
-        pricing:
           inputPerMillion: 0.1
           outputPerMillion: 0.3
+      - name: facebook/opt-350m
+        pricing:
+          inputPerMillion: 0.5
+          outputPerMillion: 1.5
     groups:
       - name: fast
         models: [facebook/opt-125m, facebook/opt-350m]

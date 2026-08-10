@@ -1,0 +1,242 @@
+# Kind Simulated Accelerators -- Multi-Model CI/CD Scenario (CostGuard, group routing)
+#
+# Sibling of kind-sim-multi.yaml. Same two-sim stack (facebook/opt-125m,
+# facebook/opt-350m) so mac_colima_bootstrap.sh's post-standup latency patch
+# still binds by the `-decode` selector. Only difference: the harness profile
+# is kind-costguard-group.yaml, which sends request-body `model: "auto/fast"`
+# and exercises IPP's model-group-name-filter "auto/<group>" branch against
+# the `fast` group declared in ipp_configs/kind-costguard/costguard-kind-values.yaml.
+#
+# Two InferencePools (facebook/opt-125m, facebook/opt-350m) behind a shared
+# Istio Gateway on a Kind cluster. No GPUs required.
+#
+# HTTPRoutes are applied post-standup by mac_colima_bootstrap.sh (Phase B.1
+# via tools/gen_httproutes.sh); the modelservice chart currently used
+# (llm-d-modelservice v0.4.15) does NOT render per-pool HTTPRoutes even
+# when `inferenceExtension.experimentalHttpRoute.enabled: true` is set on
+# a stack, so the `experimentalHttpRoute` blocks in this file are retained
+# for forward-compatibility but are inert with the current chart.
+# See AGENTS.md #4 for the workaround.
+#
+# Topology:
+#   Gateway (infra-llmdbench, shared)
+#     HTTPRoute A: X-Gateway-Base-Model-Name: facebook/opt-125m -> InferencePool A
+#     HTTPRoute B: X-Gateway-Base-Model-Name: facebook/opt-350m -> InferencePool B
+#
+# workDir is kept as ~/data/kind-sim-multi (same as kind-sim-multi.yaml) so
+# ipp_benchmarking/collect_logs.sh's default fallback still resolves. Runs
+# land in timestamped subdirs so there is no collision with kind-sim-multi
+# runs sharing the same workspace root.
+
+# ============================================================================
+# SHARED -- merged into every stack before per-stack overrides
+# ============================================================================
+shared:
+  # CPU-only affinity for Kind
+  affinity:
+    enabled: true
+    nodeSelector:
+      kubernetes.io/os: linux
+
+  accelerator:
+    count: 0
+    memory: 24
+
+  # Inference-sim image -- no GPU needed
+  # Pin to v0.8.2: "latest" switched to HTTP render sidecar (port 8082)
+  # which is not configured for Kind. v0.8.2 uses UDS-based tokenizer.
+  images:
+    vllm:
+      repository: ghcr.io/llm-d/llm-d-inference-sim
+      tag: v0.8.2
+
+  modelservice:
+    enabled: true
+    uriProtocol: hf
+
+  standalone:
+    enabled: false
+
+  # Each InferencePool creates its own HTTPRoute via experimentalHttpRoute;
+  # suppress the benchmark's per-stack HTTPRoute step entirely.
+  httpRoute:
+    enabled: false
+
+  # Minimal gateway resources for Kind
+  gateway:
+    className: istio
+    resources:
+      limits:
+        cpu: "1"
+        memory: 1Gi
+      requests:
+        cpu: "250m"
+        memory: 256Mi
+
+  # Minimal EPP resources for Kind
+  inferenceExtension:
+    experimentalHttpRoute:
+      requestTimeout: "30s"
+    resources:
+      requests:
+        cpu: "100m"
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+    monitoring:
+      prometheus:
+        enabled: false
+
+  monitoring:
+    installPrometheusCrds: true
+
+  vllmCommon:
+    shmMemory: 500Mi
+    volumes:
+      - name: dshm
+        type: emptyDir
+        emptyDir:
+          medium: Memory
+          sizeLimit: 500Mi
+    volumeMounts:
+      - name: dshm
+        mountPath: /dev/shm
+
+  prefill:
+    enabled: true
+    replicas: 1
+    parallelism:
+      tensor: 0
+      data: 1
+      dataLocal: 1
+      workers: 1
+    resources:
+      limits:
+        memory: 100Mi
+        cpu: "0"
+      requests:
+        memory: 100Mi
+        cpu: "0"
+    accelerator:
+      count: 0
+    vllm:
+      modelCommand: imageDefault
+
+  decode:
+    replicas: 1
+    parallelism:
+      tensor: 0
+      data: 1
+      dataLocal: 1
+      workers: 1
+    resources:
+      limits:
+        memory: 100Mi
+        cpu: "0"
+      requests:
+        memory: 100Mi
+        cpu: "0"
+    accelerator:
+      count: 0
+    vllm:
+      modelCommand: imageDefault
+
+  # Kind uses 'standard' storage class with ReadWriteOnce only
+  storage:
+    modelPvc:
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: standard
+      size: 4Gi   # 2 Gi per model
+    workloadPvc:
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: standard
+      size: 3Gi
+
+  control:
+    waitTimeout: 20
+
+  harness:
+    name: inference-perf
+    experimentProfile: kind-costguard-group.yaml
+    resources:
+      cpu: "1"
+      memory: 8Gi
+
+  workDir: "~/data/kind-sim-multi"
+
+  # HTTPRoute header-match routing requires IPP in the data path — skip
+  # standup smoketest and run-phase model verification which both probe
+  # the gateway without the required X-Gateway-Base-Model-Name header.
+  runConfig:
+    skipSmoketest: true
+    skipModelVerify: true
+
+
+# ============================================================================
+# SCENARIO -- per-model stacks
+# ============================================================================
+scenario:
+  # --------------------------------------------------------------------------
+  # facebook/opt-125m
+  # --------------------------------------------------------------------------
+  - name: "facebook-opt-125m"
+
+    model:
+      name: facebook/opt-125m
+      shortName: facebook-opt-125m
+      path: models/facebook/opt-125m
+      huggingfaceId: facebook/opt-125m
+      maxModelLen: 1024
+      gpuMemoryUtilization: 0
+
+    inferenceExtension:
+      # NOTE: inert with llm-d-modelservice v0.4.15 -- the chart does not
+      # render this HTTPRoute. gen_httproutes.sh applies the equivalent
+      # header-match route post-standup. Kept here for
+      # forward-compatibility. See the top-of-file comment + AGENTS.md #4.
+      experimentalHttpRoute:
+        enabled: true
+        inferenceGatewayName: infra-llmdbench-inference-gateway
+        baseModel: "facebook/opt-125m"
+
+  # --------------------------------------------------------------------------
+  # facebook/opt-350m
+  # --------------------------------------------------------------------------
+  - name: "facebook-opt-350m"
+
+    model:
+      name: facebook/opt-350m
+      shortName: facebook-opt-350m
+      path: models/facebook/opt-350m
+      huggingfaceId: facebook/opt-350m
+      maxModelLen: 1024
+      gpuMemoryUtilization: 0
+
+    inferenceExtension:
+      # NOTE: inert with llm-d-modelservice v0.4.15 -- see the sibling stack
+      # comment (opt-125m) and the top-of-file explanation.
+      experimentalHttpRoute:
+        enabled: true
+        inferenceGatewayName: infra-llmdbench-inference-gateway
+        baseModel: "facebook/opt-350m"
+
+    decode:
+      resources:
+        limits:
+          memory: 200Mi
+          cpu: "0"
+        requests:
+          memory: 200Mi
+          cpu: "0"
+
+    prefill:
+      resources:
+        limits:
+          memory: 200Mi
+          cpu: "0"
+        requests:
+          memory: 200Mi
+          cpu: "0"

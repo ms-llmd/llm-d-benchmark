@@ -345,6 +345,14 @@ SIM_NAMESPACE         ?= llmdbench
 SIM_SPEC              ?= cicd/kind-sim-multi
 SIM_RELEASE           ?= payload-processor
 
+# CostGuard group-routing evaluation (auto/fast). Overridable on the command
+# line if you author a variant scenario/profile pair.
+SIM_COSTGUARD_GROUP_SPEC    ?= cicd/kind-sim-multi-costguard-group
+SIM_COSTGUARD_GROUP_PROFILE ?= kind-costguard-group.yaml
+# Root under which each `sim-costguard-group-run` archives its collected logs
+# in a timestamped subdir. Override for CI, e.g. SIM_COSTGUARD_ARCHIVE_DIR=/tmp/ipp-runs.
+SIM_COSTGUARD_ARCHIVE_DIR   ?= collected-logs-archive
+
 # Full simulation environment (bootstrap + IPP deploy) as one command.
 # End state: Colima up, kind cluster stood up with two asymmetric sim stacks
 # (opt-125m slow, opt-350m fast), CostGuard IPP installed and Ready, HTTPRoutes
@@ -382,6 +390,59 @@ ipp-deploy: ## Install IPP (builds image from $$IPP_PATH, helm-installs the char
 ipp-undeploy: ## Undeploy IPP (helm uninstall of the payload-processor release)
 	@printf "\033[33;1m==== Uninstalling IPP release $(SIM_RELEASE) from ns/$(SIM_NAMESPACE) ====\033[0m\n"
 	-helm uninstall $(SIM_RELEASE) -n $(SIM_NAMESPACE)
+
+# Patch models.json (pricing + groups) in the payload-processor ConfigMap from
+# the current IPP values file, without re-running helm/rebuild. The
+# model-config-datasource plugin watches /config/models.json via fsnotify and
+# re-syncs pricing/groups in-memory, so no rollout restart is needed. Only
+# updates the models.json key -- customConfig edits still need `make ipp-deploy`.
+# Override IPP_VALUES=/path to point at a different values file.
+.PHONY: models-patch-kind
+models-patch-kind: ## Patch models.json in the payload-processor cm from IPP_VALUES (no helm, no restart)
+	@printf "\033[33;1m==== Running models_patch_kind.sh ====\033[0m\n"
+	KIND_CLUSTER_NAME=$(SIM_KIND_CLUSTER_NAME) NAMESPACE=$(SIM_NAMESPACE) RELEASE=$(SIM_RELEASE) \
+	  ./ipp_benchmarking/tools/models_patch_kind.sh
+
+# Run the CostGuard group-routing harness (auto/fast) end-to-end, collect the
+# IPP post-mortem logs, and archive them into a timestamped folder so a
+# subsequent run does not overwrite them.
+#
+# Preconditions: `make sim-colima IPP_PATH=...` (or equivalent) has completed
+# and payload-processor is Running in ns/$(SIM_NAMESPACE). This target does
+# NOT install IPP -- run `make ipp-deploy` first if it isn't already.
+#
+# Flow:
+#   1. `llmdbenchmark run` fires the kind-costguard-group workload profile
+#      ("auto/fast" request-body model) against the two-sim stack.
+#   2. collect_logs.sh gathers payload-processor + related pod logs and the
+#      benchmark run's results/analysis dirs into ./collected-logs-<N>.
+#   3. The newly-created collected-logs-<N> is renamed into a timestamped
+#      subdir of $(SIM_COSTGUARD_ARCHIVE_DIR)/, so runs never overwrite each
+#      other and can be diffed side-by-side.
+#
+# Override any of SIM_COSTGUARD_GROUP_SPEC / SIM_COSTGUARD_GROUP_PROFILE /
+# SIM_COSTGUARD_ARCHIVE_DIR on the command line if you're driving a variant.
+.PHONY: sim-costguard-group-run
+sim-costguard-group-run: ## Run CostGuard group-routing harness, collect IPP logs, archive to timestamped dir
+	@printf "\033[33;1m==== Running llmdbenchmark for $(SIM_COSTGUARD_GROUP_SPEC) ($(SIM_COSTGUARD_GROUP_PROFILE)) ====\033[0m\n"
+	llmdbenchmark --spec $(SIM_COSTGUARD_GROUP_SPEC) run \
+	  -l inference-perf -w $(SIM_COSTGUARD_GROUP_PROFILE)
+	@printf "\033[33;1m==== Collecting IPP post-mortem logs ====\033[0m\n"
+	@# Snapshot the highest existing collected-logs-<N> BEFORE running collect,
+	@# so we can identify the freshly-created dir without racing another run.
+	@existing_max="$$(ls -d collected-logs-* 2>/dev/null | sed -n 's/^collected-logs-\([0-9]\{1,\}\)$$/\1/p' | sort -n | tail -1)"; \
+	NAMESPACE=$(SIM_NAMESPACE) ./ipp_benchmarking/collect_logs.sh; \
+	new_max="$$(ls -d collected-logs-* 2>/dev/null | sed -n 's/^collected-logs-\([0-9]\{1,\}\)$$/\1/p' | sort -n | tail -1)"; \
+	if [ -z "$$new_max" ] || [ "$$new_max" = "$$existing_max" ]; then \
+	  echo "❌ collect_logs.sh did not create a new collected-logs-<N> directory"; \
+	  exit 1; \
+	fi; \
+	src="collected-logs-$$new_max"; \
+	stamp="$$(date +%Y%m%dT%H%M%S)"; \
+	dest="$(SIM_COSTGUARD_ARCHIVE_DIR)/$${stamp}-costguard-group"; \
+	mkdir -p "$(SIM_COSTGUARD_ARCHIVE_DIR)"; \
+	mv "$$src" "$$dest"; \
+	printf "\033[32;1m✅ sim-costguard-group-run: archived %s -> %s\033[0m\n" "$$src" "$$dest"
 
 # Full teardown of everything sim-colima brought up: IPP release, sim stacks
 # (via llmdbenchmark teardown), kind cluster, and Colima VM (stopped, not
