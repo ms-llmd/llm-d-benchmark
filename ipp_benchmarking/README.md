@@ -128,43 +128,64 @@ R=(collected-logs-<N>/benchmark-results/results/*/)
 
 ---
 
-## Mac + Colima quick-start (CostGuard)
+## Mac + Colima quick-start
 
 Same `cicd/kind-sim-multi` scenario as `# A` above, but on macOS via
 [Colima](https://github.com/abiosoft/colima). Docker-for-Mac substitutes work
-too, but Colima is what this path is tested on. The cluster side needs three
-extras that plain-Docker Linux gets for free — MetalLB to give the Istio
-Gateway a real IP, a static route from the Mac into the Colima VM so that IP
-is reachable, and an iptables `FORWARD` rule inside the VM. The bootstrap
-script below sets all of that up, then runs `llmdbenchmark ... standup` and
-patches the two sims so they have **asymmetric latency and completion-token
-output** (opt-125m: TTFT 3s, ITL 200ms, max-tokens 512; opt-350m: TTFT 1s,
-ITL 50ms, max-tokens 64). That asymmetry is the routing decision the
-[CostGuard](https://github.com/kubernetes-sigs/gateway-api-inference-extension/)
-picker is being evaluated on: one backend is slower **and** produces more
-completion tokens per response than the other.
+too, but Colima is what this path is tested on. The bootstrap script sets up
+Colima + kind, runs `llmdbenchmark ... standup`, and patches the two sims so
+they have **asymmetric latency and completion-token output** (opt-125m: TTFT
+3s, ITL 200ms, max-tokens 512; opt-350m: TTFT 1s, ITL 50ms, max-tokens 64).
+Client traffic reaches the Istio Gateway via `kubectl port-forward` rather
+than a LoadBalancer IP — see below.
+
+The rest of this section uses **CostGuard** as a running example to make the
+mechanics concrete — the values file, the routing decision under test, and
+the profile that exercises the cost signal are all CostGuard-specific. The
+Colima + kind + port-forward + Makefile machinery itself is scorer-agnostic:
+swap the values file passed to `ipp-deploy` (and, if needed, the workload
+profile) to evaluate a different scorer against the same two-sim asymmetric
+stack. The asymmetry chosen here — one backend slower **and** producing more
+completion tokens per response — is what the
+[CostGuard](https://github.com/llm-d/llm-d-inference-payload-processor/tree/main/pkg/framework/plugins/modelselector/scorer/costguard)
+picker is being evaluated against; other scorers will care about different
+per-backend deltas.
 
 **Prereqs (Homebrew):** `colima`, `docker` CLI, `kind`, `kubectl`, `helm`,
-`bash 4+`, `sudo` for the route add. Pinned versions the script drives:
-kind node `v1.34.0`, MetalLB `v0.15.2`, benchmark image `v0.7.0`, sim `v0.8.2`.
+`bash 4+`. Pinned versions the script drives: kind node `v1.34.0`, benchmark
+image `v0.7.0`, sim `v0.8.2`.
 
 ```bash
 ./ipp_benchmarking/tools/mac_colima_bootstrap.sh
 ```
 
-The script is idempotent — re-running skips Colima/kind/MetalLB steps that
-are already done. Pass `--skip-standup` to only refresh the cluster/MetalLB
-side without re-running `llmdbenchmark standup`. On completion it prints the
-Gateway's MetalLB IP, a smoke-test `curl` line, and the exact `helm upgrade`
-block to run next.
+The script is idempotent — re-running skips Colima/kind steps that are
+already done. Pass `--skip-standup` to only refresh the cluster side without
+re-running `llmdbenchmark standup`. On completion it prints the port-forward
+command and a smoke-test `curl` line.
 
-What the script leaves ready: Colima up, single-node kind cluster,
-MetalLB with a pool in the kind Docker-network CIDR (last-octet .200–.250),
-the `cicd/kind-sim-multi` stack stood up in namespace `llmdbench` with two
+What the script leaves ready: Colima up, single-node kind cluster, the
+`cicd/kind-sim-multi` stack stood up in namespace `llmdbench` with two
 `InferencePool`s + two header-match `HTTPRoute`s (created via
 `gen_httproutes.sh` as a fallback for the modelservice chart), and both
 decode sims patched with the asymmetric flags above. **IPP is not
 installed** — that's the CostGuard step below.
+
+**Reaching the Gateway (port-forward).** Expose the Istio Gateway on
+`localhost:8080` via `kubectl port-forward` and point `llmdbenchmark` at it.
+Run this in a separate terminal and leave it open for the duration of the run:
+
+```bash
+kubectl port-forward -n llmdbench svc/infra-llmdbench-inference-gateway-istio 8080:80
+```
+
+Smoke test from the Mac:
+
+```bash
+curl -sS -X POST http://localhost:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"facebook/opt-125m","prompt":"hello","max_tokens":8}' | jq .
+```
 
 Install IPP with your CostGuard values file:
 
@@ -191,8 +212,30 @@ helm uninstall payload-processor -n llmdbench
 llmdbenchmark --spec cicd/kind-sim-multi teardown -p llmdbench
 ```
 
-Or use the `Makefile` targets: `make sim-colima IPP_PATH=...` runs
-bootstrap + deploy in one shot; `make tear-down-sim` wipes everything.
+**Automation (Makefile).** The top-level `Makefile` wraps the scripts above
+into a small set of idempotent targets so you don't have to memorize the
+individual invocations:
+
+- `make sim-colima IPP_PATH=/path/to/llm-d-inference-payload-processor` —
+  end-to-end: `bootstrap-colima` (Colima + kind + sim standup with the two
+  asymmetric decode sims) followed by `ipp-deploy` (build the IPP image from
+  `$IPP_PATH`, side-load it into kind, helm-install the CostGuard values).
+  Leaves ns/`llmdbench` ready to receive traffic.
+- `make bootstrap-colima` — cluster + sim standup only, skipping the IPP
+  install. Useful when you want to swap IPP values between runs without
+  reprovisioning the cluster.
+- `make ipp-deploy IPP_PATH=...` — (re)install just the IPP release. Fast path
+  when iterating on IPP code or values.
+- `make ipp-undeploy` — `helm uninstall` the `payload-processor` release only;
+  cluster and sims stay up so the next `ipp-deploy` is quick.
+- `make tear-down-sim` — full wipe: uninstall IPP, `llmdbenchmark teardown` the
+  sim stack, `kind delete cluster`, `colima stop`. The Colima VM disk (~45GB)
+  is retained; add `colima delete default` to reclaim it.
+
+Defaults (`SIM_KIND_CLUSTER_NAME=ipp-e2e`, `SIM_NAMESPACE=llmdbench`,
+`SIM_SPEC=cicd/kind-sim-multi`, `SIM_RELEASE=payload-processor`) match what
+the underlying scripts use internally and can be overridden on the make
+command line.
 
 **Exercising the CostGuard cost signal (large `max_tokens`).** The upstream
 `sanity_random.yaml` profile is a generic smoke test — it samples
@@ -240,14 +283,12 @@ the equivalent dotted overrides would be
 
 **Mac-specific gotchas.**
 
-- The `sudo route add` in the script will prompt for your password once.
 - If Colima was already running the script does **not** restart it — it
   reuses the running VM. If you want a clean-slate Colima VM, run
   `colima stop && colima delete default` first.
-- The MetalLB pool is derived from `docker network inspect kind`. The kind
-  network CIDR is stable across cluster re-creates on the same host, but if
-  you `docker network prune` between runs the pool will shift; re-run the
-  script to reconfigure.
+- The port-forward must stay running for the duration of the benchmark.
+  If it dies (Ctrl-C, laptop sleep, pod restart) `llmdbenchmark run` will
+  fail with connection errors — restart it and re-run.
 - IPP config changes don't restart the pod (chart has no ConfigMap checksum
   annotation) — after a `helm upgrade` that only changes `customConfig` or
   `listModels`, run
