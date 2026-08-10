@@ -21,6 +21,17 @@ EPHEMERAL_POD_LABEL = "llm-d-benchmark/ephemeral=true"
 """Label applied to all ephemeral curl/smoketest pods for cleanup."""
 
 
+def resolve_direct_service_namespace(
+    plan_config: dict | None, fallback_namespace: str
+) -> str:
+    """Return the namespace containing the direct ModelService Service."""
+    gateway = (plan_config or {}).get("gateway") or {}
+    gateway_namespace = gateway.get("namespace")
+    if gateway_namespace in (None, "", "auto"):
+        return fallback_namespace
+    return str(gateway_namespace)
+
+
 def _normalize_url_prefix(prefix: str | None) -> str:
     """Normalize a URL path prefix for safe concatenation with ``/v1/models``.
 
@@ -155,27 +166,28 @@ def find_standalone_endpoint(
 
 
 def find_fma_endpoint(cmd: CommandExecutor, namespace: str) -> str | None:
-    """Find FMA replicaset name.
+    """Find FMA requester deployment name.
 
-    Queries for replicaset labelled ``stood-up-from=llm-d-benchmark``.
+    Queries for deployments labelled ``stood-up-from=llm-d-benchmark``.
 
     Returns:
         name -- None if not found.
     """
 
-    result = cmd.kube(
-        "get",
-        "replicaset",
-        "-l",
-        "stood-up-from=llm-d-benchmark",
-        "--namespace",
-        namespace,
-        "-o",
-        "jsonpath={.items[*].metadata.name}",
-        check=False,
-    )
-    if result.success and result.stdout.strip():
-        return f"{result.stdout.strip()}.{namespace}.cluster.local"
+    for resource in ("deployment", "replicaset"):
+        result = cmd.kube(
+            "get",
+            resource,
+            "-l",
+            "stood-up-from=llm-d-benchmark",
+            "--namespace",
+            namespace,
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+            check=False,
+        )
+        if result.success and result.stdout.strip():
+            return f"{result.stdout.strip()}.{namespace}.cluster.local"
 
     return None
 
@@ -190,7 +202,7 @@ def find_epponly_endpoint(
     In llm-d's standalone router topology (``gateway.className: epponly``)
     no Kubernetes Gateway is deployed; the EPP pod runs an Envoy sidecar
     that serves HTTP on the same service as the gRPC ExtProc port.
-    Clients hit ``{model_id_label}-gaie-epp:80`` directly.
+    Clients hit ``{model_id_label}-router-epp:80`` directly.
 
     Returns:
         (clusterIP, serviceName, port) or (None, expected_name, "80") if
@@ -199,7 +211,7 @@ def find_epponly_endpoint(
     if not model_id_label:
         return None, None, "80"
 
-    svc_name = f"{model_id_label}-gaie-epp"
+    svc_name = f"{model_id_label}-router-epp"
     # Fetch the whole service as JSON and pick the HTTP port in Python.
     # Earlier this used a `jsonpath` filter (``?(@.port==80)``) but that
     # syntax is not reliably handled by every kubectl/oc version we ship
@@ -247,6 +259,54 @@ def find_epponly_endpoint(
         port = "80"
 
     return ip, svc_name, port
+
+
+def find_direct_modelservice_endpoint(
+    cmd: CommandExecutor,
+    namespace: str,
+    model_id_label: str,
+    default_port: str = "8000",
+) -> tuple[str | None, str | None, str]:
+    """Find the plain Service used by ``gateway.className=none``.
+
+    The Service selects modelservice decode pods and targets vLLM directly;
+    no Gateway, EPP, Envoy, or routing proxy is in the request path.
+    """
+    if not model_id_label:
+        return None, None, default_port
+
+    svc_name = f"{model_id_label}-direct"
+    result = cmd.kube(
+        "get",
+        "service",
+        svc_name,
+        "--namespace",
+        namespace,
+        "-o",
+        "json",
+        check=False,
+    )
+    if not (result.success and result.stdout.strip()):
+        return None, svc_name, default_port
+
+    try:
+        service = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None, svc_name, default_port
+
+    spec = service.get("spec", {}) or {}
+    service_ip = spec.get("clusterIP") or None
+    ports = spec.get("ports") or []
+    service_port = default_port
+    for port in ports:
+        if port.get("name") == "http":
+            service_port = str(port.get("port", default_port))
+            break
+    else:
+        if ports:
+            service_port = str(ports[0].get("port", default_port))
+
+    return service_ip, svc_name, service_port
 
 
 def find_gateway_endpoint(
@@ -592,6 +652,13 @@ _RETRYABLE_INDICATORS = (
     "still loading",
     "503",
     "502",
+    # FMA cold-start race: bound launcher pod is k8s-Ready
+    # but vLLM's serving port isn't accepting yet,
+    # and EPP InferencePool is empty until ISC labels propagate.
+    "Connection refused",
+    "upstream connect error",
+    "remote connection failure",
+    "no pods available in datastore",
 )
 
 
@@ -789,3 +856,167 @@ def test_model_serving(
         return None  # success
 
     return last_error
+
+
+# vLLM cache-reset endpoints hit on each serving pod when ``reset_caches``
+# is enabled. All are POST, take no body, and only exist when the server was
+# launched with VLLM_SERVER_DEV_MODE=1.
+_CACHE_RESET_ENDPOINTS = (
+    "/reset_prefix_cache",
+    "/reset_mm_cache",
+    "/reset_encoder_cache",
+)
+
+
+def reset_caches_pods(
+    cmd: CommandExecutor,
+    namespace: str,
+    model_label: str,
+    inference_port: str | int,
+    plan_config: dict | None = None,
+    logger=None,
+    timeout_seconds: int = 30,
+) -> list[str]:
+    """Reset the prefix, multimodal, and encoder caches on every vLLM pod.
+
+    Discovers running pods labelled ``llm-d.ai/model=<model_label>`` in
+    *namespace* (all stack types -- modelservice, standalone, FMA --
+    apply this label to their served vLLM pods) and issues a single
+    ephemeral curl pod that loops over every pod IP, POSTing each of
+    ``/reset_prefix_cache``, ``/reset_mm_cache``, and
+    ``/reset_encoder_cache`` to it on *inference_port*.
+
+    These reset endpoints only exist when the vLLM server was launched with
+    ``VLLM_SERVER_DEV_MODE=1`` (the repo default via
+    ``vllmCommon.flags.serverDevMode``); a scenario that turns it off gets
+    a 404. All failures here are non-fatal: this returns a list of warning
+    strings (also logged if *logger* is given) and never raises, so a
+    failed reset never aborts a benchmark run.
+    """
+    warnings: list[str] = []
+
+    def _warn(msg: str) -> None:
+        warnings.append(msg)
+        if logger:
+            logger.log_warning(msg)
+
+    if not model_label:
+        _warn(
+            "reset_caches: no model label resolved -- cannot select "
+            "vLLM pods, skipping reset."
+        )
+        return warnings
+
+    # Discover running pod IPs by the serving-pod label. The jsonpath must
+    # contain no spaces: cmd.kube() joins argv with spaces and hands the
+    # result to a shell, so a `{range .items[*]}...` template would be
+    # word-split and its tail mis-read by kubectl as a positional pod name
+    # (colliding with `-l`). The space-free `{.items[*].status.podIP}` form
+    # prints every IP separated by a single space instead.
+    ip_result = cmd.kube(
+        "get",
+        "pods",
+        "-l",
+        f"llm-d.ai/model={model_label}",
+        "--namespace",
+        namespace,
+        "--field-selector=status.phase=Running",
+        "-o",
+        "jsonpath={.items[*].status.podIP}",
+        check=False,
+    )
+    if ip_result.dry_run:
+        return warnings
+    if not ip_result.success:
+        _warn(
+            f"reset_caches: failed to list vLLM pods in ns/{namespace}: "
+            f"{(ip_result.stderr or ip_result.stdout)[:200]}"
+        )
+        return warnings
+
+    pod_ips = [ip for ip in ip_result.stdout.split() if ip and ip != "null"]
+    if not pod_ips:
+        _warn(
+            f"reset_caches: no running vLLM pods found for "
+            f"'llm-d.ai/model={model_label}' in ns/{namespace} -- skipping reset."
+        )
+        return warnings
+
+    # Batch every pod IP x every cache endpoint into a single ephemeral curl
+    # pod. `-w '\n%{http_code}'` appends each request's status so a total
+    # failure is still diagnosable; per-request failures are surfaced inline
+    # by curl's own stderr (folded in via 2>&1). Non-2xx (esp. 404 when dev
+    # mode is off) is a warning, not an error.
+    ip_list = " ".join(pod_ips)
+    endpoint_list = " ".join(_CACHE_RESET_ENDPOINTS)
+    reset_url_tmpl = f"http://$ip:{inference_port}$ep"
+    inner = (
+        f"for ip in {ip_list}; do "
+        f"for ep in {endpoint_list}; do "
+        f'echo "== $ip$ep =="; '
+        f"curl -sk --max-time {timeout_seconds} "
+        f'-w "\\n%{{http_code}}\\n" -X POST {reset_url_tmpl} 2>&1; '
+        f"done; "
+        f"done"
+    )
+    curl_cmd = f"'{inner}'"
+
+    override_args = _build_overrides(plan_config)
+    curl_image = "quay.io/fedora/fedora"
+    pod_name = f"reset-caches-{_rand_suffix()}"
+
+    kubectl_args = (
+        [
+            "run",
+            pod_name,
+            "--rm",
+            "--attach",
+            "--quiet",
+            "--restart=Never",
+            "--namespace",
+            namespace,
+            f"--image={curl_image}",
+        ]
+        + _ephemeral_label_args()
+        + override_args
+        + ["--command", "--", "sh", "-c", curl_cmd]
+    )
+
+    result = cmd.kube(*kubectl_args, check=False)
+
+    if result.dry_run:
+        return warnings
+
+    if not result.success:
+        _warn(
+            f"reset_caches: curl pod failed against "
+            f"{len(pod_ips)} vLLM pod(s): "
+            f"{(result.stderr or result.stdout)[:200]}"
+        )
+        return warnings
+
+    # Every request prints its own trailing HTTP status line. A non-2xx
+    # anywhere is worth a warning -- most commonly VLLM_SERVER_DEV_MODE not
+    # being enabled (404), or a cache the server build doesn't support.
+    statuses = [
+        line.strip() for line in result.stdout.splitlines() if line.strip().isdigit()
+    ]
+    bad = [s for s in statuses if not s.startswith("2")]
+    if bad:
+        hint = ""
+        if "404" in bad:
+            hint = (
+                " (endpoint not found -- was the server launched with "
+                "VLLM_SERVER_DEV_MODE=1?)"
+            )
+        _warn(
+            f"reset_caches: {len(bad)}/{len(statuses)} reset request(s) "
+            f"returned non-2xx (e.g. HTTP {bad[0]}){hint}"
+        )
+    elif logger:
+        logger.log_info(
+            f"Reset prefix/mm/encoder caches on {len(pod_ips)} vLLM pod(s) "
+            f"in ns/{namespace}"
+        )
+
+    return warnings

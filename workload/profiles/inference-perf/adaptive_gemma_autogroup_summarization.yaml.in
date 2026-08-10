@@ -1,0 +1,41 @@
+# Gemma-PINNED load for the adaptive experiment. model_name "auto/gemma" -> the IPP
+# auto-group-model-name-filter pins every request to the Gemma pool (no spill to Qwen). Same
+# summarization shape, tokenizer and rate as the shared and Qwen profiles. One 300s poisson stage;
+# the driver launches it in the stages where Gemma-only is "on" (-1, 1, 4).
+load:
+  type: poisson
+  interval: 0
+  request_timeout: 120
+  stages:
+  # 10 rps against a ceiling of 11.1 rps MEASURED on this exact shape+tokenizer (ramp 12/14/16/18:
+  # output rate clamps at 10.9-11.1 no matter what is offered, TTFT 3.0s -> 32.7s while ITL stays
+  # flat at 0.047 -- a hard throughput ceiling, everything above it is queue). 10 rps = 90% of it:
+  # busy but still under the knee (e2e p50 9.7s, TTFT 0.166s).
+  - {rate: 10.0, duration: 300}
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: "auto/gemma"
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  # each pinned profile uses its OWN model's tokenizer so the pool receives exactly the ~2048
+  # tokens the shape specifies. Generating with Qwen's tokenizer for both inflated Gemma's real
+  # input by 39% (server saw 2868 tokens vs 2062 generated, token_count_mismatches 1318), which
+  # alone pushed Gemma's prefill to ~96% of its ceiling. The shared "auto" profile can only carry
+  # one tokenizer, so shared requests landing on Gemma still get inflated -- unavoidable.
+  pretrained_model_name_or_path: RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic
+data:
+  type: random
+  input_distribution:  {min: 1024, max: 4096, mean: 2048, std_dev: 512, total_count: 200}
+  output_distribution: {min: 128,  max: 512,  mean: 256,  std_dev: 64,  total_count: 200}
+report:
+  # per_request IS needed here: it is the only harness-side per-request record (start/end time,
+  # error, output tokens). It embeds the full streamed response, so expect ~1-2 GB per run at
+  # 3000 requests of this shape and a slow collection step. stage.sh slims it to
+  # per_request_slim.json right after archiving; the fat original is gitignored.
+  request_lifecycle: {summary: true, per_stage: true, per_request: true}
+storage:
+  local_storage: {path: /workspace}

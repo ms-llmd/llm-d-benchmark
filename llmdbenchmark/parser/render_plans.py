@@ -18,6 +18,16 @@ from jinja2 import Environment, TemplateSyntaxError, UndefinedError
 
 from llmdbenchmark.config import config
 from llmdbenchmark.logging.logger import get_logger
+from llmdbenchmark.parser.cli_overrides import (
+    MISSING,
+    REDACTED,
+    dotted_leaves,
+    find_broken_parent_paths,
+    is_secret_path,
+    resolve_dotted,
+    selectors_for_stack,
+    validate_selectors,
+)
 from llmdbenchmark.parser.config_schema import validate_config
 from llmdbenchmark.parser.render_result import StackErrors, RenderResult
 
@@ -49,9 +59,12 @@ class RenderPlans:
         cli_methods: str | None = None,
         cli_monitoring: bool | None = None,
         cli_wva: bool = False,
+        cli_epp_keda_saturation: bool = False,
         cli_gateway_class: str | None = None,
         setup_overrides: dict | None = None,
+        setup_overrides_by_stack: dict[str, dict] | None = None,
         cli_stack_filter: list[str] | None = None,
+        cli_non_admin: bool = False,
     ):
         self.template_dir = Path(template_dir)
         self.defaults_file = Path(defaults_file)
@@ -64,12 +77,23 @@ class RenderPlans:
         self.cli_methods = cli_methods
         self.cli_monitoring = cli_monitoring
         self.cli_wva = cli_wva
+        self.cli_epp_keda_saturation = cli_epp_keda_saturation
         # CLI override for `gateway.className`. Applied per-stack in
         # `_resolve_gateway_class` ahead of `_validate_epponly_constraints`
         # so the validator sees the post-override value. Only affects
         # rendering on the modelservice path; ignored by kustomize/standalone/fma.
         self.cli_gateway_class = cli_gateway_class
+        # Unscoped overrides applied LAST, so they win over everything below:
+        # DoE ``setup.treatments`` values ride here, and a treatment is the
+        # deliberate sweep factor -- it must beat a CLI ``--set``.
         self.setup_overrides = setup_overrides
+        # Scenario overrides keyed by stack selector ("*", an exact stack
+        # name, or an fnmatch glob). Carries ``--cluster-config`` (folded
+        # into "*") and ``--set``. Resolved per stack by
+        # specificity in ``_effective_setup_overrides``.
+        self.setup_overrides_by_stack: dict[str, dict] = dict(
+            setup_overrides_by_stack or {}
+        )
         # When --stack selects exactly one stack, -m/--models scopes to
         # that stack only (sibling stacks keep their scenario-defined
         # models). When --stack isn't set or selects multiple stacks and
@@ -80,6 +104,17 @@ class RenderPlans:
         # _resolve_model fires once per RenderPlans instance, not N times
         # in a multi-stack scenario.
         self._cli_model_multi_stack_warned: bool = False
+
+        # ``--non-admin`` propagates into the Jinja render context as
+        # ``nonAdmin`` so templates can gate cluster-scoped resources
+        # (ClusterRole, ClusterRoleBinding, etc.) the namespaced user
+        # can't create. Currently consumed by
+        # ``05_namespace_sa_rbac_secret.yaml.j2`` to skip the
+        # ``inference-perf-service-viewer`` pair -- those are only
+        # required by the ``nop`` harness's cluster-wide service
+        # discovery, so dropping them is safe for the mainstream
+        # harnesses (inference-perf, guidellm, vllm-benchmark).
+        self.cli_non_admin: bool = bool(cli_non_admin)
 
         self.logger = logger or get_logger(
             config.log_dir, verbose=config.verbose, log_name=__name__
@@ -113,8 +148,18 @@ class RenderPlans:
         env.filters["b64encode"] = self._b64encode_filter
         env.filters["model_id_label"] = self._model_id_label_filter
 
+        # `raise` global lets templates abort rendering with a clear
+        # error when an input is invalid for the current code path
+        # (e.g. an option that only applies to some gateway classes).
+        env.globals["raise"] = self._raise_helper
+
         self._jinja_env = env
         return env
+
+    @staticmethod
+    def _raise_helper(message: str) -> str:
+        """Abort template rendering with the given error message."""
+        raise ValueError(message)
 
     @staticmethod
     def _indent_filter(text: str, width: int = 4, first: bool = False) -> str:
@@ -136,7 +181,20 @@ class RenderPlans:
     def _toyaml_filter(
         value: Any, indent: int = 0, default_flow_style: bool = False
     ) -> str:
-        """Convert Python object to YAML string."""
+        """Convert Python object to YAML string.
+
+        Multi-line string values (e.g. embedded ConfigMap content like
+        ``router.epp.pluginsCustomConfig.<filename>``) render as YAML
+        literal blocks (``|``) instead of double-quoted scalars with
+        ``\\n`` escapes. The two are semantically equivalent, but the
+        pre-router-migration ``12_router-values.yaml.j2`` template
+        hand-emitted ``: |`` for ``pluginsCustomConfig`` so the rendered
+        artifact stayed readable. Now that the template is a generic
+        pass-through, the literal-block style has to live in the
+        ``toyaml`` filter or every multi-line value regresses to escaped
+        single-line form. Single-line strings still use the default
+        bare/quoted heuristic.
+        """
         if value is None:
             return ""
         if isinstance(value, str):
@@ -144,8 +202,20 @@ class RenderPlans:
         if isinstance(value, (dict, list)) and len(value) == 0:
             return ""
 
+        class _LiteralBlockDumper(yaml.SafeDumper):
+            pass
+
+        def _str_representer(dumper, data):
+            style = "|" if "\n" in data else None
+            return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+        _LiteralBlockDumper.add_representer(str, _str_representer)
+
         result = yaml.dump(
-            value, default_flow_style=default_flow_style, allow_unicode=True
+            value,
+            Dumper=_LiteralBlockDumper,
+            default_flow_style=default_flow_style,
+            allow_unicode=True,
         ).rstrip()
 
         if indent > 0:
@@ -249,6 +319,35 @@ class RenderPlans:
                 result[key] = self.deep_merge(result[key], value)
             else:
                 result[key] = deepcopy(value)
+
+        return result
+
+    def _apply_accelerator_profile(self, values: dict) -> dict:
+        """Apply the auto-detected machine profile.
+
+        Machine profiles live next to defaults under ``overlays/<profile>.yaml``.
+        Guides consume the profile's runtime command fragments, so the same
+        guide definition is used unchanged on every accelerator.
+        """
+        result = deepcopy(values)
+        accelerator = result.get("accelerator") or {}
+        profile = accelerator.get("profile")
+
+        if profile and profile != "auto":
+            profile_names = [profile]
+            if profile.startswith("intel-") and profile != "intel-gaudi":
+                profile_names.append("intel-xpu")
+
+            for profile_name in reversed(profile_names):
+                profile_file = (
+                    self.defaults_file.parent / "overlays" / f"{profile_name}.yaml"
+                )
+                if not profile_file.exists():
+                    continue
+                self.logger.log_info(
+                    f"Applying auto-detected accelerator profile: {profile_name}"
+                )
+                result = self.deep_merge(result, self._load_yaml(profile_file))
 
         return result
 
@@ -485,13 +584,13 @@ class RenderPlans:
             )
         else:
             podmonitor_config["enabled"] = False
-            ie = result.setdefault("inferenceExtension", {})
-            ie_mon = ie.setdefault("monitoring", {})
-            ie_prom = ie_mon.setdefault("prometheus", {})
-            ie_prom["enabled"] = False
+            router = result.setdefault("router", {})
+            router_mon = router.setdefault("monitoring", {})
+            router_prom = router_mon.setdefault("prometheus", {})
+            router_prom["enabled"] = False
             self.logger.log_info(
                 "Monitoring disabled from CLI (--no-monitoring): "
-                "PodMonitor and GAIE ServiceMonitor will not be created"
+                "PodMonitor and router ServiceMonitor will not be created"
             )
 
         return result
@@ -508,11 +607,32 @@ class RenderPlans:
         self.logger.log_info("Workload Variant Autoscaler enabled from CLI")
         return result
 
+    def _resolve_epp_keda_saturation(self, values: dict) -> dict:
+        """Enable EPP+KEDA saturation autoscaling when ``--epp-keda-saturation`` is set."""
+        if not self.cli_epp_keda_saturation:
+            return values
+
+        result = deepcopy(values)
+
+        # Mutual-exclusion check: can't use both WVA and EPP+KEDA for the same stack
+        wva_config = result.get("wva", {}) or {}
+        if wva_config.get("enabled", False):
+            raise ValueError(
+                "Cannot enable both WVA and EPP+KEDA saturation autoscaling for the same stack. "
+                "Choose one: pass either `-u/--wva` or `--epp-keda-saturation`, not both."
+            )
+
+        epp_keda_config = result.setdefault("eppKedaSaturation", {})
+        epp_keda_config["enabled"] = True
+
+        self.logger.log_info("EPP+KEDA saturation autoscaling enabled from CLI")
+        return result
+
     def _resolve_deploy_method(self, values: dict) -> dict:
         """Override deploy method based on CLI ``--methods`` flag.
 
         Accepts ``--methods standalone``, ``--methods modelservice``,
-        ``--methods fma`` or ``--methods kustomize``.
+        ``--methods fma``, ``--methods kustomize`` or ``--methods nok8s``.
         Only one method may be active at a time.
 
         Without ``--methods``, the scenario YAML value is used as-is.
@@ -534,12 +654,6 @@ class RenderPlans:
                 "Cannot enable both standalone and fma -- choose one. Using standalone."
             )
             methods = ["standalone"]
-        if "modelservice" in methods and "fma" in methods:
-            self.logger.log_warning(
-                "Cannot enable both modelservice and fma -- "
-                "choose one. Using modelservice."
-            )
-            methods = ["modelservice"]
         if "kustomize" in methods and any(
             m in methods for m in ("standalone", "modelservice", "fma")
         ):
@@ -548,36 +662,54 @@ class RenderPlans:
                 "choose one. Using kustomize."
             )
             methods = ["kustomize"]
+        if "nok8s" in methods and any(
+            m in methods for m in ("standalone", "modelservice", "fma", "kustomize")
+        ):
+            self.logger.log_warning(
+                "Cannot combine nok8s with another deploy method -- "
+                "choose one. Using nok8s."
+            )
+            methods = ["nok8s"]
 
         standalone_config = result.setdefault("standalone", {})
         modelservice_config = result.setdefault("modelservice", {})
         fma_config = result.setdefault("fma", {})
         kustomize_config = result.setdefault("kustomize", {})
+        nok8s_config = result.setdefault("nok8s", {})
 
-        if "standalone" in methods:
+        if "nok8s" in methods:
+            standalone_config["enabled"] = False
+            modelservice_config["enabled"] = False
+            fma_config["enabled"] = False
+            kustomize_config["enabled"] = False
+            nok8s_config["enabled"] = True
+            self.logger.log_info("Deploy method from CLI: nok8s")
+        elif "standalone" in methods:
             standalone_config["enabled"] = True
             modelservice_config["enabled"] = False
             fma_config["enabled"] = False
             kustomize_config["enabled"] = False
+            nok8s_config["enabled"] = False
             self.logger.log_info("Deploy method from CLI: standalone")
-        elif "modelservice" in methods:
-            standalone_config["enabled"] = False
-            modelservice_config["enabled"] = True
-            fma_config["enabled"] = False
-            kustomize_config["enabled"] = False
-            self.logger.log_info("Deploy method from CLI: modelservice")
-        elif "fma" in methods:
-            standalone_config["enabled"] = False
-            modelservice_config["enabled"] = False
-            fma_config["enabled"] = True
-            kustomize_config["enabled"] = False
-            self.logger.log_info("Deploy method from CLI: fma")
         elif "kustomize" in methods:
             standalone_config["enabled"] = False
             modelservice_config["enabled"] = False
             fma_config["enabled"] = False
             kustomize_config["enabled"] = True
+            nok8s_config["enabled"] = False
             self.logger.log_info("Deploy method from CLI: kustomize")
+        elif "modelservice" in methods or "fma" in methods:
+            # Either or both. FMA layers on top of modelservice (or runs
+            # alone in legacy FMA-only scenarios); the two flags are
+            # independent toggles, mirroring how the CLI's runtime
+            # _resolve_deploy_methods returns both when both are enabled.
+            standalone_config["enabled"] = False
+            kustomize_config["enabled"] = False
+            nok8s_config["enabled"] = False
+            modelservice_config["enabled"] = "modelservice" in methods
+            fma_config["enabled"] = "fma" in methods
+            chosen = [m for m in ("modelservice", "fma") if m in methods]
+            self.logger.log_info(f"Deploy method(s) from CLI: {', '.join(chosen)}")
 
         return result
 
@@ -585,6 +717,7 @@ class RenderPlans:
     # at render time so a typo doesn't silently produce a broken Gateway /
     # InferencePool chart configuration.
     _SUPPORTED_GATEWAY_CLASSES: tuple[str, ...] = (
+        "none",
         "epponly",
         "istio",
         "agentgateway",
@@ -709,6 +842,71 @@ class RenderPlans:
 
         return errors
 
+    @staticmethod
+    def _normalize_direct_service_mode(values: dict) -> dict:
+        """Make ``gateway.className=none`` a true direct-vLLM baseline.
+
+        The modelservice chart enables its per-pod routing proxy by default.
+        A plain Service pointing at that port would still put the proxy in the
+        request path, defeating the baseline.  Disable it before templates are
+        rendered so the chart makes vLLM bind directly to ``servicePort``.
+        """
+        gateway_class = (values.get("gateway") or {}).get("className", "")
+        modelservice_enabled = (values.get("modelservice") or {}).get("enabled", True)
+        if gateway_class == "none" and modelservice_enabled:
+            routing = values.setdefault("routing", {})
+            routing.setdefault("proxy", {})["enabled"] = False
+
+            # Accelerator-neutral guides may provide a custom command that
+            # binds decode vLLM to the proxy backend port. Direct mode has no
+            # proxy, so make the custom command follow the chart's normal
+            # proxy-disabled behavior and listen on the Service port instead.
+            decode_vllm = values.setdefault("decode", {}).get("vllm") or {}
+            custom_command = decode_vllm.get("customCommand")
+            if isinstance(custom_command, str):
+                decode_vllm["customCommand"] = custom_command.replace(
+                    "$VLLM_METRICS_PORT",
+                    "$VLLM_INFERENCE_PORT",
+                )
+                values["decode"]["vllm"] = decode_vllm
+        return values
+
+    @staticmethod
+    def _validate_direct_service_constraints(
+        values: dict,
+        stack_name: str,
+    ) -> list[str]:
+        """Reject configurations that require routing in direct mode."""
+        gateway_class = (values.get("gateway") or {}).get("className", "")
+        modelservice_enabled = (values.get("modelservice") or {}).get("enabled", True)
+        if gateway_class != "none" or not modelservice_enabled:
+            return []
+
+        errors: list[str] = []
+        http_route_mode = (values.get("httpRoute") or {}).get("mode")
+        if http_route_mode == "shared":
+            errors.append(
+                f"[{stack_name}] gateway.className=none cannot be used with "
+                "httpRoute.mode=shared (direct mode deploys no Gateway or "
+                "HTTPRoute)."
+            )
+
+        prefill = values.get("prefill") or {}
+        if prefill.get("enabled") and int(prefill.get("replicas", 0) or 0) > 0:
+            errors.append(
+                f"[{stack_name}] gateway.className=none cannot be used with "
+                "prefill replicas (direct mode bypasses P/D routing)."
+            )
+
+        decode = values.get("decode") or {}
+        decode_enabled = decode.get("enabled", int(decode.get("replicas", 0) or 0) > 0)
+        if not decode_enabled or int(decode.get("replicas", 0) or 0) < 1:
+            errors.append(
+                f"[{stack_name}] gateway.className=none requires at least one "
+                "decode replica to back the direct Service."
+            )
+        return errors
+
     def _log_image_overrides(self, values: dict) -> None:
         """Log images that have been explicitly set (not 'auto').
 
@@ -775,12 +973,12 @@ class RenderPlans:
     _STACK_SCOPED_DEFAULTS: tuple[tuple[tuple[str, ...], str], ...] = (
         # config path, default value that triggers the rewrite
         (("downloadJob", "name"), "download-model"),
-        # EPP metrics-reader Secret - the gaie chart uses this to give its
-        # SA access to the user-workload-monitoring Prometheus. Two gaie
-        # Helm releases sharing this Secret name in one namespace fail
-        # with "owned by another helm release".
+        # EPP metrics-reader Secret - the router chart uses this to give
+        # its SA access to the user-workload-monitoring Prometheus. Two
+        # router Helm releases sharing this Secret name in one namespace
+        # fail with "owned by another helm release".
         (
-            ("inferenceExtension", "monitoring", "secretName"),
+            ("router", "monitoring", "secretName"),
             "inference-gateway-sa-metrics-reader-secret",
         ),
     )
@@ -835,24 +1033,266 @@ class RenderPlans:
             cur = cur[part]
         cur[path[-1]] = value
 
+    # Sections a scenario may nest under `modelservice:` for clarity. They
+    # are consumed only on the modelservice path (see step_08_deploy_router
+    # and the modelservice-guarded templates), but every template, resolver
+    # and standup step reads them as TOP-LEVEL keys -- so we hoist them back
+    # to the top level before any resolver runs. Nesting is purely a
+    # scenario-authoring convenience; the flat top-level spelling keeps
+    # working unchanged.
+    _MODELSERVICE_HOISTED = ("gateway", "router", "routing", "httpRoute")
+
+    def _hoist_modelservice_sections(self, values: dict) -> dict:
+        """Lift ``modelservice.{gateway,router,routing,httpRoute}`` to the top level.
+
+        Scenarios may nest these under ``modelservice:`` to document that
+        they only apply on the modelservice deploy path. Templates,
+        resolvers and standup steps read them as top-level keys, so this
+        hoists them before the resolver chain runs.
+
+        The nested block is deep-merged ON TOP OF the existing top-level
+        block (defaults.yaml, or a flat scenario override), i.e. the nested
+        spelling wins, then the nested copy is popped so the resolved
+        ``config.yaml`` has a single home for each section.
+
+        A no-op when nothing is nested, so existing flat scenarios render
+        identically. ``defaults.yaml`` always provides a top-level block for
+        each key, so we can't reliably distinguish a flat scenario override
+        from the defaults here -- we simply let the nested block win over
+        whatever is present. Authors should pick one spelling per section.
+        """
+        modelservice = values.get("modelservice")
+        if not isinstance(modelservice, dict):
+            return values
+
+        for key in self._MODELSERVICE_HOISTED:
+            if key not in modelservice:
+                continue
+            nested = modelservice.pop(key)
+            existing = values.get(key)
+            values[key] = self.deep_merge(
+                existing if isinstance(existing, dict) else {},
+                nested if isinstance(nested, dict) else {},
+            )
+
+        return values
+
+    def _normalize_router_block(self, values: dict) -> dict:
+        """Lay benchmark-specific runtime details into the router block.
+
+        The scenario layer uses the llm-d-router chart's `router.*` keys
+        directly -- the 12_router-values.yaml.j2 template renders them
+        as a YAML pass-through. This method lifts in the few details a
+        scenario can't supply on its own:
+
+        - Inject ``HF_TOKEN`` into ``router.epp.env`` when
+          ``huggingface.enabled``, preserving any user-provided env
+          entries already on the list.
+        - Resolve the EPP image from ``images.routerEndpointPicker`` and
+          write it to ``router.epp.image``. A scenario that sets
+          ``router.epp.image`` explicitly wins (and partial overrides
+          merge with the catalog so the chart still renders a complete
+          ``registry/repository:tag``).
+        - Expand the benchmark-only ``router.epp.zmqPort`` into the
+          chart-native ``router.epp.extraContainerPorts`` and
+          ``router.extraServicePorts`` arrays so the kv-events
+          publisher is reachable. The knob is then popped from
+          ``router.epp`` since the chart doesn't read it directly.
+        - Materialize ``router.epp.verbosity`` into ``router.epp.flags.v``
+          when ``flags`` is unset (or bump to ``4`` when monitoring
+          metrics scraping is on). The benchmark-only ``verbosity`` knob
+          is then popped.
+        - Add an HTTP service port on 80 -> 8081 when
+          ``gateway.className: epponly`` so benchmark clients can hit
+          the standalone-chart Envoy sidecar directly.
+        - Fill ``router.tokenizer.modelName`` from ``model.name`` when
+          ``router.tokenizer.enabled: true`` and ``modelName`` is unset.
+        - Default ``router.modelServers.matchLabels`` and
+          ``targetPorts`` to the benchmark conventions when the scenario
+          hasn't overridden them.
+        - Lift ``router.inferencePool.providerConfig`` to the root-level
+          ``provider.{gatewayClassName}`` block expected by the
+          gateway chart (gke / istio only).
+
+        All transformations preserve fields the user set explicitly:
+        if a scenario or treatment provides a value, it survives.
+        """
+        router = values.setdefault("router", {})
+        epp = router.setdefault("epp", {})
+
+        # --- 1. Inject HF_TOKEN env on top of any user-supplied entries.
+        hf = values.get("huggingface", {})
+        if hf.get("enabled"):
+            env = epp.get("env") or []
+            if not any(
+                isinstance(e, dict) and e.get("name") == "HF_TOKEN" for e in env
+            ):
+                env = list(env) + [
+                    {
+                        "name": "HF_TOKEN",
+                        "valueFrom": {
+                            "secretKeyRef": {
+                                "name": hf.get("secretName", "llm-d-hf-token"),
+                                "key": hf.get("tokenKey", "HF_TOKEN"),
+                            }
+                        },
+                    }
+                ]
+                epp["env"] = env
+
+        # --- 2. Resolve EPP image. The chart's _deployment.yaml renders
+        # `{{ .image.registry }}/{{ .image.repository }}:{{ .image.tag }}`,
+        # so a partial override (e.g. tag-only) on `router.epp.image`
+        # must merge with the catalog's full image spec or the chart
+        # will render `/:custom-tag`. We always compute the catalog
+        # base first; the user's `router.epp.image` overrides on top.
+        images = values.get("images") or {}
+        chart_native = images.get("routerEndpointPicker") or {}
+        repo_full = chart_native.get("repository", "")
+        if repo_full:
+            last_slash = repo_full.rfind("/")
+            if last_slash > 0:
+                registry = repo_full[:last_slash]
+                repository = repo_full[last_slash + 1 :]
+            else:
+                registry = ""
+                repository = repo_full
+            catalog_image = {
+                "registry": registry,
+                "repository": repository,
+                "tag": chart_native.get("tag", "main"),
+                "pullPolicy": chart_native.get("pullPolicy", "IfNotPresent"),
+            }
+            user_image = epp.get("image") if isinstance(epp.get("image"), dict) else {}
+            merged_image = dict(catalog_image)
+            merged_image.update(user_image or {})
+            epp["image"] = merged_image
+
+        # --- 3. Expand zmqPort into the chart-native port arrays.
+        zmq_port = epp.pop("zmqPort", None)
+        if zmq_port:
+            container_ports = list(epp.get("extraContainerPorts") or [])
+            if not any(
+                isinstance(p, dict) and p.get("name") == "zmq" for p in container_ports
+            ):
+                container_ports.insert(
+                    0,
+                    {"name": "zmq", "containerPort": zmq_port, "protocol": "TCP"},
+                )
+                epp["extraContainerPorts"] = container_ports
+            service_ports = list(router.get("extraServicePorts") or [])
+            if not any(
+                isinstance(p, dict) and p.get("name") == "zmq" for p in service_ports
+            ):
+                service_ports.insert(
+                    0,
+                    {
+                        "name": "zmq",
+                        "port": zmq_port,
+                        "targetPort": zmq_port,
+                        "protocol": "TCP",
+                    },
+                )
+                router["extraServicePorts"] = service_ports
+
+        # --- 4. Materialize verbosity into flags.v when flags is unset.
+        verbosity = epp.pop("verbosity", None)
+        if not epp.get("flags"):
+            if (values.get("monitoring") or {}).get("metricsScrapeEnabled"):
+                epp["flags"] = {"v": "4"}
+            elif verbosity is not None:
+                epp["flags"] = {"v": str(verbosity)}
+
+        # --- 5. epponly: add HTTP service port for the in-pod proxy sidecar.
+        # 8081 is envoy's listener port, the historical default here. Not
+        # every proxy wants that though -- e.g. agentgateway's chart
+        # validation only accepts targetPort omitted, 80, or "http", not a
+        # raw port number. Rather than special-casing proxy types, the
+        # target port is just a plain override: router.proxy.httpTargetPort.
+        gw_class = (values.get("gateway") or {}).get("className", "")
+        if gw_class == "epponly":
+            service_ports = list(router.get("extraServicePorts") or [])
+            if not any(
+                isinstance(p, dict) and p.get("name") == "http" for p in service_ports
+            ):
+                proxy = router.get("proxy") or {}
+                http_target_port = proxy.get("httpTargetPort", 8081)
+                service_ports.append(
+                    {
+                        "name": "http",
+                        "port": 80,
+                        "protocol": "TCP",
+                        "targetPort": http_target_port,
+                    }
+                )
+                router["extraServicePorts"] = service_ports
+
+        # --- 6. Tokenizer modelName fallback to model.name.
+        tokenizer = router.get("tokenizer") or {}
+        if tokenizer.get("enabled") and not tokenizer.get("modelName"):
+            model_name = (values.get("model") or {}).get("name")
+            if model_name:
+                tokenizer["modelName"] = model_name
+                router["tokenizer"] = tokenizer
+
+        # --- 7. modelServers benchmark defaults (matchLabels + targetPorts).
+        model_servers = router.setdefault("modelServers", {})
+        if not model_servers.get("matchLabels"):
+            labels_block = values.get("labels") or {}
+            inference_serving = labels_block.get("inferenceServing", "")
+            model_id_label = values.get("model_id_label", "")
+            if inference_serving or model_id_label:
+                match_labels = {}
+                if inference_serving:
+                    match_labels["llm-d.ai/inferenceServing"] = str(inference_serving)
+                if model_id_label:
+                    match_labels["llm-d.ai/model"] = str(model_id_label)
+                model_servers["matchLabels"] = match_labels
+        if not model_servers.get("targetPorts"):
+            decode_port = ((values.get("decode") or {}).get("vllm") or {}).get(
+                "servicePort"
+            )
+            if decode_port:
+                model_servers["targetPorts"] = [{"number": decode_port}]
+
+        # --- 8. Lift providerConfig to root-level provider.<gw_class>
+        # for the gateway chart (gke / istio). The standalone chart's
+        # epponly mode doesn't need this.
+        inference_pool = router.get("inferencePool") or {}
+        provider_config = inference_pool.pop("providerConfig", None)
+        if gw_class in ("gke", "istio"):
+            provider_block = values.setdefault("provider", {})
+            provider_block.setdefault("name", gw_class)
+            if provider_config:
+                # Merge under provider.<gw_class>. The user's explicit
+                # root-level ``provider.<gw>`` (if any) is the more
+                # specific intent, so it wins over the lifted
+                # ``providerConfig`` -- we put providerConfig as the
+                # base and overlay the existing root-level block on top.
+                existing = provider_block.get(gw_class) or {}
+                provider_block[gw_class] = self.deep_merge(provider_config, existing)
+
+        return values
+
     def _resolve_inference_pool_host(self, values: dict) -> dict:
         """Auto-populate destinationRule.host from model_id_label when not set.
 
-        The Kubernetes service name for the GAIE EPP is always
-        ``{model_id_label}-gaie-epp``.  If a scenario's
-        ``inferenceExtension.inferencePoolProviderConfig.destinationRule``
-        exists but has no ``host``, fill it in automatically so that
-        scenario authors don't need to compute the hashed label by hand.
+        The Kubernetes service name for the router EPP is always
+        ``{model_id_label}-router-epp``.  If a scenario's
+        ``router.inferencePool.providerConfig.destinationRule`` exists but
+        has no ``host``, fill it in automatically so that scenario authors
+        don't need to compute the hashed label by hand.
         """
         dest_rule = (
-            values.get("inferenceExtension", {})
-            .get("inferencePoolProviderConfig", {})
+            values.get("router", {})
+            .get("inferencePool", {})
+            .get("providerConfig", {})
             .get("destinationRule")
         )
         if dest_rule is not None and not dest_rule.get("host"):
             model_id_label = values.get("model_id_label", "")
             if model_id_label:
-                dest_rule["host"] = f"{model_id_label}-gaie-epp"
+                dest_rule["host"] = f"{model_id_label}-router-epp"
                 self.logger.log_info(
                     f"Auto-resolved destinationRule.host to '{dest_rule['host']}'"
                 )
@@ -926,8 +1366,18 @@ class RenderPlans:
         value (``REPLACE_TOKEN`` or empty), this method checks the
         following environment variables in order:
 
-        1. ``HF_TOKEN``
-        2. ``HUGGING_FACE_HUB_TOKEN``
+        1. ``HF_TOKEN``                -- plain HuggingFace convention
+        2. ``LLMDBENCH_HF_TOKEN``      -- project-prefixed (used in CI
+                                          and ``llmdbenchmark``-namespaced
+                                          environments)
+        3. ``HUGGING_FACE_HUB_TOKEN``  -- alternate HuggingFace convention
+
+        This chain matches every other HF-token consumer in the
+        codebase -- ``_ensure_hf_token_secret`` (the kustomize-mode
+        Secret enforcer), ``step_03_detect_endpoint``'s discovery
+        path, and the harness pod env block -- so a token set under
+        any of the three names is consistently picked up regardless
+        of which code path the user hits first.
 
         If a token is found, it is injected into the values dict along
         with its base64-encoded form so that rendered K8s Secret YAMLs
@@ -948,9 +1398,14 @@ class RenderPlans:
             result["huggingface"] = hf_config
             return result
 
-        # Check environment variables (order matches HuggingFace SDK convention)
-        env_token = os.environ.get("HF_TOKEN") or os.environ.get(
-            "HUGGING_FACE_HUB_TOKEN"
+        # Check environment variables.  Order matches what
+        # ``_ensure_hf_token_secret`` and ``step_03_detect_endpoint``
+        # already use, so the harness pod's env block ends up wired up
+        # whenever the Secret would have been created.
+        env_token = (
+            os.environ.get("HF_TOKEN")
+            or os.environ.get("LLMDBENCH_HF_TOKEN")
+            or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         )
         if not env_token:
             # No token available -- disable HF secret/auth rendering.
@@ -1048,6 +1503,48 @@ class RenderPlans:
                 errors.append(f"{yaml_file.name}: {str(e)[:100]}")
         return errors
 
+    @staticmethod
+    def _validate_kustomize_patches(values: dict, stack_name: str) -> list[str]:
+        """Validate inline kustomize patches during plan rendering."""
+        kustomize_config = values.get("kustomize") or {}
+        if not kustomize_config.get("enabled"):
+            return []
+
+        errors: list[str] = []
+        patches = kustomize_config.get("patches") or []
+        for index, entry in enumerate(patches):
+            if not isinstance(entry, dict):
+                errors.append(
+                    f"[{stack_name}] kustomize.patches[{index}] must be a mapping"
+                )
+                continue
+
+            patch = entry.get("patch", "")
+            if not patch:
+                continue
+
+            try:
+                documents = list(yaml.safe_load_all(patch))
+            except yaml.YAMLError as exc:
+                errors.append(
+                    f"[{stack_name}] kustomize.patches[{index}].patch is invalid "
+                    f"YAML: {str(exc)[:100]}"
+                )
+                continue
+
+            for doc_index, document in enumerate(documents):
+                if document is None:
+                    continue
+                if not isinstance(document, dict):
+                    doc_label = "" if len(documents) == 1 else f" document {doc_index}"
+                    errors.append(
+                        f"[{stack_name}] kustomize.patches[{index}].patch"
+                        f"{doc_label} expected YAML mapping, got "
+                        f"{type(document).__name__}"
+                    )
+
+        return errors
+
     def _build_sibling_stacks(
         self,
         stacks: list[dict],
@@ -1133,6 +1630,82 @@ class RenderPlans:
                 return i
         return 1
 
+    def _effective_setup_overrides(self, stack_name: str) -> dict:
+        """Resolve the scenario overrides that apply to one stack.
+
+        Selector buckets are merged least-specific first (global, then
+        globs, then exact stack names), and the unscoped ``setup_overrides``
+        -- DoE treatment values -- goes on top of all of them.
+        """
+        resolved: dict = {}
+
+        for selector in selectors_for_stack(self.setup_overrides_by_stack, stack_name):
+            resolved = self.deep_merge(
+                resolved, self.setup_overrides_by_stack[selector]
+            )
+
+        if self.setup_overrides:
+            resolved = self.deep_merge(resolved, self.setup_overrides)
+
+        return resolved
+
+    def _log_setup_overrides(
+        self,
+        overrides: dict,
+        base_values: dict,
+        stack_name: str,
+    ) -> None:
+        """Log every scenario override applied to this stack, old -> new.
+
+        Mirrors ``_log_image_overrides``: the point is that a plan rendered
+        with CLI overrides is auditable from the log alone, without diffing
+        the rendered config against the scenario file.
+        """
+        for path, new_value in dotted_leaves(overrides):
+            old_value = resolve_dotted(base_values, path)
+            if is_secret_path(path):
+                # Never echo a credential, not even the value it replaced.
+                previous, current = REDACTED, REDACTED
+            else:
+                previous = "<unset>" if old_value is MISSING else repr(old_value)
+                current = repr(new_value)
+            self.logger.log_info(
+                f"[{stack_name}] Scenario override: {path}: {previous} -> {current}"
+            )
+
+    def _check_override_paths(
+        self,
+        overrides: dict,
+        base_values: dict,
+        stack_name: str,
+    ) -> list[str]:
+        """Validate override paths against the pre-override config.
+
+        Warns (non-fatally) when a parent key is absent -- usually a typo,
+        but legitimate for free-form blocks. Returns fatal errors for paths
+        that descend into a list or scalar: dotted paths cannot index into a
+        list here, so the merge would silently replace the whole value.
+        """
+        unknown, clobbered = find_broken_parent_paths(overrides, base_values)
+
+        for path in unknown:
+            self.logger.log_warning(
+                f"[{stack_name}] override path '{path}' does not exist in "
+                "defaults + scenario -- it will be created as a new block. "
+                "Check for a typo if you meant to change an existing value."
+            )
+
+        errors: list[str] = []
+        for path, kind in clobbered:
+            errors.append(
+                f"[{stack_name}] override path '{path}' descends into a "
+                f"{kind}, which would silently replace it. Dotted overrides "
+                f"cannot index into a list -- assign the whole value instead "
+                f'(e.g. "{path}=[{{...}}, {{...}}]"), or set it in the '
+                f"scenario file."
+            )
+        return errors
+
     def _process_stack(
         self,
         stack: dict,
@@ -1168,8 +1741,51 @@ class RenderPlans:
         merged_values = self.deep_merge(defaults, shared or {})
         merged_values = self.deep_merge(merged_values, stack_config)
 
-        if self.setup_overrides:
-            merged_values = self.deep_merge(merged_values, self.setup_overrides)
+        # Hoist scenario-nested modelservice.{gateway,router,routing} to the
+        # top level BEFORE setup overrides are merged. Templates, resolvers
+        # and standup steps read these as top-level keys, and DoE treatment /
+        # CLI overrides target the top-level dotted paths (e.g.
+        # `router.epp.pluginsConfigFile`). Hoisting first preserves the
+        # documented precedence defaults < scenario < treatment: a treatment's
+        # top-level override lands on top of the hoisted scenario value and
+        # wins, instead of the nested scenario block clobbering it.
+        merged_values = self._hoist_modelservice_sections(merged_values)
+
+        # Scenario overrides for THIS stack: --cluster-config and --set
+        # (resolved by selector specificity), then unscoped setup overrides
+        # (DoE treatments) on top. Computed once and applied at both merge
+        # points below so the two stay in lockstep.
+        stack_overrides = self._effective_setup_overrides(stack_name)
+        if stack_overrides:
+            self._log_setup_overrides(stack_overrides, merged_values, stack_name)
+            override_errors = self._check_override_paths(
+                stack_overrides, merged_values, stack_name
+            )
+            if override_errors:
+                for msg in override_errors:
+                    self.logger.log_error(msg)
+                    stack_errors.render_errors.append(msg)
+                    result.global_errors.append(msg)
+                return
+            merged_values = self.deep_merge(merged_values, stack_overrides)
+
+        # Raises RuntimeError if "auto" values are present but cluster is
+        # unreachable. Skipped for the no-Kubernetes (nok8s) method: there is no
+        # cluster to scan, and the accelerator auto-detection fields belong to
+        # the (disabled) k8s methods.
+        cli_nok8s = bool(self.cli_methods) and "nok8s" in [
+            m.strip() for m in self.cli_methods.split(",")
+        ]
+        is_nok8s = cli_nok8s or merged_values.get("nok8s", {}).get("enabled", False)
+        if self.cluster_resource_resolver and not is_nok8s:
+            merged_values = self.cluster_resource_resolver.resolve_all(merged_values)
+
+        merged_values = self._apply_accelerator_profile(merged_values)
+
+        # Detection/profile defaults must never beat an explicit experiment or
+        # CLI override. Reapply them after the selected profile/variant.
+        if stack_overrides:
+            merged_values = self.deep_merge(merged_values, stack_overrides)
 
         merged_values = self._apply_resource_preset(merged_values)
 
@@ -1183,10 +1799,6 @@ class RenderPlans:
                     f"Version resolution had issues for stack {stack_name}: {e}"
                 )
 
-        # Raises RuntimeError if "auto" values are present but cluster is unreachable
-        if self.cluster_resource_resolver:
-            merged_values = self.cluster_resource_resolver.resolve_all(merged_values)
-
         merged_values = self._resolve_namespace(merged_values)
         merged_values = self._resolve_model(
             merged_values,
@@ -1198,17 +1810,34 @@ class RenderPlans:
         merged_values = self._resolve_gateway_class(merged_values)
         merged_values = self._resolve_monitoring(merged_values)
         merged_values = self._resolve_wva(merged_values)
+        merged_values = self._resolve_epp_keda_saturation(merged_values)
         merged_values = self._resolve_hf_token(merged_values)
         merged_values = self._resolve_model_id_label(merged_values)
         merged_values = self._resolve_per_stack_identity(
             merged_values, total_stacks=total_stacks
         )
         merged_values = self._resolve_inference_pool_host(merged_values)
+        merged_values = self._normalize_direct_service_mode(merged_values)
+        merged_values = self._normalize_router_block(merged_values)
         merged_values = self._substitute_config_variables(merged_values)
+        # Runtime fragments are renderer-only source text. Commands reference
+        # them during substitution; they must not leak to chart values.
+        accelerator = merged_values.get("accelerator") or {}
+        for runtime_key in (
+            "runtimePreamble",
+            "dtypeArgs",
+            "executionArgs",
+            "blockSizeArgs",
+            "memoryUtilizationArgs",
+            "kvBufferDeviceJson",
+        ):
+            accelerator.pop(runtime_key, None)
 
         merged_values["siblingStacks"] = sibling_stacks or []
         merged_values["stackIndex"] = stack_index
         merged_values["sharedInfraStackIndex"] = shared_infra_stack_index
+        merged_values["nonAdmin"] = self.cli_non_admin
+        merged_values["scenarioName"] = self.scenarios_file.stem
 
         epponly_errors = self._validate_epponly_constraints(
             merged_values,
@@ -1216,6 +1845,22 @@ class RenderPlans:
             stack_name=stack_name,
         )
         for msg in epponly_errors:
+            self.logger.log_error(msg)
+            stack_errors.render_errors.append(msg)
+
+        direct_service_errors = self._validate_direct_service_constraints(
+            merged_values,
+            stack_name=stack_name,
+        )
+        for msg in direct_service_errors:
+            self.logger.log_error(msg)
+            stack_errors.render_errors.append(msg)
+
+        kustomize_errors = self._validate_kustomize_patches(
+            merged_values,
+            stack_name=stack_name,
+        )
+        for msg in kustomize_errors:
             self.logger.log_error(msg)
             stack_errors.render_errors.append(msg)
 
@@ -1335,6 +1980,24 @@ class RenderPlans:
                 )
                 self.logger.log_error(msg)
                 result.global_errors.append(msg)
+                return result
+
+        # Same fail-fast treatment for `--set stack:key=value` selectors. A
+        # mistyped stack name would otherwise be a silent no-op: the render
+        # succeeds and deploys a stack the user believes they modified.
+        if self.setup_overrides_by_stack:
+            selector_errors = validate_selectors(
+                self.setup_overrides_by_stack,
+                [
+                    s.get("name")
+                    for s in stacks
+                    if isinstance(s, dict) and s.get("name")
+                ],
+            )
+            if selector_errors:
+                for msg in selector_errors:
+                    self.logger.log_error(msg)
+                    result.global_errors.append(msg)
                 return result
 
         # Scenario-wide settings. Merged into every stack between `defaults`

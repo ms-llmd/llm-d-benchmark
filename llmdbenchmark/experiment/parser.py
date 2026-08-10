@@ -40,6 +40,7 @@ class ExperimentPlan:
     name: str
     harness: str | None
     profile: str | None
+    dataset_url: str | None
     setup_treatments: list[SetupTreatment]
     run_treatments_count: int
     experiment_file: Path
@@ -135,6 +136,72 @@ def _count_run_treatments(exp_data: dict) -> int:
     return 0
 
 
+def read_reset_caches(experiments_file: str | Path | None) -> bool:
+    """Read the top-level ``reset_caches`` flag from an experiment YAML.
+
+    Returns False when the file is unset, missing, unreadable, not a mapping,
+    or lacks the key -- the feature is strictly opt-in and never blocks a run
+    on a parse problem here. Consumed by the ``run``/``experiment`` CLI paths
+    to populate ``ExecutionContext.reset_caches``.
+    """
+    if not experiments_file:
+        return False
+    path = Path(experiments_file)
+    if not path.exists():
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return bool(data.get("reset_caches", False))
+
+
+# Defaults for the run-loop control knobs (no retry, do-not-abort, no gating).
+RUN_CONTROL_DEFAULTS = {
+    "treatment_max_attempts": 1,
+    "treatment_stop_on_error": False,
+    "validate_failures": False,
+}
+
+
+def read_run_controls(experiments_file: str | Path | None) -> dict:
+    """Read the top-level run-loop control keys from an experiment YAML.
+
+    Returns a dict keyed as in ``RUN_CONTROL_DEFAULTS``. Fail-open: any
+    unreadable/non-mapping file or absent/unparseable key falls back to the
+    default, so a parse problem here never blocks a run.
+    """
+    controls = dict(RUN_CONTROL_DEFAULTS)
+    if not experiments_file:
+        return controls
+    path = Path(experiments_file)
+    if not path.exists():
+        return controls
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return controls
+    if not isinstance(data, dict):
+        return controls
+
+    if "treatment_max_attempts" in data:
+        try:
+            controls["treatment_max_attempts"] = max(
+                1, int(data["treatment_max_attempts"])
+            )
+        except (TypeError, ValueError):
+            pass
+    if "treatment_stop_on_error" in data:
+        controls["treatment_stop_on_error"] = bool(data["treatment_stop_on_error"])
+    if "validate_failures" in data:
+        controls["validate_failures"] = bool(data["validate_failures"])
+    return controls
+
+
 def parse_experiment(path: Path) -> ExperimentPlan:
     """Parse an experiment YAML file into an ExperimentPlan."""
     path = Path(path).resolve()
@@ -156,6 +223,7 @@ def parse_experiment(path: Path) -> ExperimentPlan:
     name = experiment_meta.get("name", path.stem)
     harness = experiment_meta.get("harness")
     profile = experiment_meta.get("profile")
+    dataset_url = experiment_meta.get("datasetUrl")
 
     setup_data = data.get("setup")
     setup_treatments: list[SetupTreatment] = []
@@ -171,6 +239,7 @@ def parse_experiment(path: Path) -> ExperimentPlan:
         name=name,
         harness=harness,
         profile=profile,
+        dataset_url=dataset_url,
         setup_treatments=setup_treatments,
         run_treatments_count=run_count,
         experiment_file=path,

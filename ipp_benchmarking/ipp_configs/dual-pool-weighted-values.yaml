@@ -1,0 +1,30 @@
+# IPP helm values for the WEIGHTED arms (50/50, 60/40). IPP is ON but as a true
+# PASS-THROUGH: it only injects the model/base-model headers and does NOT run model-selection
+# -- the 50/50 or 60/40 split is done entirely by the weighted HTTPRoute
+# (gen_weighted_route.sh). We deliberately DROP model-selector/max-score-picker because the
+# datastore of candidate models is seeded by the model-config-datasource (from /config/
+# models.json); without that plugin model-selector 500s with "no candidate models in
+# datastore". Dropping it also drops the models.json dependency (no crashloop on helm
+# upgrade). The body `model` stays Qwen/Qwen3-8B, which both pools serve. For the smart arm
+# (real model-selection between the pools) use dual-pool-smart-values.yaml.
+provider:
+  supportedEvents:
+    requestTrailers: true
+    responseHeaders: true
+    responseBody: true
+payloadProcessor:
+  listModels:
+    - Qwen/Qwen3-8B
+  customConfig:
+    plugins:
+    - type: body-field-to-header
+      parameters:
+        fieldName: model
+        headerName: X-Gateway-Model-Name
+    - type: base-model-to-header
+    profiles:
+    - name: default
+      plugins:
+        request:
+        - pluginRef: body-field-to-header
+        - pluginRef: base-model-to-header

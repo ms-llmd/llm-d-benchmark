@@ -2,19 +2,32 @@
 {% if standalone.enabled is defined and not standalone.enabled and not (kustomize.enabled | default(false)) %}
 {% set gw_class = gateway.className %}
 {# `epponly` renders no infra values: no Gateway is installed, the standalone
-   GAIE chart provides HTTP service directly via the EPP Envoy sidecar. #}
-{% if gw_class == 'epponly' %}
+  router chart provides HTTP service directly via the EPP Envoy sidecar.
+  `none` also renders no infra values because clients use a plain Service. #}
+{% if gw_class in ['epponly', 'none'] %}
 {% elif gw_class == 'gke' %}
 {# ── GKE: managed gateway with destinationRule ── #}
 gateway:
   gatewayClassName: gke-l7-regional-external-managed
-  destinationRule: {{ model_id_label }}-gaie-epp.{{ namespace.name }}
+  destinationRule: {{ model_id_label }}-router-epp.{{ namespace.name }}
+{% if gateway.listenerPort is defined and gateway.listenerPort %}
+  listeners:
+    - name: default
+      port: {{ gateway.listenerPort }}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: All
+{% endif %}
 
 provider:
   name: gke
 
 {% elif gw_class == 'data-science-gateway-class' %}
 {# ── OpenDataHub / OpenShift AI ── #}
+{% if gateway.listenerPort is defined and gateway.listenerPort %}
+{{ raise("gateway.listenerPort is not supported for gateway class 'data-science-gateway-class' (this class pins the listener to port 443, protocol HTTPS, TLS terminate). Remove gateway.listenerPort from the scenario.") }}
+{% endif %}
 gateway:
   gatewayClassName: data-science-gateway-class
   labels:
@@ -63,6 +76,15 @@ gateway:
     enabled: false
   service:
     type: {{ gateway.service.type | default('NodePort') }}
+{% if gateway.listenerPort is defined and gateway.listenerPort %}
+  listeners:
+    - name: default
+      port: {{ gateway.listenerPort }}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: All
+{% endif %}
 
 {% else %}
 {# ── Istio (default) ── #}
@@ -80,5 +102,14 @@ gateway:
         memory: {{ gateway.resources.requests.memory }}
   service:
     type: {{ gateway.service.type }}
+{% if gateway.listenerPort is defined and gateway.listenerPort %}
+  listeners:
+    - name: default
+      port: {{ gateway.listenerPort }}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: All
+{% endif %}
 {% endif %}
 {% endif %}

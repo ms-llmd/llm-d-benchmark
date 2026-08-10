@@ -21,6 +21,10 @@ class TeardownPreflightStep(Step):
             per_stack=False,
         )
 
+    def should_skip(self, context: ExecutionContext) -> bool:
+        # nok8s has no cluster/namespace; the nok8s teardown step handles it.
+        return "nok8s" in (context.deployed_methods or [])
+
     def execute(
         self, context: ExecutionContext, stack_path: Path | None = None
     ) -> StepResult:
@@ -37,9 +41,8 @@ class TeardownPreflightStep(Step):
                 errors=["plan config (config.yaml) not found"],
             )
 
-        context.namespace = (
-            context.namespace
-            or self._require_config(plan_config, "namespace", "name")
+        context.namespace = context.namespace or self._require_config(
+            plan_config, "namespace", "name"
         )
         context.harness_namespace = (
             context.harness_namespace

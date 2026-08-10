@@ -8,17 +8,28 @@ helmDefaults:
 
 {# When gateway.className is "epponly" we skip the Gateway / HTTPRoute /
    provider entirely and run the EPP in llm-d's "standalone" router topology
-   (Envoy sidecar inside the EPP pod). The chart switches from
-   `inferencepool` to `standalone` and the `infra-llmdbench` release is not
-   installed (no Gateway resource is needed). #}
+   (Envoy sidecar inside the EPP pod). The chart switches from the
+   gateway-mode router to the standalone-mode router and the
+   `infra-llmdbench` release is not installed (no Gateway resource is
+   needed).
+
+   The llm-d-router chart migration moved these charts away from the
+   upstream GAIE registry
+   (`oci://registry.k8s.io/gateway-api-inference-extension/charts/{standalone,inferencepool}`)
+   to the llm-d-owned `llm-d-router-{standalone,gateway}` charts in
+   ghcr.io/llm-d/charts. The scenario layer uses the chart's `router.*`
+   keys directly -- see 12_router-values.yaml.j2 for the renderer. #}
 {% set _epponly = (gateway.className | default('') == 'epponly') %}
-{% set _gaie_chart = 'oci://registry.k8s.io/gateway-api-inference-extension/charts/standalone' if _epponly else 'oci://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool' %}
+{% set _direct = (gateway.className | default('') == 'none') %}
+{% set _gaie_chart = 'oci://ghcr.io/llm-d/charts/llm-d-router-standalone' if _epponly else 'oci://ghcr.io/llm-d/charts/llm-d-router-gateway' %}
 
 repositories:
   - name: llm-d-modelservice
     url: {{ helmRepositories.llmDModelservice.url }}
+{% if not _direct %}
   - name: llm-d-infra
     url: {{ helmRepositories.llmDInfra.url }}
+{% endif %}
 
 releases:
 {# `infra-llmdbench` (llm-d-infra chart -> Gateway resource + CRDs) is scenario-
@@ -36,7 +47,7 @@ releases:
    `epponly` skips this release entirely - there is no Gateway resource. #}
 {% set _is_shared_infra_owner = (stackIndex is not defined or stackIndex | int == sharedInfraStackIndex | default(1) | int) %}
 {% set _is_first_stack = _is_shared_infra_owner %}
-{% if _is_first_stack and not _epponly %}
+{% if _is_first_stack and not _epponly and not _direct %}
   - name: infra-llmdbench
     namespace: {{ gateway.namespace }}
     chart: llm-d-infra/llm-d-infra
@@ -54,27 +65,34 @@ releases:
     chart: llm-d-modelservice/llm-d-modelservice
     version: {{ chartVersions.llmDModelservice }}
     installed: true
+    {% if not _direct %}
     needs:
-{% if _is_first_stack and not _epponly %}
+    {% if _is_first_stack and not _epponly and not _direct %}
       - {{ gateway.namespace }}/infra-llmdbench
 {% endif %}
-      - {{ gateway.namespace }}/{{ model_id_label }}-gaie
+      - {{ gateway.namespace }}/{{ model_id_label }}-router
+    {% endif %}
     values:
       - ms-values.yaml
     labels:
       kind: inference-stack
 
-  - name: {{ model_id_label }}-gaie
+{% if not _direct %}
+  - name: {{ model_id_label }}-router
     namespace: {{ gateway.namespace }}
     chart: {{ _gaie_chart }}
-    version: {{ chartVersions.inferencePool }}
+    {# llm-d-router chart version. Falls back to the legacy
+       `inferencePool` key so older scenarios that pinned the GAIE chart
+       version don't silently lose their pin during the migration. #}
+    version: {{ chartVersions.llmDRouter | default(chartVersions.inferencePool) }}
     installed: true
 {% if _is_first_stack and not _epponly %}
     needs:
       - {{ gateway.namespace }}/infra-llmdbench
 {% endif %}
     values:
-      - gaie-values.yaml
+      - router-values.yaml
     labels:
       kind: inference-stack
+{% endif %}
 {% endif %}

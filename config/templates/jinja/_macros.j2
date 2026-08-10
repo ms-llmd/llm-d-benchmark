@@ -70,7 +70,7 @@
 
 {# Macro to build kv-events-config JSON #}
 {% macro build_kv_events_config() -%}
-{% set default_service_name = model_id_label ~ '-gaie-epp' -%}
+{% set default_service_name = model_id_label ~ '-router-epp' -%}
 {% set service_name = vllmCommon.kvEvents.serviceName | default(default_service_name) -%}
 {% set ns = namespace.name -%}
 {% set port = vllmCommon.kvEvents.port -%}
@@ -198,6 +198,14 @@
   value: "1"
 - name: HOME
   value: "{{ vllmCommon.containerHome }}"
+{# Workaround for https://github.com/vllm-project/vllm/issues/44548     #}
+{# (vLLM v0.20.0+ with torch 2.11). torch._inductor's cache_dir() calls #}
+{# getpass.getuser() -> pwd.getpwuid(uid), which raises KeyError on     #}
+{# OpenShift's random UIDs (e.g. 1003520000) that aren't in /etc/passwd #}
+{# inside the container. Setting USER bypasses the lookup; "llm-d" is   #}
+{# arbitrary -- any non-empty value works.                              #}
+- name: USER
+  value: "llm-d"
 {# Only emit HF_HOME when the modelservice chart will NOT. With
    modelservice.uriProtocol == 'hf' (mirrors 13_ms-values.yaml.j2) the
    chart mounts an hf:// cache and injects its own HF_HOME=/model-cache;
@@ -220,6 +228,8 @@
   value: "{{ config.vllm.workerMultiprocMethod | default(vllmCommon.workerMultiprocMethod | default('spawn')) }}"
 - name: VLLM_LOGGING_LEVEL
   value: "{{ config.vllm.loggingLevel | default(vllmCommon.loggingLevel | default('INFO')) }}"
+- name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+  value: "{{ config.vllm.httpTimeoutKeepAlive | default(120) }}"
 {% if vllmCommon.flags.allowLongMaxModelLen is defined and vllmCommon.flags.allowLongMaxModelLen -%}
 - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
   value: "{{ vllmCommon.flags.allowLongMaxModelLen }}"
@@ -383,7 +393,7 @@
   --enforce-eager
 {%- endif %}
 {%- if has_disable_log_requests %} \
-  --disable-log-requests
+  --no-enable-log-requests
 {%- endif %}
 {%- if has_disable_uvicorn %} \
   --disable-uvicorn-access-log

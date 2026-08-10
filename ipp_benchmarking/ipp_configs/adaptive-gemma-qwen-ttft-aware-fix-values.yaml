@@ -1,0 +1,76 @@
+# UNTESTED as written: the archived runs used this config WITHOUT session-affinity, which left the
+# scorer blind (RecentN=0, every model scored 1, routing uniformly random). Verify RecentN>0 under
+# load before trusting a result from it.
+#
+# Same experiment as adaptive-gemma-qwen-smart-values.yaml, on the ttft-aware-fix image.
+# That image does NOT register model-group-name-filter (its loader says so), so pinning goes
+# through auto-group-model-name-filter instead:
+#   "auto"       -> all candidates -> ttft-aware-scorer routes (the SHARED stream)
+#   "auto/gemma" -> Gemma only     -> PINNED (profile adaptive_gemma_autogroup_summarization)
+# Groups are the plugin's parameters; an unlisted/misspelled group yields no candidates -> 429.
+provider:
+  supportedEvents:
+    requestTrailers: true
+    responseHeaders: true
+    responseBody: true
+payloadProcessor:
+  image:
+    # Build the IPP yourself and supply your own registry, e.g.
+    #   --set payloadProcessor.image.registry=ghcr.io/<you>
+    # The tag below names the IPP build this arm requires.
+    repository: llm-d-inference-payload-processor
+    tag: ttft-aware-fix
+    pullPolicy: Always
+  listModels:
+    - RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic
+    - Qwen/Qwen3.6-35B-A3B-FP8
+  customConfig:
+    plugins:
+    - type: body-field-to-header
+      parameters:
+        fieldName: model
+        headerName: X-Gateway-Model-Name
+    - type: base-model-to-header
+    - type: model-selector
+    - type: auto-group-model-name-filter
+      parameters:
+        gemma:
+        - RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic
+        qwen:
+        - Qwen/Qwen3.6-35B-A3B-FP8
+    - type: ttft-aware-scorer
+      parameters:
+        explorationRate: 0.1
+        anchorGapScale: 2.0
+    - type: max-score-picker
+    # No ResponseProcessor: on builds whose streaming path skips the datalayer ResponseEvent the
+    # extractor records no TTFT (RecentN=0), the scorer returns 1 for every model and
+    # max-score-picker shuffles equal scores -> uniform random. Check RecentN before trusting a run.
+    - type: ttft-percentile-extractor
+      parameters:
+        intervalDuration: 1s
+        windowSize: 5000
+        maxObservationAge: 3m
+        maxRequests: 100
+        minRequests: 5
+        bucketDuration: 1m
+        bucketHistorySize: 720
+    - type: model-config-datasource
+      parameters:
+        modelsPath: /config/models.json
+    profiles:
+    - name: default
+      plugins:
+        request:
+        - pluginRef: model-selector
+        - pluginRef: auto-group-model-name-filter
+        - pluginRef: ttft-aware-scorer
+          weight: 1.0
+        - pluginRef: max-score-picker
+        - pluginRef: body-field-to-header
+        - pluginRef: base-model-to-header
+    datalayer:
+      extractors:
+      - pluginRef: ttft-percentile-extractor
+      datasources:
+      - pluginRef: model-config-datasource

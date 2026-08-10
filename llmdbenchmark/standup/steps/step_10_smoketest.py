@@ -14,6 +14,8 @@ from llmdbenchmark.utilities.endpoint import (
     find_standalone_endpoint,
     find_gateway_endpoint,
     find_epponly_endpoint,
+    find_direct_modelservice_endpoint,
+    resolve_direct_service_namespace,
     test_model_serving,
 )
 
@@ -64,6 +66,9 @@ class SmoketestStep(Step):
 
         gateway_class = plan_config.get("gateway", {}).get("className", "")
         is_epponly = gateway_class == "epponly"
+        is_direct = gateway_class == "none"
+        if is_direct and not is_standalone:
+            namespace = resolve_direct_service_namespace(plan_config, namespace)
         model_id_label = plan_config.get("model_id_label", "")
 
         if is_standalone:
@@ -75,6 +80,13 @@ class SmoketestStep(Step):
                 cmd,
                 namespace,
                 model_id_label,
+            )
+        elif is_direct:
+            service_ip, _, gateway_port = find_direct_modelservice_endpoint(
+                cmd,
+                namespace,
+                model_id_label,
+                str(plan_config.get("routing", {}).get("servicePort", "8000")),
             )
         else:
             service_ip, _, gateway_port = find_gateway_endpoint(cmd, namespace, release)
@@ -135,8 +147,12 @@ class SmoketestStep(Step):
         # Pods can be Running/Ready per K8s but still loading the model
         # or warming up the P/D topology.  Poll the service endpoint
         # until it actually serves the model before running assertions.
+        # If the wait itself times out, surface that as the error rather
+        # than letting the subsequent assertion fail with a cryptic
+        # Envoy "upstream connection refused".
+        wait_err: str | None = None
         if service_ip and not errors:
-            self._wait_for_model_ready(
+            wait_err = self._wait_for_model_ready(
                 cmd,
                 context,
                 namespace,
@@ -145,6 +161,8 @@ class SmoketestStep(Step):
                 model_name,
                 plan_config,
             )
+            if wait_err:
+                errors.append(wait_err)
 
         service_test_passed = False
         if service_ip:
@@ -346,6 +364,13 @@ class SmoketestStep(Step):
             )
             time.sleep(poll_interval)
 
+    # Default 30 minutes -- accommodates large models (DeepSeek-R1,
+    # Llama-3.1-405B, Qwen3-235B etc.) where weight download + load
+    # across N workers can take 15+ minutes. Small models finish in
+    # seconds and exit the poll loop immediately.
+    _DEFAULT_MODEL_READY_TIMEOUT = 1800
+    _DEFAULT_MODEL_READY_POLL_INTERVAL = 15
+
     def _wait_for_model_ready(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         cmd: CommandExecutor,
@@ -355,29 +380,64 @@ class SmoketestStep(Step):
         port: str | int,
         expected_model: str,
         plan_config: dict | None = None,
-        timeout: int = 300,
-        poll_interval: int = 15,
-    ):
+        timeout: int | None = None,
+        poll_interval: int | None = None,
+    ) -> str | None:
         """Poll the service endpoint until the model is actually serving.
 
         Kubernetes may report pods as Ready before the model is fully loaded
         or the P/D topology has finished warming up.  This blocks until
-        ``/v1/models`` returns the expected model name, up to *timeout* seconds.
+        ``/v1/models`` returns the expected model name.
+
+        Returns ``None`` on success, or a human-readable error message on
+        timeout (caller is expected to surface it as a check failure --
+        the historical "log warning and silently proceed" was wrong
+        because the subsequent assertion would then fail with the cryptic
+        Envoy "upstream connection refused" instead of the actual cause).
+
+        Timeout / poll interval can be overridden per-scenario via
+        ``harness.smoketest.modelReadyTimeout`` and
+        ``harness.smoketest.modelReadyPollInterval`` in the plan config;
+        explicit kwargs win over plan-config values which win over the
+        class defaults.
         """
+        timeout = self._resolve_wait_setting(
+            plan_config,
+            "modelReadyTimeout",
+            timeout,
+            self._DEFAULT_MODEL_READY_TIMEOUT,
+        )
+        poll_interval = self._resolve_wait_setting(
+            plan_config,
+            "modelReadyPollInterval",
+            poll_interval,
+            self._DEFAULT_MODEL_READY_POLL_INTERVAL,
+        )
+
         context.logger.log_info(
-            f"Waiting for model to be ready at {host}:{port} (timeout {timeout}s)..."
+            f"Waiting for model '{expected_model}' at {host}:{port} "
+            f"(timeout {timeout}s, poll every {poll_interval}s)..."
         )
         start = time.time()
         attempt = 0
+        last_progress_log = 0.0
+        verbose_attempts = 3
+        progress_interval = 60.0
 
         while True:
             elapsed = time.time() - start
             if elapsed > timeout:
-                context.logger.log_warning(
-                    f"Model readiness wait timed out after {timeout}s -- "
-                    f"proceeding with smoketest assertions"
+                err = (
+                    f"Model '{expected_model}' did not become ready at "
+                    f"{host}:{port} within {timeout}s. For large models "
+                    f"(DeepSeek-R1, Llama-3.1-405B, etc.) increase the "
+                    f"wait via `harness.smoketest.modelReadyTimeout: 3600` "
+                    f"in your scenario, or check the model-server logs:\n"
+                    f"  kubectl logs -n {namespace} "
+                    f"-l llm-d.ai/role=decode -c vllm --tail=100"
                 )
-                return
+                context.logger.log_error(err)
+                return err
 
             attempt += 1
             result = test_model_serving(
@@ -391,19 +451,51 @@ class SmoketestStep(Step):
             )
 
             if cmd.dry_run:
-                return  # Command logged, skip polling
+                return None
 
             if result is None:
                 context.logger.log_info(
-                    f"Model ready at {host}:{port} ✓ ({int(elapsed)}s elapsed)"
+                    f"Model '{expected_model}' ready at {host}:{port} "
+                    f"({int(elapsed)}s, attempt {attempt})"
                 )
-                return
+                return None
 
             remaining = int(timeout - elapsed)
-            context.logger.log_info(
-                f"Model not ready yet (attempt {attempt}, {remaining}s remaining)..."
-            )
+            if attempt <= verbose_attempts or (
+                elapsed - last_progress_log >= progress_interval
+            ):
+                context.logger.log_info(
+                    f"Model not ready yet (attempt {attempt}, "
+                    f"{int(elapsed)}s elapsed, {remaining}s remaining)..."
+                )
+                last_progress_log = elapsed
             time.sleep(poll_interval)
+
+    @staticmethod
+    def _resolve_wait_setting(
+        plan_config: dict | None,
+        key: str,
+        explicit: int | None,
+        default: int,
+    ) -> int:
+        """Pick a wait timeout / poll interval.
+
+        Priority: explicit kwarg > plan_config.harness.smoketest.<key> >
+        class default. Plan-config values that aren't a positive int
+        are silently ignored.
+        """
+        if explicit is not None:
+            return explicit
+        if plan_config:
+            cfg = ((plan_config.get("harness") or {}).get("smoketest") or {}).get(key)
+            if cfg is not None:
+                try:
+                    cfg_int = int(cfg)
+                    if cfg_int > 0:
+                        return cfg_int
+                except (TypeError, ValueError):
+                    pass
+        return default
 
     def _test_openshift_route(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
@@ -469,14 +561,14 @@ class SmoketestStep(Step):
         model_label = plan_config.get("model_id_label", "")
         for resource, name in [
             ("InferenceServerConfig", f"fma-{model_label}"),
-            ("LauncherrConfig", f"fma-{model_label}"),
+            ("LauncherConfig", f"fma-{model_label}"),
             ("LauncherPopulationPolicy", f"fma-{model_label}"),
-            ("ReplicaSet", f"fma-requester-{model_label}"),
+            ("Deployment", f"fma-requester-{model_label}"),
         ]:
             result = cmd.kube("get", resource, "-n", namespace, name, check=False)
             if not result.success:
                 errors.append(f"Failed to query {resource} {name}: {result.stderr}")
-            elif result.stdout.strip().split() == "":
+            elif not result.stdout.strip():
                 errors.append(f"{resource} {name} not found.")
 
         if errors:

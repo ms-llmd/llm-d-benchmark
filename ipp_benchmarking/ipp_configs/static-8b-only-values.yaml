@@ -1,0 +1,48 @@
+provider:
+  supportedEvents:
+    requestTrailers: true
+    responseHeaders: true
+    responseBody: true
+payloadProcessor:
+  listModels:
+    - Qwen/Qwen3-8B
+  customConfig:
+    plugins:
+    - type: body-field-to-header
+      parameters:
+        fieldName: model
+        headerName: X-Gateway-Model-Name
+    - type: base-model-to-header
+    - type: model-selector
+    - type: queue-ttft-scorer
+      parameters:
+        explorationRate: 0.1   
+      # effectiveTTFT = P10Low + inflight x (P50 - P10Low) / inflightAtP50
+    - type: max-score-picker
+    - type: ttft-percentile-extractor
+      parameters:
+        intervalDuration: 1s
+        windowSize: 50000
+        maxObservationAge: 3m
+        inflightEmaAlpha: 0.2
+        lowLoadWindowAge: 1h
+        maxRequests: 100
+        minRequests: 2
+    - type: model-config-datasource
+      parameters:
+        modelsPath: /config/models.json
+    profiles:
+    - name: default
+      plugins:
+        request:
+        - pluginRef: model-selector
+        - pluginRef: queue-ttft-scorer
+          weight: 1.0
+        - pluginRef: max-score-picker
+        - pluginRef: body-field-to-header
+        - pluginRef: base-model-to-header
+    datalayer:
+      extractors:
+      - pluginRef: ttft-percentile-extractor
+      datasources:
+      - pluginRef: model-config-datasource

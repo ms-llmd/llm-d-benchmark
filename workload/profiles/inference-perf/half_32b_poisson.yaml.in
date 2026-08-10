@@ -1,0 +1,37 @@
+# Poisson-RPS twin of half_32b.yaml. Same model/data/shape; open-loop instead of
+# closed-loop. rate = half the combined smart ladder (sweep_8stage_poisson), so
+# 8B + 32B == combined. interval: 0 = no cooldown between stages.
+load:
+  type: poisson
+  interval: 0
+  request_timeout: 1200
+  stages:
+  - {rate: 1.0, duration: 300}
+  - {rate: 2.0, duration: 300}
+  - {rate: 3.0, duration: 300}
+  - {rate: 4.0, duration: 300}
+  - {rate: 5.0, duration: 300}
+  - {rate: 6.0, duration: 300}
+  - {rate: 5.0, duration: 300}
+  - {rate: 4.0, duration: 300}
+  - {rate: 3.0, duration: 300}
+  - {rate: 2.0, duration: 300}
+  - {rate: 1.0, duration: 300}
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: "Qwen/Qwen3-32B"
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  pretrained_model_name_or_path: Qwen/Qwen3-32B
+data:
+  type: random
+  input_distribution:  {min: 1024, max: 4096, mean: 2048, std_dev: 512, total_count: 200}
+  output_distribution: {min: 128,  max: 512,  mean: 256,  std_dev: 64,  total_count: 200}
+report:
+  request_lifecycle: {summary: true, per_stage: true, per_request: true}
+storage:
+  local_storage: {path: /workspace}

@@ -1,0 +1,62 @@
+{# ============================================================================
+   29_epp-keda-saturation-epp-monitoring.yaml.j2
+
+   ServiceMonitor for Prometheus to scrape EPP metrics endpoint (port 9090).
+   Includes Role + RoleBinding to grant Prometheus read access to EPP metrics.
+
+   Only rendered when eppKedaSaturation.enabled is true.
+   ============================================================================ #}
+{% if eppKedaSaturation is defined and eppKedaSaturation.enabled | default(false) %}
+{% set epp_ns = eppKedaSaturation.namespace | default(namespace.name, true) %}
+---
+{# Role allowing prometheus-user-workload to find and read the router's auto-created token secret #}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: epp-metrics-secret-reader
+  namespace: {{ epp_ns }}
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: [get, list]
+---
+{# RoleBinding: prometheus-user-workload → epp-metrics-secret-reader #}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: epp-metrics-secret-reader
+  namespace: {{ epp_ns }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: epp-metrics-secret-reader
+subjects:
+- kind: ServiceAccount
+  name: prometheus-user-workload
+  namespace: openshift-user-workload-monitoring
+---
+{# ServiceMonitor for Prometheus operator to scrape EPP metrics #}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: epp-metrics
+  namespace: {{ epp_ns }}
+  labels:
+    release: llmd
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ epp_ns }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ model_id_label }}-router-epp
+  endpoints:
+    - port: {{ eppKedaSaturation.epp.metricsPortName }}
+      path: /metrics
+      scheme: http
+      interval: 15s
+      authorization:
+        credentials:
+          name: {{ model_id_label }}-router-epp-token
+          key: token
+{% endif %}

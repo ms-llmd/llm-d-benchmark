@@ -545,6 +545,7 @@ class BenchmarkScenario:
     deploy_methods: str = ""
     load_format: LoadFormat = LoadFormat.UNKNOWN
     sleep_mode: bool = False
+    max_instances: int = 0
     model: ModelScenario = field(default_factory=ModelScenario)
     platform: PlatformScenario = field(default_factory=PlatformScenario)
     gpus: list[GPUScenario] = field(default_factory=list[GPUScenario])
@@ -1245,7 +1246,10 @@ def parse_logs(  # pylint: disable=too-many-locals,too-many-branches,too-many-st
 
     # Strings to be searched on logging ouput in order to extract values
 
-    plugins_init = "plugins/__init__.py"
+    # vLLM start marker for vLLM >= 0.24: Older vLLM logged "plugins/__init__.py"
+    # during startup, but v0.24 dropped that line; "non-default args:" is the
+    # earliest APIServer line (api_utils.py) and marks the server-process start.
+    vllm_start_marker = "non-default args:"
     available_routes = "Available routes are:"
 
     server_non_default_args = "non-default args:"
@@ -1293,7 +1297,7 @@ def parse_logs(  # pylint: disable=too-many-locals,too-many-branches,too-many-st
     for log in logs:
         line = log.line.strip()
 
-        if metrics.vllm_start_timestamp == 0.0 and plugins_init in line:
+        if metrics.vllm_start_timestamp == 0.0 and vllm_start_marker in line:
             metrics.vllm_start_timestamp = log.timestamp.astimezone(
                 timezone.utc
             ).timestamp()

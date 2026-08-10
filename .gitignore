@@ -89,3 +89,7 @@ dist/
 # Optional: cache files
 pip-log.txt
 
+
+# run outputs — local only, never committed (see ipp_benchmarking/README.md)
+ipp_benchmarking/example_outputs/
+collected-logs*/

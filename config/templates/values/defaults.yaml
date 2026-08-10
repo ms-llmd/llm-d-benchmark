@@ -34,9 +34,14 @@ _anchors:
   shm_32gi: &shm_32gi 32Gi
   shm_64gi: &shm_64gi 64Gi
 
-  # GPU configuration
+  # GPU configuration.
+  # `gpu_label_value: auto` opts into cluster-side discovery: the resolver
+  # (cluster_resource_resolver.py:_resolve_accelerator_type_labels) reads
+  # actual node labels and overrides BOTH labelKey and labelValue in the
+  # plan, so any GPU model works out of the box. Scenarios that need a
+  # specific SKU can still pin a literal value (e.g. NVIDIA-H100-80GB-HBM3).
   gpu_label_key: &gpu_label_key nvidia.com/gpu.product
-  gpu_label_value: &gpu_label_value NVIDIA-H100-80GB-HBM3
+  gpu_label_value: &gpu_label_value auto
   gpu_memory_util: &gpu_memory_util 0.95
 
   # Common vLLM settings
@@ -96,18 +101,25 @@ _anchors:
 
   # General versions
   istio_version:                     &istio_version                     1.29.2
-  agentgateway_version:              &agentgateway_version              v1.2.1
-  lws_version:                       &lws_version                       0.8.0
+  agentgateway_version:              &agentgateway_version              v1.3.1
+  lws_version:                       &lws_version                       0.9.0
+
+  # GAIE CRDs are still installed from the gateway-api-inference-extension
+  # release (`v1.5.0`). The router chart below replaces the legacy
+  # `inferencepool` / `standalone` charts from that release.
   gaie_version:                      &gaie_version                      v1.5.0
-  wva_version:                       &wva_version                       0.6.0
-  prometheus_version:                &prometheus_version                5.3.0
-  vllm-openai_version:               &vllm-openai_version               v0.20.2
-  llm-d-inference-scheduler_version: &llm-d-inference-scheduler_version v0.8.0
-  llm-d-routing-sidecar_version:     &llm-d-routing-sidecar_version     v0.8.0
-  llm-d-uds-tokenizer_version:       &llm-d-uds-tokenizer_version       v0.8.0
-  llm-d-cuda_version:                &llm-d-cuda_version                v0.7.0
-  llm-d-inference-sim_version:       &llm-d-inference-sim_version       v0.8.2
-  llm-d-benchmark_version:           &llm-d-benchmark_version           v0.6.7
+  # llm-d-router chart version (migrated off the GAIE-published
+  # `inferencepool` / `standalone` charts onto the llm-d-owned
+  # `llm-d-router-{gateway,standalone}-dev` charts in ghcr.io/llm-d/charts).
+  # Used for both the standalone and gateway router charts.
+  router_chart_version:              &router_chart_version              v0.9.0
+  vllm-openai_version:               &vllm-openai_version               v0.24.0
+  llm-d-router-endpoint-picker_version: &llm-d-router-endpoint-picker_version v0.9.0
+  llm-d-routing-sidecar_version:     &llm-d-routing-sidecar_version     v0.9.0
+  llm-d-uds-tokenizer_version:       &llm-d-uds-tokenizer_version       v0.24.0
+  llm-d-cuda_version:                &llm-d-cuda_version                v0.8.0
+  llm-d-inference-sim_version:       &llm-d-inference-sim_version       v0.9.2
+  llm-d-benchmark_version:           &llm-d-benchmark_version           v0.7.0
 
   # Common labels
   app_label: &app_label llm-d-benchmark-harness
@@ -307,6 +319,28 @@ storage:
     volumeMode: Filesystem
     storageClassName: *storage_class
 
+  # HostPath-backed model storage (opt-in).
+  # When enabled, a static PersistentVolume with hostPath is created and the
+  # model PVC binds to it via a matching storageClassName.  A DaemonSet
+  # downloads the model to the hostPath on every target node BEFORE the
+  # serving pods start; the regular download Job is skipped.
+  #
+  # Requirements:
+  #   - Nodes must have the hostPath directory writable.
+  #   - nodeSelector / tolerations should target the GPU nodes where
+  #     vLLM pods will schedule.
+  #   - The storageClassName does NOT need a real StorageClass object
+  #     on the cluster; static PV binding uses label matching.
+  hostPath:
+    enabled: false
+    path: /mnt/models
+    storageClassName: hostpath
+    capacity: 300Gi
+    nodeSelector: {}
+    tolerations: []
+    daemonSetTimeout: 3600
+    daemonSetName: download-model-ds
+
 # ============================================================================
 # HUGGINGFACE CONFIGURATION
 # ============================================================================
@@ -365,24 +399,30 @@ images:
     pullPolicy: *pull_always
     sourceRepo: https://github.com/vllm-project/vllm
 
-  inferenceScheduler:
-    repository: ghcr.io/llm-d/llm-d-inference-scheduler
-    tag: *llm-d-inference-scheduler_version
+  # EPP (Endpoint Picker / Router) image -- llm-d-owned, sourced from the
+  # llm-d-router chart family.
+  routerEndpointPicker:
+    repository: ghcr.io/llm-d/llm-d-router-endpoint-picker
+    tag: *llm-d-router-endpoint-picker_version
     pullPolicy: *pull_always
-    sourceRepo: https://github.com/llm-d/llm-d-inference-scheduler
+    sourceRepo: https://github.com/llm-d/llm-d-router
 
   routingSidecar:
-    repository: ghcr.io/llm-d/llm-d-routing-sidecar
+    repository: ghcr.io/llm-d/llm-d-router-disagg-sidecar
     tag: *llm-d-routing-sidecar_version
     pullPolicy: *pull_if_not_present
-    sourceRepo: https://github.com/llm-d/llm-d-routing-sidecar
+    sourceRepo: https://github.com/llm-d/llm-d-router
 
   udsTokenizer:
-    repository: ghcr.io/llm-d/llm-d-uds-tokenizer
+    repository: docker.io/vllm/vllm-openai
     tag: *llm-d-uds-tokenizer_version
-    pullPolicy: *pull_if_not_present
-    sourceRepo: https://github.com/llm-d/llm-d-kv-cache
-    sourcePath: services/uds_tokenizer
+    pullPolicy: *pull_always
+    sourceRepo: https://github.com/vllm-project/vllm
+#    repository: ghcr.io/llm-d/llm-d-uds-tokenizer
+#    tag: *llm-d-uds-tokenizer_version
+#    pullPolicy: *pull_if_not_present
+#    sourceRepo: https://github.com/llm-d/llm-d-kv-cache
+#    sourcePath: services/uds_tokenizer
 
   python:
     repository: python
@@ -409,21 +449,25 @@ helmRepositories:
   llmDInfra:
     url: https://llm-d-incubation.github.io/llm-d-infra/
     sourceRepo: https://github.com/llm-d-incubation/llm-d-infra
-  wva:
-    name: workload-variant-autoscaler
-    url: oci://ghcr.io/llm-d/workload-variant-autoscaler
-    sourceRepo: https://github.com/llm-d/llm-d-workload-variant-autoscaler
-  prometheusAdapter:
-    name: prometheus-adapter
-    url: https://prometheus-community.github.io/helm-charts
-    sourceRepo: https://github.com/prometheus-community/helm-charts
   agentgateway:
     name: agentgateway
     url: oci://cr.agentgateway.dev/charts/
     sourceRepo: https://github.com/agentgateway/agentgateway
-  # The next three entries hold metadata only -- the charts are pulled from
+  # The next entries hold metadata only -- the charts are pulled from
   # OCI registries directly in the helmfile templates (no `url` needed for
   # `helm repo add`). They live here so the SBOM can find the source repo.
+  #
+  # `llmDRouter` is the chart family that replaced the GAIE-published
+  # `inferencepool` and `standalone` charts. The benchmark always uses
+  # `llm-d-router-gateway-dev` (or `-standalone-dev` when
+  # gateway.className=epponly), so only the source repo metadata is held
+  # here. The chart URLs themselves are constructed in
+  # `config/templates/jinja/10_helmfile-main.yaml.j2`.
+  llmDRouter:
+    sourceRepo: https://github.com/llm-d/llm-d-router
+  # Retained for backwards-compat metadata (SBOM) but no longer used to
+  # construct chart URLs. The GAIE `inferencepool` / `standalone` charts
+  # were superseded by `llmDRouter` above.
   inferencePool:
     sourceRepo: https://github.com/kubernetes-sigs/gateway-api-inference-extension
   gaie:
@@ -439,8 +483,13 @@ chartVersions:
   istiod: *istio_version
   llmDInfra: auto
   llmDModelservice: auto
-  wva: *wva_version
-  prometheusAdapter: *prometheus_version
+  # llm-d-router chart version (used by the standalone and gateway
+  # variants). Replaces the legacy `inferencePool` (GAIE chart) entry
+  # below for the EPP/router deploy.
+  llmDRouter: *router_chart_version
+  # Retained for backwards compatibility; no longer consumed by the helmfile
+  # template after the migration to `llmDRouter`. Kept so any scenario or
+  # downstream tooling still reading the legacy key continues to resolve.
   inferencePool: *gaie_version
   agentgateway: *agentgateway_version
   lws: *lws_version
@@ -469,6 +518,35 @@ monitoring:
   metricsPath: /metrics
   scrapeInterval: "30s"
   metricsScrapeEnabled: false
+  # Prometheus time-series metrics retained for processing, visualization,
+  # and benchmark-report observability entries. Add new metrics here without
+  # changing the analysis code.
+  timeSeriesMetrics:
+    - vllm:kv_cache_usage_perc
+    - vllm:gpu_cache_usage_perc
+    - vllm:cpu_cache_usage_perc
+    - vllm:gpu_memory_usage_bytes
+    - vllm:cpu_memory_usage_bytes
+    - container_memory_usage_bytes
+    - DCGM_FI_DEV_GPU_UTIL
+    - DCGM_FI_DEV_POWER_USAGE
+    - vllm:num_requests_running
+    - vllm:num_requests_waiting
+    - vllm:prefix_cache_hits_total
+    - vllm:prefix_cache_queries_total
+    - vllm:external_prefix_cache_hits_total
+    - vllm:external_prefix_cache_queries_total
+    - vllm:prefix_cache_hit_rate
+    - vllm:external_prefix_cache_hit_rate
+    - vllm:nixl_xfer_time_seconds_sum
+    - vllm:nixl_xfer_time_seconds_count
+    - vllm:nixl_bytes_transferred_sum
+    - vllm:nixl_bytes_transferred_count
+    - vllm:num_preemptions_total
+    - inference_pool_average_kv_cache_utilization
+    - inference_pool_average_queue_size
+    - inference_pool_average_running_requests
+    - inference_pool_ready_pods
 
 # ============================================================================
 # ACCELERATOR CONFIGURATION
@@ -479,6 +557,17 @@ accelerator:
   # Resource name for the accelerator used in limits/requests
   # Override for non-NVIDIA GPUs (e.g. habana.ai/gaudi, amd.com/gpu)
   resource: "nvidia.com/gpu"
+  # Runtime command fragments consumed by accelerator-neutral guide commands.
+  # Hardware profiles use these to avoid duplicating guides; a profile may
+  # additionally provide a fitting model, resource sizing, and storage defaults.
+  runtimePreamble: |
+    export LD_LIBRARY_PATH=$(find / -name libcuda.so.1 -printf '%h\n' 2>/dev/null | sed ':a; N; $!ba; s/\n/:/g'):${LD_LIBRARY_PATH}
+    export LIBRARY_PATH=$(find / -name libcuda.so.1 -printf '%h\n' 2>/dev/null | head -1):${LIBRARY_PATH}
+  dtypeArgs: "--dtype bfloat16"
+  executionArgs: ""
+  blockSizeArgs: "--block-size $VLLM_BLOCK_SIZE"
+  memoryUtilizationArgs: "--gpu-memory-utilization $VLLM_ACCELERATOR_MEM_UTIL"
+  kvBufferDeviceJson: ""
   # Resource names for different accelerator types (optional override)
   # resources:
   #   nvidia: "nvidia.com/gpu"
@@ -542,6 +631,35 @@ annotations:
     container: {}
 
 # ============================================================================
+# MODELSERVICE-ONLY SECTIONS: gateway / router / routing / httpRoute
+#
+# These sections (gateway, router, routing below, plus httpRoute further
+# down) are consumed ONLY on the modelservice deploy path -- standalone,
+# kustomize and fma do not read them. Scenarios MAY nest them under
+# `modelservice:` to make that scope explicit, e.g.:
+#
+#   modelservice:
+#     enabled: true
+#     gateway:
+#       className: epponly
+#     router:
+#       epp: { replicas: 2 }
+#     httpRoute:
+#       requestTimeout: "300s"
+#
+# The renderer hoists any such nested block back to the top level before the
+# resolver chain runs (RenderPlans._hoist_modelservice_sections). Templates,
+# resolvers and standup steps always read the TOP-LEVEL keys -- which is why
+# these defaults live at the top level. The flat top-level spelling in a
+# scenario is equally valid; pick one spelling per section.
+#
+# IMPORTANT: DoE experiment treatments and CLI overrides target the
+# TOP-LEVEL dotted path (e.g. `router.epp.pluginsConfigFile`,
+# `--gateway-class`), not the nested path. Precedence is
+# defaults < scenario < treatment/CLI.
+# ============================================================================
+
+# ============================================================================
 # GATEWAY CONFIGURATION
 # ============================================================================
 gateway:
@@ -556,10 +674,16 @@ gateway:
   #                                Kubernetes Gateway is deployed, the EPP
   #                                runs with an Envoy sidecar that serves
   #                                HTTP directly (single-stack only).
+  #   none                       - plain ClusterIP Service to decode vLLM;
+  #                                no Gateway, EPP, Envoy, or routing proxy.
   className: istio
   providerNamespace: istio-system
   # Gateway version is derived from chartVersions.istiod at plan time
   logLevel: error
+  # Optional: override the Gateway's HTTP listener port. When unset (default)
+  # the chart's built-in listener is used. Not supported for
+  # className: data-science-gateway-class (that class pins port 443 HTTPS+TLS).
+  # listenerPort: 80
   service:
     type: NodePort
   resources:
@@ -571,66 +695,76 @@ gateway:
       memory: *memory_4gi
 
 # ============================================================================
-# INFERENCE EXTENSION CONFIGURATION
+# ROUTER CONFIGURATION
+#
+# Scenario-level keys for the llm-d-router chart. Mirrors the chart's
+# top-level `router:` shape; the 12_router-values.yaml.j2 template passes
+# this through largely unchanged, with a few benchmark-specific niceties
+# (HF token env injection, zmq port expansion into the extraContainerPorts
+# / extraServicePorts arrays, EPP image resolution from
+# `images.routerEndpointPicker`, and tokenizer.modelName fallback to
+# model.name).
 # ============================================================================
-inferenceExtension:
-  replicas: 1
-  extProcPort: *ext_proc_port
-  zmqPort: *zmq_port
-  pluginsConfigFile: "default-plugins.yaml"
-  # Custom plugin content to embed in gaie-values.yaml.
-  # Keys are filenames, values are the YAML content as literal strings.
-  # Example:
-  #   pluginsCustomConfig:
-  #     my-plugins.yaml: |
-  #       apiVersion: inference.networking.x-k8s.io/v1alpha1
-  #       kind: EndpointPickerConfig
-  #       ...
-  pluginsCustomConfig: {}
-  verbosity: "1"
-  # UDS tokenizer sidecar - runs alongside EPP for precise-prefix-cache scoring.
-  # Enable in scenarios that use `precise-prefix-cache-scorer` with UDS tokenizer.
-  # Image is sourced from `images.udsTokenizer`; override that entry per scenario
-  # to change the version.
-  sidecar:
+router:
+  epp:
+    replicas: 1
+    extProcPort: *ext_proc_port
+    # Used to populate router.epp.extraContainerPorts and
+    # router.extraServicePorts with the zmq port (the EPP needs the
+    # container port for the kv-events publisher, and the service port
+    # so other pods can reach the publisher).
+    zmqPort: *zmq_port
+    pluginsConfigFile: "default-plugins.yaml"
+    # Custom plugin content to embed in router-values.yaml.
+    # Keys are filenames, values are the YAML content as literal strings.
+    # The chart expects apiVersion `llm-d.ai/v1alpha1` for the
+    # EndpointPickerConfig (the legacy `inference.networking.x-k8s.io/v1alpha1`
+    # is also accepted but deprecated).
+    # Example:
+    #   pluginsCustomConfig:
+    #     my-plugins.yaml: |
+    #       apiVersion: llm-d.ai/v1alpha1
+    #       kind: EndpointPickerConfig
+    #       ...
+    pluginsCustomConfig: {}
+    verbosity: "1"
+    # Resources are intentionally NOT set here.
+    # CI runners override this in their scenario YAML -- see
+    # config/scenarios/cicd/kind.yaml for an example.
+    # Extra volumes / mounts on the EPP container (e.g. shared dirs).
+    volumes: []
+    volumeMounts: []
+  # UDS tokenizer is a first-class chart feature. Flip
+  # `router.tokenizer.enabled: true` and the chart wires up the
+  # tokenizer container, sockets, and volumes itself. When `enabled`
+  # is true and `modelName` is unset, the template falls back to
+  # `model.name`.
+  tokenizer:
     enabled: false
-    name: tokenizer-uds
-    imagePullPolicy: IfNotPresent
-    env:
-      - name: TOKENIZERS_DIR
-        value: /tokenizers
-      - name: HF_HOME
-        value: /tokenizers
-    volumeMounts:
-      - mountPath: /tokenizers
-        name: tokenizers
-      - mountPath: /tmp/tokenizer
-        name: tokenizer-uds
-  # Resources are intentionally NOT set here.
-  # CI runners override this in their scenario YAML -- see
-  # config/scenarios/cicd/kind-sim.yaml for an example.
-  # Extra volumes and volume mounts for the EPP pod (e.g., tokenizer sidecar shared volumes)
-  volumes: []
-  volumeMounts: []
-  # Monitoring configuration for the EPP (Endpoint Picker Pod)
+  inferencePool:
+    failureMode: "FailOpen"
+    # Provider-specific config rendered to the values root as
+    # `provider.{gatewayClassName}.{...}` for gke/istio (epponly and
+    # agentgateway don't consume this).
+    # Example (istio):
+    #   providerConfig:
+    #     destinationRule:
+    #       trafficPolicy:
+    #         connectionPool:
+    #           http:
+    #             h2UpgradePolicy: DO_NOT_UPGRADE
+    providerConfig: {}
   monitoring:
+    # Service-account token secret name for the Prometheus scraper.
+    # Multi-stack scenarios sharing one namespace get a per-stack
+    # rewrite of this name in render_plans to avoid Helm ownership
+    # collisions.
     secretName: inference-gateway-sa-metrics-reader-secret
     interval: "10s"
     prometheus:
       enabled: true
       auth:
         enabled: true
-  # Provider-specific config for the InferencePool resource.
-  # When non-empty, rendered under inferencePool.provider.{gatewayClassName}.
-  # Example (for istio destinationRule):
-  #   inferencePoolProviderConfig:
-  #     destinationRule:
-  #       host: my-model-gaie-epp
-  #       trafficPolicy:
-  #         connectionPool:
-  #           http:
-  #             h2UpgradePolicy: DO_NOT_UPGRADE
-  inferencePoolProviderConfig: {}
 
 # ============================================================================
 # ROUTING / PROXY CONFIGURATION
@@ -658,6 +792,26 @@ routing:
     # zapDevel: false
     # zapStacktraceLevel: error
     # zapTimeEncoding: epoch
+
+# ============================================================================
+# HTTPROUTE CONFIGURATION
+#
+# Gateway-API HTTPRoute settings consumed by 08_httproute.yaml.j2. Applies to
+# every rule the template emits (both per-stack and shared modes).
+#
+#   requestTimeout        End-to-end request timeout the gateway enforces.
+#                         Requests exceeding it are aborted with a 502 (which
+#                         surfaces as a "connection reset by peer" on the
+#                         decode routing-proxy loopback hop). Set "0s" to
+#                         disable -- appropriate for long agentic turns.
+#   backendRequestTimeout Per-retry backend timeout; "0s" disables.
+#
+# Shared-mode-only knobs (mode/name/pathPrefix/rewriteTo) are documented in
+# the template header and read with their own defaults.
+# ============================================================================
+httpRoute:
+  requestTimeout: "300s"
+  backendRequestTimeout: "0s"
 
 # ============================================================================
 # VLLM COMMON CONFIGURATION
@@ -1061,10 +1215,12 @@ standalone:
   # Node selector (optional)
   nodeSelector: {}
 
-  # Accelerator type selection (inherits from decode if not specified)
+  # Accelerator type selection (inherits from decode if not specified).
+  # `labelValue: auto` triggers cluster-side discovery; see the
+  # `gpu_label_value` anchor at the top of this file.
   acceleratorType:
     labelKey: nvidia.com/gpu.product
-    labelValue: NVIDIA-H100-80GB-HBM3
+    labelValue: auto
     # labelValues:  # Use for multiple GPU types
     #   - NVIDIA-H100-80GB-HBM3
     #   - NVIDIA-A100-SXM4-80GB
@@ -1072,7 +1228,7 @@ standalone:
   # Image configuration (inherits from images.vllm if not specified)
   image:
     repository: docker.io/vllm/vllm-openai
-    tag: auto
+    tag: *vllm-openai_version
     pullPolicy: Always
 
   # Parallelism configuration
@@ -1195,6 +1351,69 @@ standalone:
   extraPodConfig: {}
 
 # ============================================================================
+# NO-KUBERNETES (nok8s) DEPLOYMENT CONFIGURATION
+# Runs the llm-d routing stack (vLLM + EPP + Envoy) as plain docker/podman
+# containers on the local host, with NO Kubernetes cluster.  The EPP uses the
+# file-discovery plugin (reads endpoints.yaml) instead of a k8s InferencePool.
+# Wired: client -> Envoy (listenPort) -> EPP (grpcPort) -> vLLM (hostPort).
+# Opt-in via `nok8s.enabled: true` in a scenario or `-t nok8s` on the CLI.
+# ============================================================================
+nok8s:
+  enabled: false
+  # Container runtime: "docker" or "podman".
+  runtime: docker
+  # Host env var read at standup time and passed to the vLLM container so it
+  # can pull gated models from Hugging Face.
+  hfTokenEnv: HUGGING_FACE_HUB_TOKEN
+  # Host directory where rendered EPP/Envoy configs are staged and bind-mounted
+  # from (avoids sudo writes to /etc).
+  workspaceHostDir: "~/.llmdbench/nok8s"
+
+  # vLLM inference worker(s)
+  vllm:
+    image: docker.io/vllm/vllm-openai
+    tag: *vllm-openai_version
+    hostPort: 8000          # worker i is published on hostPort + i
+    containerPort: 8000
+    tensorParallel: 1       # accelerators to shard each worker across
+    # Accelerator preset for exposing the device to the container:
+    #   nvidia | amd | intel | gaudi | cpu | spyre
+    # Only NVIDIA is validated end-to-end; others follow each backend's
+    # documented device flags. Change `image` to the matching vLLM backend.
+    accelerator: nvidia
+    gpus: "all"             # nvidia only: docker --gpus value (podman uses CDI)
+    # Raw runtime device flags; overrides the accelerator preset entirely.
+    # Use for IBM Spyre/AIU or any custom device wiring, e.g.
+    #   deviceArgs: ["--device", "/dev/kfd", "--device", "/dev/dri"]
+    deviceArgs: []
+    shmSize: "20g"          # required for NCCL/RCCL when tensorParallel > 1
+    hfCacheDir: "~/.cache/huggingface"
+    # Number of independent vLLM workers (EPP load-balances across them). With
+    # replicas > 1 each worker is pinned to its own slice of `tensorParallel`
+    # GPU indices (replica i -> devices i*TP .. i*TP+TP-1) via the accelerator's
+    # visible-devices env. Total GPUs used = replicas * tensorParallel.
+    replicas: 1
+    extraArgs: []           # appended after `serve <MODEL> --tensor-parallel-size=N`
+
+  # Endpoint Picker (router brain), file-discovery mode
+  epp:
+    image: ghcr.io/llm-d/llm-d-router-endpoint-picker
+    tag: v0.9.0
+    grpcPort: 9002
+    grpcHealthPort: 9003
+    metricsPort: 9090
+    poolName: file-discovery
+    poolNamespace: default
+    configMountDir: /etc/epp
+
+  # Envoy front door
+  envoy:
+    image: docker.io/envoyproxy/envoy
+    tag: distroless-v1.33.2
+    listenPort: 8081
+    configMountPath: /etc/envoy/envoy.yaml
+
+# ============================================================================
 # KUSTOMIZE DEPLOYMENT CONFIGURATION
 # Opt-in via `kustomize.enabled: true` in a scenario or `-t kustomize` on
 # the CLI. Defined here (matching modelservice/standalone/fma) so the
@@ -1212,6 +1431,15 @@ fma:
   enabled: false
   iterations: 1
 
+  # Pin FMA launchers + requester to a single GPU node. When enabled, standup
+  # (step_06) picks a GPU node with free GPUs and CPU (preferring a dedicated
+  # one), labels it <nodeLabel>=true, and sizes launchers/requesters to its free
+  # GPUs. Standup fails if no node qualifies. Off by default; opt in per-scenario
+  # (used by cicd/ocp-wva-fma-hotstart).
+  launcherNodeSelection:
+    enabled: false
+    nodeLabel: fma-hotstart
+
   # Deployment naming
   deployment:
     name: null  # Auto-generated if null: vllm-standalone-<model.shortName>
@@ -1223,23 +1451,23 @@ fma:
     stood-up-via: "fma"
 
   crds:
-    inferenceServerConfig: https://raw.githubusercontent.com/llm-d-incubation/llm-d-fast-model-actuation/v0.6.0-alpha.13/config/crd/fma.llm-d.ai_inferenceserverconfigs.yaml
-    launcherConfig: https://raw.githubusercontent.com/llm-d-incubation/llm-d-fast-model-actuation/v0.6.0-alpha.13/config/crd/fma.llm-d.ai_launcherconfigs.yaml
-    launcherPopulatorConfig: https://raw.githubusercontent.com/llm-d-incubation/llm-d-fast-model-actuation/v0.6.0-alpha.13/config/crd/fma.llm-d.ai_launcherpopulationpolicies.yaml
+    inferenceServerConfig: https://raw.githubusercontent.com/llm-d-incubation/llm-d-fast-model-actuation/v0.6.3/config/crd/fma.llm-d.ai_inferenceserverconfigs.yaml
+    launcherConfig: https://raw.githubusercontent.com/llm-d-incubation/llm-d-fast-model-actuation/v0.6.3/config/crd/fma.llm-d.ai_launcherconfigs.yaml
+    launcherPopulatorConfig: https://raw.githubusercontent.com/llm-d-incubation/llm-d-fast-model-actuation/v0.6.3/config/crd/fma.llm-d.ai_launcherpopulationpolicies.yaml
 
   chart:
     url: oci://ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/charts/fma-controllers
-    version: 0.6.0-alpha.13
+    version: 0.6.3
 
   image:
     repository: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation
-    tag: v0.6.0-alpha.13
+    tag: v0.6.3
     pullPolicy: IfNotPresent
 
   requester:
     image:
       repository: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/requester
-      tag: v0.6.0-alpha.13
+      tag: v0.6.3
       pullPolicy: IfNotPresent
     probePort: 8080
     spiPort: 8081
@@ -1250,9 +1478,10 @@ fma:
     limitsMemory: 250Mi
 
   launcher:
+    maxInstances: 4
     image:
       repository: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher
-      tag: v0.6.0-alpha.13
+      tag: v0.6.3
       pullPolicy: IfNotPresent
     runtimeClassName: nvidia-legacy
     podTemplate:
@@ -1298,7 +1527,7 @@ downloadJob:
 # ============================================================================
 dataAccess:
   rsyncPort: *rsync_port
-  runAsUser: 0
+  runAsUser: ~
   nodeSelector: {}
   tolerations: []
 
@@ -1334,8 +1563,8 @@ extraObjects: []
 #
 # Installed in *namespaced* mode: the controller watches only the namespace
 # it is deployed in. One controller per unique wva.namespace across rendered
-# stacks. VariantAutoscaling + HPA are rendered per-stack so a single
-# controller can manage multiple models in the same namespace.
+# stacks. A KEDA ScaledObject is rendered per-stack (28_wva-scaledobject.yaml.j2)
+# so a single controller can manage multiple models in the same namespace.
 # ============================================================================
 wva:
   enabled: false
@@ -1359,13 +1588,17 @@ wva:
   prometheus:
     baseUrl: https://thanos-querier.openshift-monitoring.svc.cluster.local
     port: 9091
+  # Only variantCost is consumed by rendering (llm-d.ai/variant-cost annotation
+  # on the KEDA ScaledObject). The controller's SLO / saturation tuning comes
+  # from the upstream overlay's ConfigMaps, not from per-model fields here --
+  # no VariantAutoscaling CR is rendered.
   variantAutoscaling:
-    enabled: true
     variantCost: "10.0"
-    slo:
-      tpot: 10
-      ttft: 1000
+  # Drives the per-stack KEDA ScaledObject (min/maxReplicaCount, trigger
+  # threshold, HPA behavior). Named "hpa" for parity with the upstream guide.
   hpa:
+    # Gates the smoketest's autoscaling-aware replica-range check. Does not
+    # affect rendering -- the ScaledObject is gated on wva.enabled.
     enabled: true
     minReplicas: 1
     maxReplicas: 16
@@ -1391,6 +1624,47 @@ wva:
     scheme: http
 
 # ============================================================================
+# EPP+KEDA SATURATION AUTOSCALING
+# ============================================================================
+# Direct KEDA autoscaling using EPP pool metrics, without WVA controller.
+# Queries inference_pool_average_kv_cache_utilization and
+# inference_pool_average_queue_size directly.
+eppKedaSaturation:
+  enabled: false
+  namespace: ""                 # defaults to namespace.name at render time
+  prometheus:
+    baseUrl: https://thanos-querier.openshift-monitoring.svc.cluster.local
+    port: 9091
+  epp:
+    poolName: ""                # InferencePool name; defaults to model_id_label
+    serviceLabelSelector: {}    # matchLabels for EPP Service selector
+    metricsPortName: http-metrics
+    metricsPort: 9090
+    prometheusServiceAccount: thanos-querier
+    prometheusServiceAccountNamespace: openshift-monitoring
+  scaledObject:
+    minReplicas: 1
+    maxReplicas: 10
+    pollingInterval: 15
+    kvCacheThreshold: "0.7"    # scale up when pool-avg KV cache > 70%
+    queueSizeThreshold: "2"    # scale up when pool-avg queue > 2 requests
+    activationThreshold: "0"
+    unsafeSsl: true
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        policies:
+          - type: Pods
+            value: 1
+            periodSeconds: 180  # adjust to actual pod startup time
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Pods
+            value: 1
+            periodSeconds: 300
+
+# ============================================================================
 # GATEWAY PROVIDERS
 # ============================================================================
 gatewayProviders:
@@ -1405,7 +1679,7 @@ gatewayProviders:
 lws:
   # Chart version managed in chartVersions.lws
   namespace: lws-system
-  helmRepository: oci://ghcr.io/kubernetes-sigs/lws
+  helmRepository: oci://registry.k8s.io/lws/charts/
 
 # ============================================================================
 # GATEWAY API CRD VERSIONS

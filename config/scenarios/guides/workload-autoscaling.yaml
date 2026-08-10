@@ -2,16 +2,17 @@
 #
 # Same base configuration as `inference-scheduling.yaml` (Qwen3-32B, 2 decode
 # pods, modelservice deployment) but with the Workload Variant Autoscaler
-# (WVA) explicitly enabled. All HPA / VariantAutoscaling knobs are listed
-# below even when they match defaults.yaml, so users can see the full
-# surface area in one place and tweak it per-scenario.
+# (WVA) explicitly enabled. The scaling knobs this scenario actually consumes
+# (variantAutoscaling.variantCost + the hpa.* block, which drive the KEDA
+# ScaledObject) are listed below with inline notes; the WVA controller's own
+# tuning lives in the upstream overlay's ConfigMaps, not here.
 #
 # Based on:
 #   https://github.com/llm-d/llm-d/blob/main/guides/workload-autoscaling/README.wva.md
 #
 # Running:
 #
-#   llmdbenchmark --spec guides/inference-scheduling-wva standup -p <namespace>
+#   llmdbenchmark --spec guides/workload-autoscaling standup -p <namespace>
 #
 # The `-u/--wva` CLI flag is NOT required with this scenario because
 # `wva.enabled: true` is already hard-coded below. Pass `-u` with the
@@ -23,6 +24,58 @@ scenario:
   # Inference Scheduling + WVA - Qwen3-32B with 2 decode pods, autoscaled
   # ============================================================================
   - name: "inference-scheduling-wva"
+
+    # =========================================================================
+    # KUSTOMIZE DEPLOY METHOD   (scope: the ENTIRE stack)
+    # -------------------------------------------------------------------------
+    # When kustomize.enabled is true (or `-t kustomize` is passed) this
+    # scenario is deployed by applying the UPSTREAM llm-d guide directly
+    # (guides/<guideName> in the llm-d repo). In that mode the deployment is
+    # defined ENTIRELY by the guide's own manifests:
+    #
+    #   * EVERYTHING ELSE in this scenario is IGNORED -- model, modelservice,
+    #     standalone, decode/prefill, vllmCommon, storage, harness model, etc.
+    #   * `-m/--models` and all other CLI/scenario tuning are ignored.
+    #   * DoE `experiment` SETUP sweeps do NOT alter a kustomize deploy
+    #     (only run/workload treatments still apply).
+    #
+    # The ONLY way to modify a kustomize deployment is the kustomize.* keys
+    # below:
+    #   patches / overlayPath           -> modelserver (the workload pods)
+    #   extraHelmValues / extraHelmSets -> router / GAIE helm release
+    #   guideVariableOverrides          -> override the guide README's ${VAR}
+    # See docs/kustomize.md for the full reference and worked examples.
+    #
+    # NOT SUPPORTED with kustomize: multi-model / multi-stack scenarios
+    # (the deploy is keyed on guideName with no per-stack uniquification --
+    # stacks would collide). Use the modelservice method for multi-model.
+    #
+    # When kustomize.enabled is false (the DEFAULT) this whole block is
+    # inert and the scenario deploys via modelservice/standalone as
+    # configured further below.
+    # =========================================================================
+    kustomize:
+      enabled: false
+
+      guideName: "workload-autoscaling"
+      repoPath: ""
+      repoRef: "main"
+      gaieVersion: ""
+      acceleratorBackend: "gpu/vllm"
+      monitoring: false
+      overlayPath: ""
+      extraHelmValues: []
+      extraHelmSets: {}
+      guideVariableOverrides: {}   # override/fill the guide README's ${VAR}
+
+      # Inline kustomize strategic merge patches applied on top of the
+      # guide's modelserver base.  For gated models, add an HF_TOKEN
+      # env var patch (the secret is auto-created from HF_TOKEN env):
+      # Default is empty -- upstream guide already injects HF_TOKEN from
+      # the `llm-d-hf-token` Secret (auto-created by standup). Add entries
+      # here only for non-token overrides (e.g. bump replicas, pin a
+      # priorityClassName) -- see optimized-baseline.yaml for an example.
+      patches: []
 
     # =========================================================================
     # MODEL CONFIGURATION
@@ -43,6 +96,52 @@ scenario:
     modelservice:
       enabled: true
 
+      gateway:
+        className: epponly
+
+      # =========================================================================
+      # ROUTING / GAIE CONFIGURATION
+      # =========================================================================
+      # WVA autoscaling is driven by EPP queue depth, so we must enable the
+      # `flowControl` feature gate in the EPP's EndpointPickerConfig. That gate
+      # is not on by default, and toggling it requires shipping a custom
+      # EndpointPickerConfig (the default one the gaie chart ships has no
+      # `featureGates` block). We inline it here and point `pluginsConfigFile`
+      # at this filename so the chart mounts it as the active config.
+      router:
+        epp:
+          pluginsConfigFile: "wva-plugins.yaml"
+          pluginsCustomConfig:
+            wva-plugins.yaml: |
+              apiVersion: llm-d.ai/v1alpha1
+              kind: EndpointPickerConfig
+              featureGates:
+                - flowControl
+              plugins:
+                - type: queue-scorer
+                - type: kv-cache-utilization-scorer
+                - type: prefix-cache-scorer
+              schedulingProfiles:
+                - name: default
+                  plugins:
+                    - pluginRef: queue-scorer
+                      weight: 2
+                    - pluginRef: kv-cache-utilization-scorer
+                      weight: 2
+                    - pluginRef: prefix-cache-scorer
+                      weight: 3
+
+      # -------------------------------------------------------------------------
+      # HTTPRoute Configuration
+      # requestTimeout: end-to-end Gateway-API HTTPRoute timeout the istio
+      # gateway enforces per request. Long agentic turns that exceed it are
+      # aborted by the gateway with a 502 (surfaces as "connection reset by
+      # peer" on the decode routing-proxy loopback hop). Set "0s" to disable.
+      # -------------------------------------------------------------------------
+      httpRoute:
+        requestTimeout: "300s"
+        backendRequestTimeout: "0s"
+
     standalone:
       enabled: false
 
@@ -57,7 +156,7 @@ scenario:
 
       # Upstream well-lit-path tag. Becomes the `llm-d.ai/guide` label on the
       # VariantAutoscaling so dashboards/queries can group by guide.
-      wellLitPath: inference-scheduling
+      wellLitPath: optimized-baseline
 
       # Where to install the WVA controller.
       # Empty = use the deploy namespace (the first slot of `-p`). Override by
@@ -70,15 +169,16 @@ scenario:
       # Controller container image.
       # Pin `tag` to a release version for reproducibility, or set to "auto"
       # to let the version-resolver pick latest at plan time.
-      # NOTE: image tags use a leading "v" (v0.6.0), distinct from the
-      # helm chart version pinned in chartVersions.wva (which is bare 0.6.0).
+      # NOTE: the WVA controller is installed from the upstream kustomize
+      # overlay (see wva.repoRef), not a helm chart -- there is no separate
+      # `chartVersions.wva` to keep in sync.
       # Available version tags can be listed with:
       #   curl -sL "https://ghcr.io/token?scope=repository:llm-d/llm-d-workload-variant-autoscaler:pull" \
       #     | jq -r .token | xargs -I{} curl -sH "Authorization: Bearer {}" \
       #       https://ghcr.io/v2/llm-d/llm-d-workload-variant-autoscaler/tags/list
       image:
         repository: ghcr.io/llm-d/llm-d-workload-variant-autoscaler
-        tag: v0.7.0
+        tag: v0.8.0
 
       replicaCount: 1                # WVA controller pod replicas (1 is the chart default)
 
@@ -113,45 +213,50 @@ scenario:
       # -----------------------------------------------------------------------
       # VariantAutoscaling — per-model scaling intent
       #
-      # Should match the HPA min/max below; the VA caps what the controller
-      # is willing to compute, the HPA caps what actually gets applied.
+      # Only `variantCost` is consumed by this benchmark's rendering: it becomes
+      # the `llm-d.ai/variant-cost` annotation on the KEDA ScaledObject
+      # (28_wva-scaledobject.yaml.j2). The WVA controller reads its own tuning
+      # (SLOs, saturation thresholds, opt interval) from the ConfigMaps shipped
+      # by the upstream overlay applied in step_03 (`manager-config` /
+      # `saturation-scaling-config`), NOT from per-model fields here — this
+      # scenario does not render a VariantAutoscaling CR. To change SLO-driven
+      # behavior on-cluster, patch those controller ConfigMaps. The replica
+      # floor/ceiling the controller actually respects is the hpa.min/maxReplicas
+      # block below (which drives the ScaledObject's min/maxReplicaCount).
       # -----------------------------------------------------------------------
       variantAutoscaling:
-        enabled: true                # required for the VA to render at all
-        minReplicas: 1               # controller floor — never compute below this
-        maxReplicas: 10              # controller ceiling — never compute above this
         # Relative GPU cost weight used by WVA's saturation solver to decide
         # WHICH model to scale when several share GPU capacity. Higher =
         # more expensive to scale up. Common tiering: H100=10, A100=8,
         # L40S=5, MI300X=10. Tweak per stack to express your business priority.
         variantCost: "10.0"
-        # SLO targets the controller tries to keep the variant within when
-        # computing desiredReplicas. Lower numbers = more aggressive scale-up
-        # under load.
-        slo:
-          tpot: 10                   # Time-Per-Output-Token target (ms)
-          ttft: 1000                 # Time-To-First-Token target (ms)
 
       # -----------------------------------------------------------------------
-      # HorizontalPodAutoscaler — what actually changes the replica count
+      # KEDA ScaledObject — what actually changes the replica count
       #
-      # The HPA reads `wva_desired_replicas` (emitted by the WVA controller
-      # via prometheus-adapter) and scales the decode Deployment between
-      # min/max.
+      # Despite the `hpa` name (retained for parity with defaults.yaml and the
+      # upstream guide), these knobs now drive a KEDA ScaledObject
+      # (28_wva-scaledobject.yaml.j2), not a native HPA + prometheus-adapter.
+      # KEDA queries Prometheus for `wva_desired_replicas` (emitted by the WVA
+      # controller) and scales the decode Deployment between min/max. KEDA
+      # generates an HPA under the hood, so `behavior` still applies.
       # -----------------------------------------------------------------------
       hpa:
-        enabled: true                # set false to render the VA only, no HPA
-        minReplicas: 1               # never scale below this — must be >= 1
-                                     # (HPA refuses to manage targets at 0)
-                                     # Keep aligned with variantAutoscaling.minReplicas above.
-        maxReplicas: 10              # safety ceiling — scale-up cap regardless
-                                     # of what the controller computes
-                                     # Keep aligned with variantAutoscaling.maxReplicas above.
-        targetAvgValue: 1            # target value the HPA tries to reach for
-                                     # `wva_desired_replicas` per pod.
-                                     # 1 = "match controller's desiredReplicas
-                                     # exactly". Don't change unless you
-                                     # understand HPA averaging math.
+        enabled: true                # gates the smoketest's autoscaling-aware
+                                     # replica-range check (does not affect
+                                     # rendering; the ScaledObject is gated on
+                                     # wva.enabled)
+        minReplicas: 1               # ScaledObject minReplicaCount — never scale
+                                     # below this; must be >= 1 (KEDA/HPA refuse
+                                     # to manage targets at 0)
+        maxReplicas: 10              # ScaledObject maxReplicaCount — safety
+                                     # ceiling regardless of what the controller
+                                     # computes
+        targetAvgValue: 1            # Prometheus trigger threshold for
+                                     # `wva_desired_replicas`. 1 = "match the
+                                     # controller's desiredReplicas exactly".
+                                     # Don't change unless you understand
+                                     # HPA/KEDA averaging math.
 
         # Scaling behavior — how aggressively the HPA reacts. See:
         #   https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#configurable-scaling-behavior
@@ -181,53 +286,18 @@ scenario:
         enabled: false
 
     # =========================================================================
-    # WVA-RELATED CHART VERSIONS
+    # CHART VERSIONS
     #
-    # Pins for the helm charts that step_03 installs as part of the WVA
-    # pipeline. Bump these to track upstream releases; align with what the
-    # upstream WVA guide currently calls for so the rule format and chart
-    # values stay compatible.
-    #   https://github.com/llm-d/llm-d/blob/main/guides/workload-autoscaling/README.wva.md
+    # The WVA controller itself is installed from the upstream kustomize
+    # overlay (see wva.image.tag / wva.repoRef above), not a helm chart --
+    # this block only pins helm charts still installed by step_03.
     # =========================================================================
     chartVersions:
-      # WVA controller chart (oci://ghcr.io/llm-d/workload-variant-autoscaler)
-      wva: 0.6.0
       # prometheus-adapter chart (prometheus-community/prometheus-adapter).
       # Pinned because newer releases have broken external-metric
       # compatibility with the rule format the WVA chart emits.
       # The upstream WVA README also pins this version.
       prometheusAdapter: 5.2.0
-
-    # =========================================================================
-    # ROUTING / GAIE CONFIGURATION
-    # =========================================================================
-    # WVA autoscaling is driven by EPP queue depth, so we must enable the
-    # `flowControl` feature gate in the EPP's EndpointPickerConfig. That gate
-    # is not on by default, and toggling it requires shipping a custom
-    # EndpointPickerConfig (the default one the gaie chart ships has no
-    # `featureGates` block). We inline it here and point `pluginsConfigFile`
-    # at this filename so the chart mounts it as the active config.
-    inferenceExtension:
-      pluginsConfigFile: "wva-plugins.yaml"
-      pluginsCustomConfig:
-        wva-plugins.yaml: |
-          apiVersion: inference.networking.x-k8s.io/v1alpha1
-          kind: EndpointPickerConfig
-          featureGates:
-            - flowControl
-          plugins:
-            - type: queue-scorer
-            - type: kv-cache-utilization-scorer
-            - type: prefix-cache-scorer
-          schedulingProfiles:
-            - name: default
-              plugins:
-                - pluginRef: queue-scorer
-                  weight: 2
-                - pluginRef: kv-cache-utilization-scorer
-                  weight: 2
-                - pluginRef: prefix-cache-scorer
-                  weight: 3
 
     # =========================================================================
     # PREFILL / DECODE CONFIGURATION (same as inference-scheduling.yaml)
@@ -339,6 +409,7 @@ scenario:
     # VLLM COMMON CONFIGURATION
     # =========================================================================
     vllmCommon:
+#      priorityClassName: nightly-gpu-critical
       kvTransfer:
         enabled: true
         connector: NixlConnector
@@ -373,6 +444,18 @@ scenario:
     storage:
       modelPvc:
         size: 1Ti
+      hostPath:
+        # TODO: should we default to enabled: true for WVA scenarios?
+        enabled: false
+        path: /mnt/models
+        storageClassName: hostpath
+        capacity: 1Ti
+        # Target the GPU nodes where decode pods will schedule.
+        # Replace with your cluster's actual node labels.
+        nodeSelector:
+          nvidia.com/gpu.present: "true"
+        tolerations: []
+        daemonSetTimeout: 3600
 
     # =========================================================================
     # WORKLOAD / HARNESS

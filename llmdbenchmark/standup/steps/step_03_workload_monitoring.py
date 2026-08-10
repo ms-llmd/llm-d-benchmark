@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+
 from llmdbenchmark.executor.step import Step, StepResult, Phase
 from llmdbenchmark.executor.context import ExecutionContext
 from llmdbenchmark.executor.command import CommandExecutor
+from llmdbenchmark.parser.cluster_resource_resolver import effective_accelerator_count
 from llmdbenchmark.standup import wva as wva_mod
+from llmdbenchmark.standup import keda_saturation as keda_sat_mod
 from llmdbenchmark.utilities.capacity_validator import run_capacity_planner
 
 
@@ -25,9 +28,11 @@ class WorkloadMonitoringStep(Step):
         )
 
     def should_skip(self, context: ExecutionContext) -> bool:
+        methods = context.deployed_methods or []
+        if "nok8s" in methods:
+            return True
         if context.non_admin:
             return True
-        methods = context.deployed_methods or []
         if methods == ["kustomize"] and context.kustomize_skip_infra:
             return True
         return False
@@ -163,11 +168,15 @@ class WorkloadMonitoringStep(Step):
         """
         val = str(val).strip()
         suffixes = {
-            "k": 1_000, "K": 1_000,
+            "k": 1_000,
+            "K": 1_000,
             "Ki": 1_024,
-            "M": 1_000_000, "Mi": 1_048_576,
-            "G": 1_000_000_000, "Gi": 1_073_741_824,
-            "T": 1_000_000_000_000, "Ti": 1_099_511_627_776,
+            "M": 1_000_000,
+            "Mi": 1_048_576,
+            "G": 1_000_000_000,
+            "Gi": 1_073_741_824,
+            "T": 1_000_000_000_000,
+            "Ti": 1_099_511_627_776,
         }
         for suffix, multiplier in sorted(suffixes.items(), key=lambda x: -len(x[0])):
             if val.endswith(suffix):
@@ -321,7 +330,7 @@ class WorkloadMonitoringStep(Step):
             # Only scenarios that *explicitly* set count to 0 (e.g. the
             # CPU example) are treated as CPU-only and have their GPU
             # label validation skipped.
-            method_accel_count, accel_count_source = self._effective_accelerator_count(
+            method_accel_count, accel_count_source = effective_accelerator_count(
                 method_config
             )
 
@@ -346,55 +355,39 @@ class WorkloadMonitoringStep(Step):
         if node_labels is None:
             # kubectl call failed -- warn but don't block
             context.logger.log_warning(
-                "Could not retrieve node labels -- " "skipping node selector validation"
+                "Could not retrieve node labels -- skipping node selector validation"
             )
             return
 
+        cluster_gpu_labels: dict[str, list[str]] | None = None
         for source, key, value in selectors:
             if self._label_exists_on_nodes(node_labels, key, value):
                 context.logger.log_info(
-                    f"Node selector {key}={value} ({source}) -- " "matched on cluster"
+                    f"Node selector {key}={value} ({source}) -- matched on cluster"
                 )
             else:
-                errors.append(
+                msg = (
                     f"Node selector label '{key}={value}' "
                     f"(from {source}) not found on any cluster node. "
                     "Pods using this selector will be stuck in Pending."
                 )
-
-    @staticmethod
-    def _effective_accelerator_count(method_config: dict) -> tuple[int, str]:
-        """Resolve the per-pod accelerator count for a method.
-
-        Mirrors the fallback chain in ``config/templates/jinja/13_ms-values.yaml.j2``
-        line 252:
-
-            decode.accelerator.count   (explicit)
-              ↓ (if unset)
-            decode.parallelism.tensor  (canonical vLLM pattern)
-
-        Returns a ``(count, source)`` tuple where ``source`` describes
-        which field was consulted, for informative logging. Any parsing
-        failure returns ``(0, "parse-error")`` so the caller treats the
-        method as CPU-only and skips GPU-label validation — the safe
-        choice when the config is unintelligible.
-        """
-        accel = method_config.get("accelerator")
-        if isinstance(accel, dict) and "count" in accel:
-            try:
-                return int(accel["count"]), "accelerator.count (explicit)"
-            except (ValueError, TypeError):
-                return 0, "parse-error"
-
-        parallelism = method_config.get("parallelism")
-        if isinstance(parallelism, dict) and "tensor" in parallelism:
-            try:
-                return int(parallelism["tensor"]), "parallelism.tensor (fallback)"
-            except (ValueError, TypeError):
-                return 0, "parse-error"
-
-        # Neither field present at all — assume no accelerators.
-        return 0, "unset"
+                if source.endswith(".acceleratorType"):
+                    if cluster_gpu_labels is None:
+                        cluster_gpu_labels = self._collect_cluster_gpu_labels(
+                            node_labels
+                        )
+                    if cluster_gpu_labels:
+                        preview = "; ".join(
+                            f"{k}={','.join(vs)}"
+                            for k, vs in cluster_gpu_labels.items()
+                        )
+                        msg += (
+                            f" Cluster has these GPU-like labels: {preview}. "
+                            f"To auto-detect, set `{source}.labelValue: auto` "
+                            "in your scenario (resolver will discover labelKey "
+                            "and labelValue from the cluster)."
+                        )
+                errors.append(msg)
 
     def _get_all_node_labels(
         self, cmd: CommandExecutor, context: ExecutionContext
@@ -432,6 +425,25 @@ class WorkloadMonitoringStep(Step):
             if labels.get(key) == value:
                 return True
         return False
+
+    @staticmethod
+    def _collect_cluster_gpu_labels(
+        node_labels: list[dict[str, str]],
+    ) -> dict[str, list[str]]:
+        """Return GPU-related labels observed across nodes as {key: [values]}.
+
+        Used to make node-selector mismatches actionable: when a scenario's
+        acceleratorType doesn't match the cluster, we surface what GPU labels
+        DO exist so the user can either pin them explicitly or switch to
+        `labelValue: auto` to let the resolver substitute them in.
+        """
+        gpu_keywords = ("gpu", "accelerator", "nvidia", "amd", "habana")
+        found: dict[str, set[str]] = {}
+        for labels in node_labels:
+            for k, v in labels.items():
+                if any(kw in k.lower() for kw in gpu_keywords):
+                    found.setdefault(k, set()).add(v)
+        return {k: sorted(found[k]) for k in sorted(found)}
 
     def _capacity_planner_sanity_check(
         self,
@@ -493,25 +505,32 @@ class WorkloadMonitoringStep(Step):
         # triggers the install; one WVA controller per unique wva.namespace.
         self._install_wva_if_enabled(cmd, context, errors)
 
+        # EPP+KEDA saturation autoscaling (controller-free alternative to WVA).
+        # Similar setup but no WVA controller, no VariantAutoscaling CRs.
+        # Queries EPP's pool metrics directly.
+        self._install_epp_keda_saturation_if_enabled(cmd, context, errors)
+
     def _install_wva_if_enabled(
         self,
         cmd: CommandExecutor,
         context: ExecutionContext,
         errors: list,
     ) -> None:
-        """Install WVA controller + prometheus-adapter once per unique namespace.
+        """Install WVA controller + per-namespace Prometheus auth once per unique namespace.
 
         Runs only when at least one rendered stack has ``wva.enabled: true``
         and the platform is OpenShift. Provisions:
 
-        1. prometheus-adapter helm chart + prometheus-ca ConfigMap in the
-           user-workload monitoring namespace (cluster-scoped dependency,
-           installed once regardless of how many WVA namespaces exist).
+        1. Verify KEDA is installed (cluster-scoped, pre-installed by admin).
         2. The thanos-querier ClusterRole (from rendered 22_prometheus-rbac).
-        3. The WVA namespace label (from rendered 23_wva-namespace).
-        4. The WVA controller helm chart into each unique wva.namespace.
+        3. The WVA namespace label + ServiceAccount + ClusterRoleBinding
+           (from rendered 23_wva-namespace).
+        4. Per-namespace Prometheus bearer token Secret + TriggerAuthentication
+           (minted dynamically via create_prometheus_auth_secret).
+        5. The WVA controller (upstream kustomize overlay) into each unique
+           wva.namespace.
 
-        The chart itself brings its own RBAC (``templates/rbac/*``), CRD
+        The upstream overlay itself brings its own RBAC, CRD
         (``llmd.ai/variantautoscaling``), ServiceMonitor, and ConfigMaps.
         """
         pairs = wva_mod.stacks_enabling_wva(context.rendered_stacks or [])
@@ -525,21 +544,16 @@ class WorkloadMonitoringStep(Step):
             )
             return
 
-        # prometheus-adapter + ClusterRole: cluster-wide, install once
-        # from the first stack's rendered templates.
-        first_stack, first_cfg = pairs[0]
-        monitoring_ns = (
-            first_cfg.get("openshiftMonitoring", {})
-            .get("userWorkloadMonitoringNamespace", "openshift-user-workload-monitoring")
-        )
+        # Verify KEDA is installed cluster-wide (shared infra, not managed here).
+        wva_mod.verify_keda_installed(cmd, context)
 
+        # Extract Prometheus CA cert for per-namespace auth Secret.
         prom_ca_cert = wva_mod.extract_prometheus_ca_cert(cmd, context.logger)
         if not prom_ca_cert:
             context.logger.log_warning(
                 "Could not extract a Prometheus CA cert. Skipping "
-                "prometheus-adapter install -- the WVA controller will still "
-                "run (TLS insecureSkipVerify=true) but the HPA will not "
-                "receive metrics, so auto-scaling is disabled.\n"
+                "KEDA authentication setup -- the WVA controller will still "
+                "run but KEDA ScaledObject metric queries will fail.\n"
                 "  To fix, ensure either:\n"
                 "    1) `oc get secret thanos-querier-tls -n openshift-monitoring` "
                 "returns the secret (needs cluster-admin on most clusters), or\n"
@@ -547,26 +561,100 @@ class WorkloadMonitoringStep(Step):
                 "deploy namespace (this is the built-in fallback; any "
                 "authenticated user has access)."
             )
-        else:
-            wva_mod.install_prometheus_adapter(
-                cmd=cmd,
-                context=context,
-                plan_config=first_cfg,
-                stack_path=first_stack,
-                monitoring_ns=monitoring_ns,
-                prom_ca_cert=prom_ca_cert,
-                errors=errors,
-            )
 
-        # One WVA controller per unique wva.namespace.
-        for wva_ns, (stack_path, plan_config) in wva_mod.unique_wva_namespaces(pairs).items():
+        # One WVA controller + auth setup per unique wva.namespace.
+        for wva_ns, (stack_path, plan_config) in wva_mod.unique_wva_namespaces(
+            pairs
+        ).items():
             wva_mod.apply_wva_namespace_label(cmd, stack_path, wva_ns)
+            if prom_ca_cert:
+                wva_mod.create_prometheus_auth_secret(
+                    cmd=cmd,
+                    context=context,
+                    stack_path=stack_path,
+                    wva_namespace=wva_ns,
+                    prom_ca_cert=prom_ca_cert,
+                    errors=errors,
+                )
             wva_mod.install_wva_for_namespace(
                 cmd=cmd,
                 context=context,
                 plan_config=plan_config,
                 stack_path=stack_path,
                 wva_namespace=wva_ns,
+                prom_ca_cert=prom_ca_cert,
+                errors=errors,
+            )
+
+    def _install_epp_keda_saturation_if_enabled(
+        self,
+        cmd: CommandExecutor,
+        context: ExecutionContext,
+        errors: list,
+    ) -> None:
+        """Install EPP+KEDA saturation autoscaling resources for enabled stacks.
+
+        Runs only when at least one rendered stack has ``eppKedaSaturation.enabled: true``
+        and the platform is OpenShift. Provisions (once per unique epp_keda_ns):
+
+        1. Verify KEDA is installed (cluster-scoped, pre-installed by admin).
+        2. The thanos-querier ClusterRole (from rendered 22_prometheus-rbac).
+        3. The EPP+KEDA namespace label + ServiceAccount + ClusterRoleBinding
+           (from rendered 23_wva-namespace, reused for both WVA and EPP+KEDA).
+        4. Per-namespace Prometheus bearer token Secret + TriggerAuthentication.
+        5. EPP ServiceMonitor + metrics reader RBAC (from rendered 29_epp-keda-saturation-epp-monitoring).
+
+        No WVA controller, no VariantAutoscaling CRs — just direct EPP metric queries via KEDA.
+        """
+        try:
+            pairs = keda_sat_mod.stacks_enabling_epp_keda_saturation(
+                context.rendered_stacks or []
+            )
+        except Exception as e:
+            import traceback
+
+            errors.append(
+                f"Failed to check EPP+KEDA stacks: {e}\n{traceback.format_exc()}"
+            )
+            return
+
+        if not pairs:
+            return
+
+        if not context.is_openshift:
+            context.logger.log_info(
+                "ℹ️  EPP+KEDA saturation is enabled but platform is not OpenShift -- "
+                "skipping admin setup (not yet verified on non-OCP)"
+            )
+            return
+
+        # Verify KEDA is installed cluster-wide.
+        keda_sat_mod.verify_keda_installed(cmd, context)
+
+        # Extract Prometheus CA cert for per-namespace auth Secret.
+        prom_ca_cert = keda_sat_mod.extract_prometheus_ca_cert(cmd, context.logger)
+        if not prom_ca_cert:
+            context.logger.log_warning(
+                "Could not extract a Prometheus CA cert for EPP+KEDA. "
+                "Skipping KEDA authentication setup -- KEDA ScaledObject metric queries will fail.\n"
+                "  To fix, ensure either:\n"
+                "    1) `oc get secret thanos-querier-tls -n openshift-monitoring` "
+                "returns the secret (needs cluster-admin on most clusters), or\n"
+                "    2) `oc get cm openshift-service-ca.crt` works in the "
+                "deploy namespace (this is the built-in fallback; any "
+                "authenticated user has access)."
+            )
+
+        # One EPP+KEDA setup per unique eppKedaSaturation.namespace.
+        for epp_keda_ns, (
+            stack_path,
+            plan_config,
+        ) in keda_sat_mod.unique_epp_keda_saturation_namespaces(pairs).items():
+            keda_sat_mod.install_epp_keda_saturation_for_namespace(
+                cmd=cmd,
+                context=context,
+                stack_path=stack_path,
+                epp_keda_namespace=epp_keda_ns,
                 prom_ca_cert=prom_ca_cert,
                 errors=errors,
             )

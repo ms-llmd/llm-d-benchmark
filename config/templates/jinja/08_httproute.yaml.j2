@@ -1,7 +1,7 @@
 {# HTTPRoute rendering - two modes:
 
    1. per-stack  (default): emit one HTTPRoute per stack, one backendRef ->
-      this stack's {model_id_label}-gaie InferencePool. This is the single-
+      this stack's {model_id_label}-router InferencePool. This is the single-
       model behavior the repo has always had.
 
    2. shared:     emit ONE HTTPRoute in stack index 1 only, with one
@@ -19,16 +19,31 @@
                              no substitution token the stacks will collide
      httpRoute.rewriteTo    (default: "/v1")
 
+   Timeout knobs (both modes, optional; Gateway-API HTTPRoute timeouts):
+     httpRoute.requestTimeout         (default: "300s") - end-to-end request
+                             timeout the gateway enforces. Long agentic turns
+                             that exceed it are aborted with a 502; set "0s"
+                             to disable. Applies to every rule this template
+                             emits.
+     httpRoute.backendRequestTimeout  (default: "0s")  - per-retry backend
+                             timeout; "0s" disables.
+#}
+{% set _request_timeout = (httpRoute.requestTimeout if httpRoute is defined and httpRoute.requestTimeout is defined else '300s') %}
+{% set _backend_request_timeout = (httpRoute.backendRequestTimeout if httpRoute is defined and httpRoute.backendRequestTimeout is defined else '0s') %}
+{#
+
    `siblingStacks` and `stackIndex` are injected by
    llmdbenchmark.parser.render_plans._process_stack.
 #}
-{# Modelservice-only template. Two skip conditions:
+{# Modelservice-only template. Skip when:
      1. -t kustomize -- upstream guide manifests define their own routing.
      2. gateway.className == 'epponly' -- no Gateway exists, so an HTTPRoute
-        would be unresolvable; clients hit the EPP service directly. #}
+      would be unresolvable; clients hit the EPP service directly.
+    3. gateway.className == 'none' -- clients hit the model server's plain
+      Service directly; no Gateway, router, or HTTPRoute is deployed. #}
 {% if standalone.enabled is defined and not standalone.enabled
       and not (kustomize.enabled | default(false))
-      and gateway.className | default('') != 'epponly' %}
+    and gateway.className | default('') not in ['epponly', 'none'] %}
 {% set _mode = (httpRoute.mode if httpRoute is defined and httpRoute.mode is defined else 'per-stack') %}
 {% if _mode == 'shared' %}
 {% set _owner_index = sharedInfraStackIndex | default(1) | int %}
@@ -53,12 +68,12 @@ spec:
     - backendRefs:
       - group: inference.networking.k8s.io
         kind: InferencePool
-        name: {{ _sibling_label }}-gaie
+        name: {{ _sibling_label }}-router
         port: {{ decode.vllm.servicePort }}
         weight: 1
       timeouts:
-        backendRequest: 0s
-        request: 300s
+        backendRequest: {{ _backend_request_timeout }}
+        request: {{ _request_timeout }}
       matches:
         - path:
             type: PathPrefix
@@ -86,12 +101,12 @@ spec:
     - backendRefs:
       - group: inference.networking.k8s.io
         kind: InferencePool
-        name: {{ model_id_label }}-gaie
+        name: {{ model_id_label }}-router
         port: {{ decode.vllm.servicePort }}
         weight: 1
       timeouts:
-        backendRequest: 0s
-        request: 0s
+        backendRequest: {{ _backend_request_timeout }}
+        request: {{ _request_timeout }}
       matches:
         - path:
             type: PathPrefix
@@ -106,11 +121,11 @@ spec:
     - backendRefs:
       - group: inference.networking.k8s.io
         kind: InferencePool
-        name: {{ model_id_label }}-gaie
+        name: {{ model_id_label }}-router
         port: {{ decode.vllm.servicePort }}
         weight: 1
       timeouts:
-        backendRequest: 0s
-        request: 0s
+        backendRequest: {{ _backend_request_timeout }}
+        request: {{ _request_timeout }}
 {% endif %}
 {% endif %}

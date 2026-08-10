@@ -1,0 +1,35 @@
+# SHARED probe for the Gemma/Qwen adaptive experiment. model_name "auto" -> the IPP
+# model-group-name-filter keeps BOTH pools as candidates and the ttft-aware-scorer routes each
+# request to the lower predicted TTFT. Classic single-turn chat (shareGPT, no prefix reuse).
+# One 180s poisson stage; adaptive_toggle_run.sh re-launches it fresh in each of stages 0..5.
+load:
+  type: poisson
+  interval: 0
+  request_timeout: 120
+  stages:
+  # 10 rps, sized to FIT in the headroom the pinned loads leave. With Gemma pinned at 10 (of an 11.1
+  # ceiling) and Qwen at 15 (of 18.9), combined spare capacity is only ~8 rps of shared-shape work,
+  # so the old 30 rps swamped both pools and buried the routing signal in queueing. At 10 rps the
+  # pools stay responsive and where each request lands reflects a real scorer decision.
+  - {rate: 10.0, duration: 180}
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: "auto"
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B-FP8
+data:
+  type: shareGPT
+  input_distribution:  {min: 10, max: 1024}
+  output_distribution: {min: 10, max: 1024}
+report:
+  # per_request embeds every prompt+completion: 0.5-1.2 GB per run (random/shareGPT text escapes
+  # to ~6 B/char), which stalls result collection for 20+ min and has OOM'd runs. Splits come
+  # from the vLLM counters and distributions from summary/per_stage, so it is not needed here.
+  request_lifecycle: {summary: true, per_stage: true, per_request: false}
+storage:
+  local_storage: {path: /workspace}

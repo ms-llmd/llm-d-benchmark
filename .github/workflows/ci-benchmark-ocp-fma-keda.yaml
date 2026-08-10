@@ -1,0 +1,470 @@
+name: CI - Run Benchmark on OCP ("EPP+KEDA+FMA" autoscaling path)
+
+# Drives the EPP+KEDA saturation autoscaling path: KEDA scales on EPP pool
+# metrics (inference_pool_average_kv_cache_utilization / _average_queue_size).
+# Enabled purely via `eppKedaSaturation.enabled: true`.
+#
+# Three passes for direct comparison, under inference-perf load
+# (shared_prefix_synthetic_heavy.yaml, sized to push the EPP KV-cache / queue
+# gauges past the KEDA ScaledObject thresholds so it scales out):
+#   1. baseline (EPP+KEDA, no FMA)   -- `cicd/ocp-keda`
+#   2. FMA warm-start with EPP+KEDA  -- `cicd/ocp-keda-fma-warmstart`
+#   3. FMA hot-start with EPP+KEDA   -- `cicd/ocp-keda-fma-hotstart`
+#
+# Hot-start pre-loads all models during standup then scales to 1 (vLLM sleeps),
+# isolating scaling behavior from model-load latency.
+#
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario_dir:
+        description: 'Directory housing the scenarios'
+        required: false
+        default: 'cicd'
+      baseline_scenario:
+        description: 'Baseline scenario (EPP+KEDA, no FMA)'
+        required: false
+        type: 'string'
+        default: 'ocp-keda'
+      standup_scenario:
+        description: 'EPP+KEDA with FMA scenario (warm-start)'
+        required: false
+        type: 'string'
+        default: 'ocp-keda-fma-warmstart'
+      hotstart_scenario:
+        description: 'EPP+KEDA with FMA scenario (hot-start)'
+        required: false
+        type: 'string'
+        default: 'ocp-keda-fma-hotstart'
+      decode_pods:
+        description: 'Number of decode pods (FMA path keeps decode at 0; baseline uses 1)'
+        required: false
+        type: 'string'
+        default: 'auto'
+      prefill_pods:
+        description: 'Number of prefill pods'
+        required: false
+        type: 'string'
+        default: 'auto'
+      accelerator_type:
+        description: 'Type of accelerator (kustomize only)'
+        required: false
+        type: 'string'
+        default: 'gpu'
+      backend_type:
+        description: 'Type of backend (kustomize only)'
+        required: false
+        type: 'string'
+        default: 'vllm'
+      infra_provider:
+        description: 'Target cloud provider (kustomize only)'
+        required: false
+        type: 'string'
+        default: 'ocp'
+      connector:
+        description: 'Accelerator offloading connector (kustomize only)'
+        required: false
+        type: 'string'
+        default: ''
+      bucket_project:
+        description: 'Project associated to the object storage bucket'
+        required: false
+        default: 'llm-d-scale'
+      bucket_provider:
+        description: 'Type (provider of) the bucket'
+        required: false
+        default: 'gcs'
+      bucket_path:
+        description: 'Path to object storage bucket'
+        required: false
+        default: 'llm-d-benchmarks/regressions'
+      gateway_class:
+        description: 'Class of gateway used (epponly for modelservice paths)'
+        required: false
+        default: 'epponly'
+      monitoring_enabled:
+        description: 'Enabled monitoring ("true", "false")'
+        required: true
+        type: 'string'
+        default: 'true'
+      dry_run:
+        description: 'Execute workflow in "dry-run" mode'
+        required: false
+        default: 'false'
+      verbose:
+        description: 'Execute workflow in "verbose" mode'
+        required: false
+        default: 'false'
+        type: 'string'
+      harness:
+        description: 'Harness ("inference-perf", "guidellm", "inferencemax", "vllm-benchmark", "nop")'
+        required: false
+        default: 'inference-perf'
+        type: 'string'
+      model:
+        description: 'Served model. Keep in sync with the scenario model.'
+        required: false
+        default: 'Qwen/Qwen3-32B'
+        type: 'string'
+      workload:
+        description: 'Workload profile (under workload/profiles/<harness>/)'
+        required: false
+        # Default to the heavy variant (calibrated to drive EPP saturation
+        # past the KEDA scale-up thresholds). Override to shared_prefix_synthetic.yaml
+        # for a light-load smoke test of the deployment chain itself.
+        default: 'shared_prefix_synthetic_heavy.yaml'
+        type: 'string'
+      wait_timeout:
+        # The reusable workflow's default is 3600s, but CI runs of the
+        # FMA+KEDA (with the heavy RPS profile) take 20+ minutes for the
+        # inference-perf harness pod to drain its in-flight queue.
+        description: 'Run-phase wait timeout in seconds'
+        required: false
+        default: '5400'
+        type: 'string'
+
+jobs:
+  # =========================================================================
+  # Pass 1: EPP+KEDA without FMA
+  #
+  # EPP-only path — decode.replicas: 1 at idle, scaled by the KEDA-managed HPA
+  # on EPP pool metrics (kv-cache / queue). No FMA controllers, no launchers.
+  # =========================================================================
+  baseline:
+    name: Baseline (EPP+KEDA, no FMA)
+    uses: llm-d/llm-d-infra/.github/workflows/reusable-ci-nightly-benchmark.yaml@main
+    with:
+      scenario_dir: ${{ inputs.scenario_dir || 'cicd' }}
+      standup_method: 'modelservice'
+      standup_scenario: ${{ inputs.baseline_scenario || 'ocp-keda' }}
+      decode_pods: ${{ inputs.decode_pods || 'auto' }}
+      prefill_pods: ${{ inputs.prefill_pods || 'auto' }}
+      accelerator_type: ${{ inputs.accelerator_type || 'gpu' }}
+      backend_type: ${{ inputs.backend_type || 'vllm' }}
+      infra_provider: ${{ inputs.infra_provider || 'ocp' }}
+      connector: ${{ inputs.connector || '' }}
+      cluster_namespace: 'llmdbenchcicdkbns-ocp'
+      helm_release: 'lmdbenchcicdkbr-ocp'
+      workspace_dir: '/tmp/llmdbenchcicdkb-ocp'
+      bucket_project: ${{ inputs.bucket_project || 'llm-d-scale' }}
+      bucket_provider: ${{ inputs.bucket_provider || 'gcs' }}
+      bucket_path: ${{ inputs.bucket_path || 'llm-d-benchmarks/regressions' }}
+      gateway_class: ${{ inputs.gateway_class || 'epponly' }}
+      monitoring_enabled: ${{ inputs.monitoring_enabled || 'true' }}
+      dry_run: ${{ inputs.dry_run || 'false' }}
+      verbose: ${{ inputs.verbose || 'false' }}
+      harness: ${{ inputs.harness || 'inference-perf' }}
+      workload: ${{ inputs.workload || 'shared_prefix_synthetic_heavy.yaml' }}
+      wait_timeout: ${{ inputs.wait_timeout || '5400' }}
+    secrets: inherit
+
+  # =========================================================================
+  # Pass 2: EPP+KEDA with FMA (Warm-Start)
+  #
+  # Same load against the same gateway/EPP path, but with FMA layered on:
+  # decode.replicas: 0, FMA's launcher pods serve traffic, requester
+  # Deployment is the KEDA scale target. Warm-start deploys 1 replica initially,
+  # model loads during warmup, then benchmark scales 1->N.
+  # =========================================================================
+  nightly:
+    name: EPP+KEDA with FMA (Warm-Start)
+    needs: [baseline]
+    uses: llm-d/llm-d-infra/.github/workflows/reusable-ci-nightly-benchmark.yaml@main
+    with:
+      scenario_dir: ${{ inputs.scenario_dir || 'cicd' }}
+      # Both methods: this scenario deploys modelservice (gateway/EPP/
+      # InferencePool) AND layers FMA on top (launcher pods serve traffic
+      # via the modelservice gateway). Comma-separated value
+      # makes both code paths fire.
+      standup_method: 'modelservice,fma'
+      standup_scenario: ${{ inputs.standup_scenario || 'ocp-keda-fma-warmstart' }}
+      decode_pods: ${{ inputs.decode_pods || 'auto' }}
+      prefill_pods: ${{ inputs.prefill_pods || 'auto' }}
+      accelerator_type: ${{ inputs.accelerator_type || 'gpu' }}
+      backend_type: ${{ inputs.backend_type || 'vllm' }}
+      infra_provider: ${{ inputs.infra_provider || 'ocp' }}
+      connector: ${{ inputs.connector || '' }}
+      cluster_namespace: 'llmdbenchcicdkwns-ocp'
+      helm_release: 'lmdbenchcicdkwr-ocp'
+      workspace_dir: '/tmp/llmdbenchcicdkw-ocp'
+      bucket_project: ${{ inputs.bucket_project || 'llm-d-scale' }}
+      bucket_provider: ${{ inputs.bucket_provider || 'gcs' }}
+      bucket_path: ${{ inputs.bucket_path || 'llm-d-benchmarks/regressions' }}
+      gateway_class: ${{ inputs.gateway_class || 'epponly' }}
+      monitoring_enabled: ${{ inputs.monitoring_enabled || 'true' }}
+      dry_run: ${{ inputs.dry_run || 'false' }}
+      verbose: ${{ inputs.verbose || 'false' }}
+      harness: ${{ inputs.harness || 'inference-perf' }}
+      workload: ${{ inputs.workload || 'shared_prefix_synthetic_heavy.yaml' }}
+      wait_timeout: ${{ inputs.wait_timeout || '5400' }}
+    secrets: inherit
+
+  # =========================================================================
+  # Pass 3: EPP+KEDA with FMA (Hot-Start)
+  #
+  # Hot-start variant: deploys all maxReplicas initially so all models load
+  # in parallel during standup. After loading, scales down to 1 (vLLM sleeps).
+  # Benchmark then scales 1->N, measuring pure HPA/KEDA behavior without model
+  # loading latency confounding the results.
+  # =========================================================================
+  hotstart:
+    name: EPP+KEDA with FMA (Hot-Start)
+    needs: [baseline]
+    uses: llm-d/llm-d-infra/.github/workflows/reusable-ci-nightly-benchmark.yaml@main
+    with:
+      scenario_dir: ${{ inputs.scenario_dir || 'cicd' }}
+      standup_method: 'modelservice,fma'
+      standup_scenario: ${{ inputs.hotstart_scenario || 'ocp-keda-fma-hotstart' }}
+      decode_pods: ${{ inputs.decode_pods || 'auto' }}
+      prefill_pods: ${{ inputs.prefill_pods || 'auto' }}
+      accelerator_type: ${{ inputs.accelerator_type || 'gpu' }}
+      backend_type: ${{ inputs.backend_type || 'vllm' }}
+      infra_provider: ${{ inputs.infra_provider || 'ocp' }}
+      connector: ${{ inputs.connector || '' }}
+      cluster_namespace: 'llmdbenchcicdkhns-ocp'
+      helm_release: 'lmdbenchcicdkhr-ocp'
+      workspace_dir: '/tmp/llmdbenchcicdkh-ocp'
+      bucket_project: ${{ inputs.bucket_project || 'llm-d-scale' }}
+      bucket_provider: ${{ inputs.bucket_provider || 'gcs' }}
+      bucket_path: ${{ inputs.bucket_path || 'llm-d-benchmarks/regressions' }}
+      gateway_class: ${{ inputs.gateway_class || 'epponly' }}
+      monitoring_enabled: ${{ inputs.monitoring_enabled || 'true' }}
+      dry_run: ${{ inputs.dry_run || 'false' }}
+      verbose: ${{ inputs.verbose || 'false' }}
+      harness: ${{ inputs.harness || 'inference-perf' }}
+      workload: ${{ inputs.workload || 'shared_prefix_synthetic_heavy.yaml' }}
+      wait_timeout: ${{ inputs.wait_timeout || '7200' }}
+    secrets: inherit
+
+  # =========================================================================
+  # Display: combine all three result sets in the GH Step Summary
+  # =========================================================================
+  display-results:
+    name: Display Results (Baseline + EPP+KEDA with FMA Warm-Start + Hot-Start)
+    needs: [baseline, nightly, hotstart]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GCS_PATH: ${{ inputs.bucket_path || 'llm-d-benchmarks/regressions' }}
+      GCP_PROJECT_ID: ${{ inputs.bucket_project || 'llm-d-scale' }}
+      LLMDBENCH_CICD_TARGET: ${{ inputs.infra_provider || 'ocp' }}
+      BASELINE_SCENARIO: ${{ inputs.baseline_scenario || 'ocp-keda' }}
+      FMA_KEDA_WARMSTART_SCENARIO: ${{ inputs.standup_scenario || 'ocp-keda-fma-warmstart' }}
+      FMA_KEDA_HOTSTART_SCENARIO: ${{ inputs.hotstart_scenario || 'ocp-keda-fma-hotstart' }}
+    steps:
+      - name: Checkout llm-d-benchmark (for the results-table script)
+        uses: actions/checkout@v7.0.0
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          credentials_json: ${{ secrets.GKE_SA_KEY }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Display results
+        run: |
+          set +e
+          BASELINE_DIR="/tmp/baseline-results"
+          FMA_KEDA_WARMSTART_DIR="/tmp/fma-keda-warmstart-results"
+          FMA_KEDA_HOTSTART_DIR="/tmp/fma-keda-hotstart-results"
+          mkdir -p "$BASELINE_DIR" "$FMA_KEDA_WARMSTART_DIR" "$FMA_KEDA_HOTSTART_DIR"
+
+          # Pick the most recent <date> subdir that actually has data
+          latest_date_under() {
+            # $1 = bucket prefix (e.g., gs://.../scenario/target/method/)
+            # Output: latest YYYY-MM-DD/, or empty if none.
+            gcloud storage ls "$1" 2>/dev/null \
+              | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}/$' \
+              | sort | tail -1
+          }
+          BL_PREFIX="gs://${GCS_PATH}/${BASELINE_SCENARIO}/${LLMDBENCH_CICD_TARGET}/modelservice/"
+          FW_WARMSTART_PREFIX="gs://${GCS_PATH}/${FMA_KEDA_WARMSTART_SCENARIO}/${LLMDBENCH_CICD_TARGET}/modelservice,fma/"
+          FW_HOTSTART_PREFIX="gs://${GCS_PATH}/${FMA_KEDA_HOTSTART_SCENARIO}/${LLMDBENCH_CICD_TARGET}/modelservice,fma/"
+          BL_DATE=$(latest_date_under "$BL_PREFIX")
+          FW_WARMSTART_DATE=$(latest_date_under "$FW_WARMSTART_PREFIX")
+          FW_HOTSTART_DATE=$(latest_date_under "$FW_HOTSTART_PREFIX")
+          echo "Baseline data date:           ${BL_DATE:-none found}"
+          echo "FMA+KEDA Warm-Start data date: ${FW_WARMSTART_DATE:-none found}"
+          echo "FMA+KEDA Hot-Start data date:  ${FW_HOTSTART_DATE:-none found}"
+
+          [ -n "$BL_DATE" ] && gcloud storage cp -r "${BL_PREFIX}${BL_DATE}" "$BASELINE_DIR/" || true
+          [ -n "$FW_WARMSTART_DATE" ] && gcloud storage cp -r "${FW_WARMSTART_PREFIX}${FW_WARMSTART_DATE}" "$FMA_KEDA_WARMSTART_DIR/" || true
+          [ -n "$FW_HOTSTART_DATE" ] && gcloud storage cp -r "${FW_HOTSTART_PREFIX}${FW_HOTSTART_DATE}" "$FMA_KEDA_HOTSTART_DIR/" || true
+
+          python3 "$GITHUB_WORKSPACE/llmdbenchmark/analysis/scripts/fma_comparison_table.py" \
+            --baseline-dir "$BASELINE_DIR" \
+            --warmstart-dir "$FMA_KEDA_WARMSTART_DIR" \
+            --hotstart-dir "$FMA_KEDA_HOTSTART_DIR" \
+            --col-baseline "Baseline (EPP+KEDA, no FMA)" \
+            --col-warmstart "EPP+KEDA with FMA Warm Start" \
+            --col-hotstart "EPP+KEDA with FMA Hot Start" \
+            --model "${{ inputs.model || 'Qwen/Qwen3-32B' }}" \
+            --harness "${{ inputs.harness || 'inference-perf' }}" \
+            --workload "${{ inputs.workload || 'shared_prefix_synthetic_heavy.yaml' }}" \
+            --gpu-hourly-cost 1.0 \
+            >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      # =====================================================================
+      # Per-resource dump steps.
+      #
+      # Source for all dumps: results/<exp_id>/ — step_09a writes autoscaling
+      # diagnostics (hpa.txt, hpa-describe.txt, scaledobject.txt, all pod
+      # logs as <ns>__<pod>.log) directly into the experiment's results dir
+      # alongside the harness's benchmark output.
+      # =====================================================================
+
+      - name: Find latest experiment results dirs
+        if: always()
+        id: cs
+        run: |
+          set +e
+          for label in baseline fma_keda_warmstart fma_keda_hotstart; do
+            case $label in
+              baseline)          base=/tmp/baseline-results ;;
+              fma_keda_warmstart) base=/tmp/fma-keda-warmstart-results ;;
+              fma_keda_hotstart)  base=/tmp/fma-keda-hotstart-results ;;
+            esac
+            latest=$(find "$base" -type d -name "runner-*" 2>/dev/null | sort | tail -1)
+            exp=""
+            if [ -n "$latest" ]; then
+              exp=$(find "$latest/results" -mindepth 1 -maxdepth 1 -type d -exec test -f '{}/hpa.txt' \; -print 2>/dev/null | head -1)
+              if [ -z "$exp" ]; then
+                exp=$(find "$latest/results" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+              fi
+            fi
+            echo "${label}_exp=${exp}" >> "$GITHUB_OUTPUT"
+            echo "${label}_exp=${exp}"
+          done
+        shell: bash
+
+      # ---------------- Baseline (EPP+KEDA, no FMA) dumps -------------------
+
+      - name: Dump HPA — Baseline (EPP+KEDA, no FMA)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.baseline_exp }}/hpa.txt"
+          [ -f "$f" ] && cat "$f" || echo "no hpa.txt for baseline"
+
+      - name: Dump HPA describe — Baseline (EPP+KEDA, no FMA)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.baseline_exp }}/hpa-describe.txt"
+          [ -f "$f" ] && cat "$f" || echo "no hpa-describe.txt for baseline"
+
+      - name: Dump ScaledObject — Baseline (EPP+KEDA, no FMA)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.baseline_exp }}/scaledobject.txt"
+          [ -f "$f" ] && cat "$f" || echo "no scaledobject.txt for baseline"
+
+      - name: Dump ScaledObject describe — Baseline (EPP+KEDA, no FMA)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.baseline_exp }}/scaledobject-describe.txt"
+          [ -f "$f" ] && cat "$f" || echo "no scaledobject-describe.txt for baseline"
+
+      - name: Dump events — Baseline (EPP+KEDA, no FMA)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.baseline_exp }}/events.log"
+          [ -f "$f" ] && cat "$f" || echo "no events.log for baseline"
+
+      - name: Dump pods — Baseline (EPP+KEDA, no FMA)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.baseline_exp }}/pods.txt"
+          [ -f "$f" ] && cat "$f" || echo "no pods.txt for baseline"
+
+      # ---------------- EPP+KEDA with FMA (Warm-Start) dumps --------------------
+
+      - name: Dump HPA — EPP+KEDA with FMA (Warm-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_warmstart_exp }}/hpa.txt"
+          [ -f "$f" ] && cat "$f" || echo "no hpa.txt for warm-start"
+
+      - name: Dump HPA describe — EPP+KEDA with FMA (Warm-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_warmstart_exp }}/hpa-describe.txt"
+          [ -f "$f" ] && cat "$f" || echo "no hpa-describe.txt for warm-start"
+
+      - name: Dump ScaledObject — EPP+KEDA with FMA (Warm-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_warmstart_exp }}/scaledobject.txt"
+          [ -f "$f" ] && cat "$f" || echo "no scaledobject.txt for warm-start"
+
+      - name: Dump ScaledObject describe — EPP+KEDA with FMA (Warm-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_warmstart_exp }}/scaledobject-describe.txt"
+          [ -f "$f" ] && cat "$f" || echo "no scaledobject-describe.txt for warm-start"
+
+      - name: Dump FMA launcher-populator log tail — EPP+KEDA with FMA (Warm-Start)
+        if: always()
+        run: |
+          f=$(find "${{ steps.cs.outputs.fma_keda_warmstart_exp }}" -maxdepth 1 -name "*launcher-populator*.log" 2>/dev/null | head -1)
+          [ -n "$f" ] && tail -200 "$f" || echo "no launcher-populator log for warm-start"
+
+      - name: Dump events — EPP+KEDA with FMA (Warm-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_warmstart_exp }}/events.log"
+          [ -f "$f" ] && cat "$f" || echo "no events.log for warm-start"
+
+      - name: Dump pods — EPP+KEDA with FMA (Warm-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_warmstart_exp }}/pods.txt"
+          [ -f "$f" ] && cat "$f" || echo "no pods.txt for warm-start"
+
+      # ---------------- EPP+KEDA with FMA (Hot-Start) dumps ---------------------
+
+      - name: Dump HPA — EPP+KEDA with FMA (Hot-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_hotstart_exp }}/hpa.txt"
+          [ -f "$f" ] && cat "$f" || echo "no hpa.txt for hot-start"
+
+      - name: Dump HPA describe — EPP+KEDA with FMA (Hot-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_hotstart_exp }}/hpa-describe.txt"
+          [ -f "$f" ] && cat "$f" || echo "no hpa-describe.txt for hot-start"
+
+      - name: Dump ScaledObject — EPP+KEDA with FMA (Hot-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_hotstart_exp }}/scaledobject.txt"
+          [ -f "$f" ] && cat "$f" || echo "no scaledobject.txt for hot-start"
+
+      - name: Dump ScaledObject describe — EPP+KEDA with FMA (Hot-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_hotstart_exp }}/scaledobject-describe.txt"
+          [ -f "$f" ] && cat "$f" || echo "no scaledobject-describe.txt for hot-start"
+
+      - name: Dump FMA launcher-populator log tail — EPP+KEDA with FMA (Hot-Start)
+        if: always()
+        run: |
+          f=$(find "${{ steps.cs.outputs.fma_keda_hotstart_exp }}" -maxdepth 1 -name "*launcher-populator*.log" 2>/dev/null | head -1)
+          [ -n "$f" ] && tail -200 "$f" || echo "no launcher-populator log for hot-start"
+
+      - name: Dump events — EPP+KEDA with FMA (Hot-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_hotstart_exp }}/events.log"
+          [ -f "$f" ] && cat "$f" || echo "no events.log for hot-start"
+
+      - name: Dump pods — EPP+KEDA with FMA (Hot-Start)
+        if: always()
+        run: |
+          f="${{ steps.cs.outputs.fma_keda_hotstart_exp }}/pods.txt"
+          [ -f "$f" ] && cat "$f" || echo "no pods.txt for hot-start"

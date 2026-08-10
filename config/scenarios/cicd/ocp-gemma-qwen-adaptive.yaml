@@ -1,0 +1,167 @@
+# OpenShift adaptive-routing scenario -- TWO DIFFERENT models, one pool each, behind one
+# shared Istio Gateway + IPP. Gemma-4 26B-A4B (fp8) and Qwen3.6 35B-A3B (fp8): similar
+# quality, similar perf (+-20%). The IPP ttft-aware scorer routes the shared workload to
+# whichever pool has spare capacity; pinned per-model workloads toggle load on/off.
+#
+# Unlike the same-model dual-pool (alias trick), each pool serves ONLY its own real name --
+# the IPP rewrites the request `model` to the picked real name, so no --served-model-name
+# aliasing is needed. imageDefault is fine; USER/LOGNAME env under shared.decode avoids the
+# OCP arbitrary-UID getpwuid crashloop.
+#
+#   llmdbenchmark --spec cicd/ocp-gemma-qwen-adaptive standup -p $NAMESPACE
+#   # then: install IPP (ipp_configs/adaptive-gemma-qwen-smart-values.yaml), apply the two
+#   # base-model ConfigMaps, gen_httproutes.sh, drive with tools/adaptive_toggle_run.sh
+#   llmdbenchmark --spec cicd/ocp-gemma-qwen-adaptive teardown -p $NAMESPACE
+# Cluster: OpenShift + NVIDIA GPU Operator, H100-80GB (1 GPU/pod, 2 pods total). HF_TOKEN in env.
+
+shared:
+  # GPU placement comes from accelerator auto-detection. To pin a SKU, set
+  # affinity.enabled: true + nodeSelector: {nvidia.com/gpu.product: <label>}.
+  accelerator:
+    count: 1
+    memory: 80
+  modelservice:
+    enabled: true
+    uriProtocol: hf
+  standalone:
+    enabled: false
+  httpRoute:
+    enabled: false
+  gateway:
+    className: istio
+    resources:
+      limits:   { cpu: "2",    memory: 2Gi }
+      requests: { cpu: "500m", memory: 512Mi }
+  # llm-d-router chart keys (chart default is cpu 8 / memory 8Gi)
+  router:
+    epp:
+      resources:
+        requests: { cpu: "200m", memory: 512Mi }
+        limits:   { cpu: "1",    memory: 1Gi }
+    monitoring:
+      prometheus:
+        enabled: true
+  monitoring:
+    installPrometheusCrds: false
+  vllmCommon:
+    shmMemory: 8Gi
+    volumes:
+      - name: dshm
+        type: emptyDir
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi
+    volumeMounts:
+      - name: dshm
+        mountPath: /dev/shm
+    flags:
+      enforceEager: false
+      disableLogRequests: true
+      disableUvicornAccessLog: true
+  prefill:
+    enabled: false
+    replicas: 0
+  decode:
+    replicas: 1
+    parallelism:
+      tensor: 1
+      data: 1
+      dataLocal: 1
+      workers: 1
+    accelerator:
+      count: 1
+    # LOGNAME only: the env macro (_macros.j2) already emits USER, and a second one
+    # is a duplicate env key that Helm 4 server-side apply rejects.
+    extraEnvVars:
+      - name: LOGNAME
+        value: vllm
+  storage:
+    modelPvc:
+      accessModes:
+        - ReadWriteMany   # one PVC, two pods (distinct model.path subdirs) -> RWX
+      size: 200Gi
+    workloadPvc:
+      accessModes:
+        - ReadWriteMany
+      size: 96Gi
+  harness:
+    name: inference-perf
+    experimentProfile: adaptive_shared_sharegpt.yaml
+    resources:
+      cpu: "8"
+      memory: 32Gi
+  workDir: "~/data/ocp-gemma-qwen-adaptive"
+  monitoring:
+    metricsScrapeEnabled: true
+    scrapeInterval: "10s"
+  runConfig:
+    skipSmoketest: true
+    skipModelVerify: true
+
+scenario:
+  # Pool A -- Gemma-4 26B-A4B fp8, 1 pod / 1 GPU
+  - name: "gemma4-26b-fp8"
+    # Per-stack metrics-reader Secret. Set on BOTH keys: the router chart reads
+    # prometheus.auth.secretName, the RBAC template reads monitoring.secretName.
+    router:
+      monitoring:
+        secretName: inference-gateway-sa-metrics-reader-secret-gemma4-26b-fp8
+        prometheus:
+          auth:
+            secretName: inference-gateway-sa-metrics-reader-secret-gemma4-26b-fp8
+    model:
+      name: RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic
+      shortName: gemma4-26b-fp8
+      path: models/RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic
+      huggingfaceId: RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic
+      size: 40Gi
+      maxModelLen: 8192
+      gpuMemoryUtilization: 0.90
+    decode:
+      replicas: 1
+      resources:
+        limits:   { memory: 80Gi, cpu: "16", nvidia.com/gpu: "1" }
+        requests: { memory: 80Gi, cpu: "8",  nvidia.com/gpu: "1" }
+      vllm:
+        modelCommand: imageDefault
+
+  # Pool B -- Qwen3.6 35B-A3B fp8, 1 pod / 1 GPU.
+  # NOT imageDefault: that makes the chart use the image entrypoint and drop every generated flag
+  # (container args become just --model/--port/--served-model-name), and maxModelLen above is only
+  # passed as VLLM_MAX_MODEL_LEN, which vLLM 0.23 does not recognise -- so the engine booted at its
+  # full 262144 context while still admitting 256 concurrent requests.
+  #
+  # Qwen3.6 is a HYBRID GDN(linear-attention)+attention model: vLLM forces the attention block size
+  # to 1056 tokens to match the mamba page size, disables prefix caching, and cannot preempt the
+  # recurrent state. At max_num_seqs=256 the allocator reached a state where nothing could advance
+  # and nothing could be preempted -- the engine wedged silently at 100% GPU with zero tokens and
+  # needed a pod restart (example_outputs/gemma-qwen-adaptive/qwen-engine-wedge/).
+  # --max-num-seqs 64 was the guard, but at 256-token outputs the cap itself became the binding
+  # constraint (63/64 slots occupied at 8 rps), so it is REMOVED and the engine default applies.
+  # The wedge guard in the stage runner watches generation_tokens_total and aborts within ~60s if
+  # it recurs; restore the flag here if it does.
+  # USER/LOGNAME under shared.decode already covers the getpwuid crashloop that imageDefault was
+  # avoiding.
+  - name: "qwen36-35b-fp8"
+    router:
+      monitoring:
+        secretName: inference-gateway-sa-metrics-reader-secret-qwen36-35b-fp8
+        prometheus:
+          auth:
+            secretName: inference-gateway-sa-metrics-reader-secret-qwen36-35b-fp8
+    model:
+      name: Qwen/Qwen3.6-35B-A3B-FP8
+      shortName: qwen36-35b-fp8
+      path: models/Qwen/Qwen3.6-35B-A3B-FP8
+      huggingfaceId: Qwen/Qwen3.6-35B-A3B-FP8
+      size: 50Gi
+      maxModelLen: 8192
+      gpuMemoryUtilization: 0.90
+    decode:
+      replicas: 1
+      resources:
+        limits:   { memory: 80Gi, cpu: "16", nvidia.com/gpu: "1" }
+        requests: { memory: 80Gi, cpu: "8",  nvidia.com/gpu: "1" }
+      vllm:
+        additionalFlags:
+          - --max-model-len 8192

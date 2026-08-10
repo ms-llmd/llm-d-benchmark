@@ -80,7 +80,7 @@ def q_range(host, token, query, start, end, step=10):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--logs-dir", required=True)
-    ap.add_argument("--namespace", default=os.environ.get("NAMESPACE", "llm-d-arad"))
+    ap.add_argument("--namespace", default=os.environ.get("NAMESPACE"), required="NAMESPACE" not in os.environ)
     ap.add_argument("--step", type=int, default=10)
     ap.add_argument("--pad", type=float, default=30.0)
     args = ap.parse_args()

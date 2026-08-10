@@ -1,3 +1,4 @@
+{% if not (storage.hostPath is defined and storage.hostPath.enabled | default(false)) %}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -18,7 +19,7 @@ spec:
           args:
             - |
               mkdir -p "${MOUNT_PATH}/${MODEL_PATH}" && \
-              pip install huggingface_hub && \
+              pip install -U --user huggingface_hub && \
               export PATH="${PATH}:${HOME}/.local/bin" && \
 {% if huggingface.enabled %}
               hf auth login --token "${HF_TOKEN}" && \
@@ -54,3 +55,4 @@ spec:
         - name: model-cache
           persistentVolumeClaim:
             claimName: {{ storage.modelPvc.name }}
+{% endif %}

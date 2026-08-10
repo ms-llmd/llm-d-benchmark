@@ -1,0 +1,37 @@
+# SHARED probe for the Gemma/Qwen adaptive experiment. model_name "auto" -> the IPP
+# model-group-name-filter keeps BOTH pools as candidates and the ttft-aware-scorer routes each
+# request to the lower predicted TTFT.
+# Same summarization shape and same tokenizer as the two pinned profiles, so a shared request and
+# a pinned request are the SAME unit of work -- the earlier run mixed shareGPT here with
+# summarization/code-completion on the pinned streams, which made the per-pool latencies
+# incomparable. One 300s poisson stage; the driver re-launches it fresh in each of stages 0..5.
+load:
+  type: poisson
+  interval: 0
+  request_timeout: 120
+  stages:
+  - {rate: 10.0, duration: 300}
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: "auto"
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  # one tokenizer for all three profiles: a shared request may land on either pool, so prompts must
+  # be generated identically everywhere or "same dataset" is not true at the server
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B-FP8
+data:
+  type: random
+  input_distribution:  {min: 1024, max: 4096, mean: 2048, std_dev: 512, total_count: 200}
+  output_distribution: {min: 128,  max: 512,  mean: 256,  std_dev: 64,  total_count: 200}
+report:
+  # per_request IS needed here: it is the only harness-side per-request record (start/end time,
+  # error, output tokens). It embeds the full streamed response, so expect ~1-2 GB per run at
+  # 3000 requests of this shape and a slow collection step. stage.sh slims it to
+  # per_request_slim.json right after archiving; the fat original is gitignored.
+  request_lifecycle: {summary: true, per_stage: true, per_request: true}
+storage:
+  local_storage: {path: /workspace}

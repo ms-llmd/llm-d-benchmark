@@ -12,6 +12,7 @@ import uuid
 import hashlib
 import json
 import binascii
+from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
 
@@ -28,6 +29,30 @@ from .core import (
 )
 from .schema_v0_2 import BenchmarkReportV02, Component, Distribution, LoadSource
 from .schema_v0_2_components import HostType
+
+
+def _normalize_concurrency(value: Any, zero_fallback: Any = None) -> Any:
+    """Map upstream "0 = unbounded" sentinels for the v0.2 schema.
+
+    LoadStandardized.concurrency is constrained to >=1, so a literal 0
+    coming back from a harness (e.g. inference-perf trace_session_replay
+    with ``concurrent_sessions: 0`` meaning "no limit") would fail
+    Pydantic validation. Substitute ``zero_fallback`` for 0 -- callers
+    that have a meaningful cap (e.g. ``num_sessions``) pass it in.
+    For callers that don't have a suitable cap, a default `zero_fallback`
+    of `None` will be used.
+    Negative and non-numeric values are returned as-is so validation
+    still rejects them.
+    """
+    if value is None:
+        return None
+    try:
+        as_float = float(value)
+    except (TypeError, ValueError):
+        return value
+    if as_float == 0:
+        return zero_fallback
+    return value
 
 
 def _load_run_metadata() -> dict:
@@ -196,6 +221,75 @@ def get_configmap(
         return {}
 
 
+# Node labels advertising the accelerator model, in preference order.
+_ACCELERATOR_LABELS = (
+    "nvidia.com/gpu.product",
+    "gpu.nvidia.com/model",
+    "amd.com/gpu.product",
+    "gpu.amd.com/model",
+    "habana.ai/gaudi.product",
+    "ibm.com/spyre.product",
+)
+
+
+def _detect_accelerator_model(ev_dict: dict, timeout: int = 5) -> str:
+    """Read the accelerator model from cluster node labels.
+
+    Used as a fallback when LLMDBENCH_VLLM_COMMON_AFFINITY carries no value.
+    Prefers a node running a pod in the run's namespace; otherwise any node
+    advertising a known accelerator label. Returns "" if none is found.
+    """
+    try:
+        from kubernetes import client, config as k8s_config
+
+        try:
+            k8s_config.load_incluster_config()
+        except k8s_config.ConfigException:
+            context_dict = get_context_from_envar("LLMDBENCH_BASE64_CONTEXT_CONTENTS")
+            if not context_dict:
+                return ""
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".yaml", delete=False
+            ) as f:
+                yaml.dump(context_dict, f)
+                k8s_config.load_kube_config(config_file=f.name)
+
+        v1 = client.CoreV1Api()
+
+        def label(node) -> str:
+            labels = node.metadata.labels or {}
+            for key in _ACCELERATOR_LABELS:
+                if labels.get(key):
+                    return labels[key]
+            return ""
+
+        # Prefer nodes hosting the run's pods.
+        ns = ev_dict.get("vllm_common_namespace") or os.environ.get(
+            "LLMDBENCH_VLLM_COMMON_NAMESPACE", ""
+        )
+        node_names = set()
+        if ns:
+            pods = v1.list_namespaced_pod(namespace=ns, _request_timeout=timeout)
+            node_names = {p.spec.node_name for p in pods.items if p.spec.node_name}
+
+        nodes = v1.list_node(_request_timeout=timeout).items
+        for node in nodes:
+            if node.metadata.name in node_names and label(node):
+                return label(node)
+        for node in nodes:
+            if label(node):
+                return label(node)
+    except Exception as e:
+        sys.stderr.write(f"Failed to detect accelerator model: {e}\n")
+    return ""
+
+
+def _resolve_accelerator_model(ev_dict: dict) -> str:
+    """Accelerator model from the affinity value, falling back to node labels."""
+    accelerator = ev_dict.get("vllm_common_affinity", "").rsplit(":", 1)[-1]
+    return accelerator or _detect_accelerator_model(ev_dict)
+
+
 def _populate_run(ev_dict: dict) -> dict:
     """Create a benchmark report with run details from environment variables.
 
@@ -212,11 +306,19 @@ def _populate_run(ev_dict: dict) -> dict:
     # Create cluster ID from the API server certificate
     host = os.environ.get("KUBERNETES_SERVICE_HOST")
     port = int(os.environ.get("KUBERNETES_SERVICE_PORT", 0))
-    try:
-        cert = ssl.get_server_certificate((host, port), timeout=5)
-    except (TimeoutError, OSError):
-        # As a failover, just use the service host
-        cert = host
+    cert = None
+    if host and port:
+        try:
+            cert = ssl.get_server_certificate((host, port), timeout=5)
+        except (TimeoutError, OSError):
+            # As a failover, just use the service host
+            cert = host
+    if not cert:
+        cert = (
+            ev_dict.get("harness_stack_endpoint_url")
+            or ev_dict.get("vllm_common_namespace")
+            or "run-only"
+        )
     cid = str(uuid.uuid5(uuid.NAMESPACE_DNS, cert))
 
     # Use the namespace for "user"
@@ -275,13 +377,28 @@ def _populate_load() -> dict:
             value = None
         args[key] = value
 
-    # Import config file, if it exists
-    config_file = os.environ.get("LLMDBENCH_RUN_EXPERIMENT_HARNESS_WORKLOAD_NAME", "")
-    try:
-        with open(config_file, "r", encoding="UTF-8") as file:
-            config = yaml.safe_load(file)
-    except (FileNotFoundError, IsADirectoryError):
-        config = None
+    # Import config file, if it exists. In run-only/local analysis the workload
+    # env var may be just a file name, while harness_args carries the full path.
+    config = None
+    config_candidates = [
+        os.environ.get("LLMDBENCH_RUN_EXPERIMENT_HARNESS_WORKLOAD_NAME", ""),
+        args.get("config_file", ""),
+    ]
+    run_metadata = _load_run_metadata()
+    results_dir = os.environ.get("LLMDBENCH_RUN_EXPERIMENT_RESULTS_DIR", "")
+    harness_workload = run_metadata.get("harness_workload", "")
+    if results_dir and harness_workload:
+        config_candidates.append(os.path.join(results_dir, harness_workload))
+
+    for config_file in config_candidates:
+        if not config_file:
+            continue
+        try:
+            with open(config_file, "r", encoding="UTF-8") as file:
+                config = yaml.safe_load(file)
+            break
+        except (FileNotFoundError, IsADirectoryError):
+            continue
 
     br_dict = {
         "scenario": {
@@ -315,7 +432,7 @@ def _populate_aggregate_stack(ev_dict: dict) -> dict:
         dict: dict with scenario.stack part of of BenchmarkReport.
     """
     model = ev_dict.get("deploy_current_model", "")
-    accelerator = ev_dict.get("vllm_common_affinity", "").rsplit(":", 1)[-1]
+    accelerator = _resolve_accelerator_model(ev_dict)
     replicas = int(ev_dict.get("vllm_common_replicas", 1))
     tp = int(ev_dict.get("vllm_common_tensor_parallelism", 1))
     dp = int(ev_dict.get("vllm_common_data_parallelism", 1))
@@ -403,19 +520,16 @@ def _add_inference_scheduler_component(br_dict: dict, ev_dict: dict) -> None:
         ev_dict (dict): Environment variable values.
     """
     epp_config_str = b64_decode_envar("LLMDBENCH_VLLM_MODELSERVICE_GAIE_PRESETS_CONFIG")
-    if not epp_config_str:
-        return
-
-    epp_config = yaml.safe_load(epp_config_str)
-    # Inference scheduler component
+    epp_config = yaml.safe_load(epp_config_str) if epp_config_str else {}
+    # "scheduler" in the label is what prism keys off to show the component.
     epp = {
         "metadata": {
-            "label": "EPP",  # TODO
+            "label": "Inference Scheduler (EPP)",
             "cfg_id": config_hash(epp_config),
         },
         "standardized": {
             "kind": "generic",
-            "tool": "request_router",
+            "tool": "inference_scheduler",
             "tool_version": "",  # TODO get version somehow
         },
         "native": {
@@ -425,6 +539,40 @@ def _add_inference_scheduler_component(br_dict: dict, ev_dict: dict) -> None:
 
     stack: list[Component] = br_dict["scenario"]["stack"]
     stack.append(epp)
+
+
+def _add_gateway_component(br_dict: dict, ev_dict: dict) -> None:
+    """Add an inference gateway component unless the topology has none."""
+    gateway_class = ev_dict.get("gateway_class", "")
+    # epponly deploys no Kubernetes Gateway (EPP serves HTTP directly).
+    if not gateway_class or gateway_class == "epponly":
+        return
+    gateway = {
+        "metadata": {"label": "Inference Gateway", "cfg_id": config_hash({})},
+        "standardized": {
+            "kind": "generic",
+            "tool": f"inference_gateway ({gateway_class})",
+            "tool_version": "",
+        },
+        "native": {"config": {"className": gateway_class}},
+    }
+    br_dict["scenario"]["stack"].append(gateway)
+
+
+def _add_leaderworkerset_component(br_dict: dict, ev_dict: dict) -> None:
+    """Add a LeaderWorkerSet component when multinode serving is enabled."""
+    if str(ev_dict.get("multinode_enabled", "")).lower() != "true":
+        return
+    lws = {
+        "metadata": {"label": "LeaderWorkerSet", "cfg_id": config_hash({})},
+        "standardized": {
+            "kind": "generic",
+            "tool": "leaderworkerset",
+            "tool_version": "",
+        },
+        "native": {"config": {}},
+    }
+    br_dict["scenario"]["stack"].append(lws)
 
 
 def _populate_disaggregate_stack(ev_dict: dict) -> dict:
@@ -439,7 +587,7 @@ def _populate_disaggregate_stack(ev_dict: dict) -> dict:
     """
 
     model = ev_dict.get("deploy_current_model", "")
-    accelerator = ev_dict.get("vllm_common_affinity", "").rsplit(":", 1)[-1]
+    accelerator = _resolve_accelerator_model(ev_dict)
     p_replicas = int(ev_dict.get("vllm_modelservice_prefill_replicas", 0))
     d_replicas = int(ev_dict.get("vllm_modelservice_decode_replicas", 1))
     p_tp = int(ev_dict.get("vllm_modelservice_prefill_tensor_parallelism", 1))
@@ -584,6 +732,8 @@ def _populate_disaggregate_stack(ev_dict: dict) -> dict:
 
     # Add inference scheduler component to stack
     _add_inference_scheduler_component(br_dict, ev_dict)
+    _add_gateway_component(br_dict, ev_dict)
+    _add_leaderworkerset_component(br_dict, ev_dict)
     return br_dict
 
 
@@ -597,24 +747,86 @@ def _populate_stack(ev_dict: dict) -> dict:
         dict: dict with scenario.stack part of of BenchmarkReport.
     """
 
-    if "LLMDBENCH_DEPLOY_METHODS" not in os.environ:
-        sys.stderr.write(
-            "Warning: LLMDBENCH_DEPLOY_METHODS undefined, cannot determine deployment method\n"
-        )
-        return {}
+    method = os.environ.get("LLMDBENCH_DEPLOY_METHODS")
 
-    if os.environ.get("LLMDBENCH_DEPLOY_METHODS") == "standalone":
+    if method == "standalone":
         # This is an aggregate serving setup
         return _populate_aggregate_stack(ev_dict)
 
-    if os.environ.get("LLMDBENCH_DEPLOY_METHODS") == "modelservice":
+    if method == "modelservice":
         # This is a disaggregated serving setup
         return _populate_disaggregate_stack(ev_dict)
 
-    sys.stderr.write(
-        f"Warning: Unknown deployment method LLMDBENCH_DEPLOY_METHODS={os.environ.get('LLMDBENCH_DEPLOY_METHODS')}\n"
+    if method:
+        sys.stderr.write(
+            f"Warning: Unknown deployment method LLMDBENCH_DEPLOY_METHODS={method}\n"
+        )
+    # Run-only mode: no deployment method, so build a minimal stack from the
+    # model/namespace we do have (detecting the accelerator from node labels).
+    return _populate_minimal_stack(ev_dict)
+
+
+def _populate_minimal_stack(ev_dict: dict) -> dict:
+    """Minimal scenario.stack when the deployment method is unknown (run-only).
+
+    No standup data exists in this mode; record the served model and a
+    node-label-detected accelerator, leaving parallelism at the schema default.
+    """
+    model = ev_dict.get("deploy_current_model", "")
+    if not model:
+        return {}
+    inference_engine = {
+        "metadata": {"label": "", "cfg_id": config_hash({})},
+        "standardized": {
+            "kind": "inference_engine",
+            "tool": "",
+            "tool_version": "",
+            "role": HostType.REPLICA,
+            "replicas": 1,
+            "model": {"name": model},
+            "accelerator": {
+                "model": _detect_accelerator_model(ev_dict),
+                "count": 0,
+                "parallelism": {"tp": 1, "dp": 1, "dp_local": 1, "workers": 1},
+            },
+        },
+        "native": {"args": {}, "envars": {}},
+    }
+    return {"scenario": {"stack": [inference_engine]}}
+
+
+def _ev_dict_from_params(data: dict) -> dict:
+    """Map the flat standup-parameters ConfigMap keys to the names the stack
+    populators read from ev_dict.
+    """
+    if not data:
+        return {}
+    ev = {
+        "deploy_current_model": data.get("model_name", ""),
+        "vllm_common_namespace": data.get("namespace", ""),
+        "vllm_common_affinity": data.get("accelerator_model", ""),
+        "vllm_common_replicas": data.get("decode_replicas", 1),
+        "vllm_modelservice_prefill_replicas": data.get("prefill_replicas", 0),
+        "vllm_modelservice_decode_replicas": data.get("decode_replicas", 1),
+        "gateway_class": data.get("gateway_class", ""),
+        "multinode_enabled": data.get("multinode_enabled", ""),
+    }
+    for role in ("prefill", "decode"):
+        for short, key in (
+            ("tensor_parallelism", "tensor"),
+            ("data_parallelism", "data"),
+            ("data_local_parallelism", "data_local"),
+            ("num_workers_parallelism", "workers"),
+        ):
+            ev[f"vllm_modelservice_{role}_{short}"] = data.get(
+                f"{role}_{key}_parallelism", 1
+            )
+    ev["vllm_common_tensor_parallelism"] = data.get("decode_tensor_parallelism", 1)
+    ev["vllm_common_data_parallelism"] = data.get("decode_data_parallelism", 1)
+    ev["vllm_common_data_local_parallelism"] = data.get(
+        "decode_data_local_parallelism", 1
     )
-    return {}
+    return ev
 
 
 def _populate_benchmark_report_from_envars() -> dict:
@@ -645,7 +857,11 @@ def _populate_benchmark_report_from_envars() -> dict:
 
     if params_cm:
         ev_str: str = get_nested(params_cm, ["data", "ev.yaml"])
-        ev_dict = yaml.safe_load(ev_str) if ev_str else {}
+        if ev_str:
+            ev_dict = yaml.safe_load(ev_str)
+        else:
+            # Standup writes flat metadata keys, not an ev.yaml blob.
+            ev_dict = _ev_dict_from_params(get_nested(params_cm, ["data"]) or {})
     else:
         # Could not get parameters from ConfigMap, try /standup/ev.yaml
         try:
@@ -781,7 +997,9 @@ def import_vllm_benchmark(results_file: str) -> BenchmarkReportV02:
                         "tool": WorkloadGenerator.VLLM_BENCHMARK,
                         "stage": 0,
                         "rate_qps": results.get("request_rate"),
-                        "concurrency": results.get("max_concurrency"),
+                        "concurrency": _normalize_concurrency(
+                            results.get("max_concurrency")
+                        ),
                         "source": source,
                         "input_seq_len": {
                             "distribution": isl_dist,
@@ -898,6 +1116,163 @@ def import_vllm_benchmark(results_file: str) -> BenchmarkReportV02:
     return load_benchmark_report(br_dict)
 
 
+def _aiperf_percentiles(data: dict, ms_to_s: bool = False) -> dict:
+    """Extract percentile stats from an aiperf metric block."""
+    scale = 0.001 if ms_to_s else 1.0
+
+    def val(key):
+        v = data.get(key)
+        return v * scale if v is not None else None
+
+    return {
+        "mean": val("avg"),
+        "min": val("min"),
+        "p1": val("p1"),
+        "p5": val("p5"),
+        "p10": val("p10"),
+        "p25": val("p25"),
+        "p50": val("p50"),
+        "p75": val("p75"),
+        "p90": val("p90"),
+        "p95": val("p95"),
+        "p99": val("p99"),
+        "max": val("max"),
+    }
+
+
+def import_aiperf(results_file: str) -> BenchmarkReportV02:
+    """Import data from an aiperf run as a BenchmarkReportV02.
+
+    Args:
+        results_file (str): Results file to import (profile_export_aiperf.json).
+
+    Returns:
+        BenchmarkReportV02: Imported data.
+    """
+    check_file(results_file)
+
+    results = import_yaml(results_file)
+
+    br_dict = _populate_benchmark_report_from_envars()
+
+    model_name = get_nested(  # noqa: F841
+        br_dict,
+        ["scenario", "model", "name"],
+        get_nested(results, ["input_config", "endpoint", "model_names", 0], "unknown"),
+    )
+
+    input_config = results.get("input_config", {})
+    cfg_id = config_hash(input_config)
+
+    concurrency = _normalize_concurrency(
+        get_nested(input_config, ["loadgen", "concurrency"])
+    )
+    isl_mean = get_nested(results, ["input_sequence_length", "avg"])
+    osl_mean = get_nested(results, ["output_sequence_length", "avg"])
+
+    update_dict(
+        br_dict,
+        {
+            "scenario": {
+                "load": {
+                    "metadata": {
+                        "schema_version": "0.0.1",
+                        "cfg_id": cfg_id,
+                    },
+                    "standardized": {
+                        "tool": WorkloadGenerator.AIPERF,
+                        "concurrency": concurrency,
+                        "source": LoadSource.RANDOM,
+                        "input_seq_len": {
+                            "distribution": Distribution.FIXED,
+                            "value": isl_mean,
+                            "min": get_nested(
+                                results, ["input_sequence_length", "min"]
+                            ),
+                            "max": get_nested(
+                                results, ["input_sequence_length", "max"]
+                            ),
+                        },
+                        "output_seq_len": {
+                            "distribution": Distribution.FIXED,
+                            "value": osl_mean,
+                            "min": get_nested(
+                                results, ["output_sequence_length", "min"]
+                            ),
+                            "max": get_nested(
+                                results, ["output_sequence_length", "max"]
+                            ),
+                        },
+                    },
+                    "native": {
+                        "config": input_config,
+                    },
+                },
+            },
+        },
+    )
+
+    ttft = results.get("time_to_first_token", {})
+    itl = results.get("inter_token_latency", {})
+    req_lat = results.get("request_latency", {})
+    isl = results.get("input_sequence_length", {})
+    osl = results.get("output_sequence_length", {})
+
+    aggregate = {
+        "requests": {
+            "total": int(get_nested(results, ["request_count", "avg"], 0)),
+            "failures": len(results.get("error_summary", [])),
+            "input_length": {
+                "units": Units.COUNT,
+                **_aiperf_percentiles(isl),
+            },
+            "output_length": {
+                "units": Units.COUNT,
+                **_aiperf_percentiles(osl),
+            },
+        },
+        "latency": {
+            "time_to_first_token": {
+                "units": Units.S,
+                **_aiperf_percentiles(ttft, ms_to_s=True),
+            },
+            "inter_token_latency": {
+                "units": Units.S_PER_TOKEN,
+                **_aiperf_percentiles(itl, ms_to_s=True),
+            },
+            "request_latency": {
+                "units": Units.S,
+                **_aiperf_percentiles(req_lat, ms_to_s=True),
+            },
+        },
+        "throughput": {
+            "output_token_rate": {
+                "units": Units.TOKEN_PER_S,
+                "mean": get_nested(results, ["output_token_throughput", "avg"]),
+            },
+            "total_token_rate": {
+                "units": Units.TOKEN_PER_S,
+                "mean": get_nested(results, ["total_token_throughput", "avg"]),
+            },
+            "request_rate": {
+                "units": Units.QUERY_PER_S,
+                "mean": get_nested(results, ["request_throughput", "avg"]),
+            },
+        },
+    }
+
+    update_dict(
+        br_dict,
+        {
+            "results": {
+                "request_performance": {"aggregate": aggregate},
+            },
+        },
+    )
+
+    return load_benchmark_report(br_dict)
+
+
 def import_inference_max(results_file: str) -> BenchmarkReportV02:
     """Import data from an InferenceMAX benchmark run as a BenchmarkReportV01.
 
@@ -977,7 +1352,9 @@ def import_inference_max(results_file: str) -> BenchmarkReportV02:
                         "tool": WorkloadGenerator.INFERENCE_MAX,
                         "stage": 0,
                         "rate_qps": results.get("request_rate"),
-                        "concurrency": results.get("max_concurrency"),
+                        "concurrency": _normalize_concurrency(
+                            results.get("max_concurrency")
+                        ),
                         "source": source,
                         "input_seq_len": {
                             "distribution": isl_dist,
@@ -1090,6 +1467,156 @@ def import_inference_max(results_file: str) -> BenchmarkReportV02:
     return load_benchmark_report(br_dict)
 
 
+def import_eval_containers(results_file: str) -> BenchmarkReportV02:
+    """Convert eval-containers agentic output into a v0.2 Benchmark Report.
+
+    eval-containers runs a real agent, not a synthetic load generator, so its
+    serving-perf signal lives in the OTel gateway traces (one span per LLM
+    call). This reads ``traces.jsonl`` for request latency + throughput and the
+    task ``result.json`` for the reward. The reward is a task-correctness signal
+    with no slot in the perf schema, so it rides in ``results.observability`` --
+    the format's extra-permitted area for ad-hoc result metrics. Server-side
+    observability (KV cache, queue depth) is not produced here; the framework
+    scrapes that from the served pods, harness-agnostic.
+    """
+    res = Path(results_file)
+    root = res.parent.parent if res.parent.name == "task" else res.parent
+
+    def _read(rel: str) -> dict:
+        try:
+            return json.loads((root / rel).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    reward = _read("task/result.json")
+    agent = _read("agent/result.json")
+    model = _read("model/result.json")
+
+    # --- request performance from the gateway OTel spans (one per LLM call) ---
+    lats_ms: list[float] = []
+    n_calls = 0
+    in_tok = out_tok = 0
+    t_first = t_last = None
+    traces = root / "traces.jsonl"
+    if traces.exists():
+        for line in traces.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                doc = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for rs in doc.get("resourceSpans", []):
+                for ss in rs.get("scopeSpans", []):
+                    for sp in ss.get("spans", []):
+                        name = sp.get("name", "")
+                        # one span per LLM request, across gateways: bifrost emits
+                        # /anthropic/v1/messages or /openai/.../completions; litellm
+                        # emits litellm_request. Skip the child provider span
+                        # (llm.call) so requests aren't double-counted.
+                        if not any(
+                            s in name
+                            for s in (
+                                "messages",
+                                "completions",
+                                "responses",
+                                "litellm_request",
+                            )
+                        ):
+                            continue
+                        n_calls += 1
+                        st = int(sp.get("startTimeUnixNano", 0) or 0)
+                        en = int(sp.get("endTimeUnixNano", 0) or 0)
+                        if st and en and en > st:
+                            lats_ms.append((en - st) / 1e6)
+                            t_first = st if t_first is None else min(t_first, st)
+                            t_last = en if t_last is None else max(t_last, en)
+                        for a in sp.get("attributes", []):
+                            k = a.get("key", "")
+                            iv = int(a.get("value", {}).get("intValue") or 0)
+                            if k.endswith("input_tokens") or k.endswith(
+                                "prompt_tokens"
+                            ):
+                                in_tok += iv
+                            elif k.endswith("output_tokens") or k.endswith(
+                                "completion_tokens"
+                            ):
+                                out_tok += iv
+
+    def _stat(xs: list[float]):
+        if not xs:
+            return None
+        a = np.array(xs, dtype=float)
+        return {
+            "units": Units.MS,
+            "mean": float(a.mean()),
+            "stddev": float(a.std()),
+            "min": float(a.min()),
+            "p50": float(np.percentile(a, 50)),
+            "p90": float(np.percentile(a, 90)),
+            "p99": float(np.percentile(a, 99)),
+            "max": float(a.max()),
+        }
+
+    n = n_calls
+    dur_s = (
+        (t_last - t_first) / 1e9 if (t_first and t_last and t_last > t_first) else None
+    )
+
+    br_dict = _populate_benchmark_report_from_envars()
+    # The harness-pod skeleton fills scenario.load.* from the run env; provide
+    # agentic-appropriate defaults so the report is valid outside a pod too.
+    load = br_dict.setdefault("scenario", {}).setdefault("load", {})
+    load.setdefault("metadata", {})  # required by the v0.2 schema
+    std = load.setdefault("standardized", {})
+    std.setdefault("tool", "eval-containers")
+    std.setdefault("tool_version", "")
+    std.setdefault("source", "sampled")  # tasks sampled from the benchmark dataset
+    std.setdefault("input_seq_len", {"distribution": "other", "value": 0})
+    # the agentic workload itself, in the native (free-form) subsection
+    load.setdefault("native", {}).setdefault("args", {}).update(
+        {
+            "harness": "eval-containers",
+            "benchmark": reward.get("benchmark", ""),
+            "agent": agent.get("agent", ""),
+            "model": model.get("model", ""),
+            "task_id": str(reward.get("task_id", "")),
+            "workload_type": "agentic-multi-turn",
+        }
+    )
+
+    agg: dict = {"latency": {}, "throughput": {}}
+    rl = _stat(lats_ms)
+    if rl:
+        agg["latency"]["request_latency"] = rl
+    if dur_s:
+        agg["throughput"]["request_rate"] = {
+            "units": Units.QUERY_PER_S,
+            "mean": n / dur_s,
+        }
+        agg["throughput"]["total_token_rate"] = {
+            "units": Units.TOKEN_PER_S,
+            "mean": (in_tok + out_tok) / dur_s,
+        }
+
+    results = br_dict.setdefault("results", {})
+    results["request_performance"] = {"aggregate": agg}
+    # reward is a task-correctness signal with no formal perf slot, so it rides
+    # in results.observability -- the schema's extra-permitted area for ad-hoc
+    # result metrics. Server-side observability stays the framework's job.
+    results.setdefault("observability", {}).update(
+        {
+            "eval_containers_reward": reward.get("reward"),
+            "eval_containers_passed": reward.get("passed"),
+            "eval_containers_llm_calls": n,
+            "eval_containers_input_tokens": in_tok or None,
+            "eval_containers_output_tokens": out_tok or None,
+        }
+    )
+    return load_benchmark_report(br_dict)
+
+
 def import_inference_perf(results_file: str) -> BenchmarkReportV02:
     """Import data from a Inference Perf run as a BenchmarkReportV02.
 
@@ -1165,8 +1692,9 @@ def import_inference_perf(results_file: str) -> BenchmarkReportV02:
                             results, ["load_summary", "requested_rate"]
                         )
                         or None,
-                        "concurrency": get_nested(
-                            results, ["load_summary", "concurrency"]
+                        "concurrency": _normalize_concurrency(
+                            get_nested(results, ["load_summary", "concurrency"]),
+                            zero_fallback=results.get("num_sessions"),
                         ),
                         "source": source,
                         # For ISL and OSL, If br_dict has config file from
@@ -2127,7 +2655,9 @@ def import_guidellm(results_file: str, index: int = 0) -> BenchmarkReportV02:
     if profile in ["async", "constant", "poisson"]:
         rate_qps = get_nested(data, ["args", "rate"])[index]
     elif profile in ["concurrent", "throughput"]:
-        concurrency = int(get_nested(data, ["args", "rate"])[index])
+        concurrency = _normalize_concurrency(
+            int(get_nested(data, ["args", "rate"])[index])
+        )
 
     prefix = None
     if "prefix_tokens" in input_args:

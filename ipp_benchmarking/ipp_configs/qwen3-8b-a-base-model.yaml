@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen3-8b-a-base-model
+  labels:
+    inference.llm-d.ai/ipp-managed: "true"
+data:
+  baseModel: "Qwen/Qwen3-8B-a"

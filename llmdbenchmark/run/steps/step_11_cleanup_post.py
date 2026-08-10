@@ -23,7 +23,9 @@ class RunCleanupPostStep(Step):
         )
 
     def should_skip(self, context: ExecutionContext) -> bool:
-        """Skip cleanup in debug mode (keep pods alive for inspection)."""
+        """Skip cleanup in debug mode, or for nok8s (no cluster resources)."""
+        if "nok8s" in (context.deployed_methods or []):
+            return True
         return context.harness_debug
 
     def execute(
@@ -42,16 +44,18 @@ class RunCleanupPostStep(Step):
 
         plan_config = self._load_plan_config(context)
         pod_label = self._resolve(
-            plan_config, "harness.podLabel", default="llmdbench-harness-launcher",
+            plan_config,
+            "harness.podLabel",
+            default="llmdbench-harness-launcher",
         )
         harness_name = self._resolve(
-            plan_config, "harness.name",
-            context_value=context.harness_name, default="inference-perf",
+            plan_config,
+            "harness.name",
+            context_value=context.harness_name,
+            default="inference-perf",
         )
 
-        context.logger.log_info(
-            f"Cleaning up harness resources in ns={harness_ns}..."
-        )
+        context.logger.log_info(f"Cleaning up harness resources in ns={harness_ns}...")
 
         # Delete harness pods
         delete_pods_by_label(cmd, pod_label, harness_ns, context)
@@ -62,7 +66,10 @@ class RunCleanupPostStep(Step):
 
         # Delete harness scripts ConfigMap
         self._delete_configmap(
-            cmd, HARNESS_SCRIPTS_CONFIGMAP, harness_ns, context,
+            cmd,
+            HARNESS_SCRIPTS_CONFIGMAP,
+            harness_ns,
+            context,
         )
 
         return StepResult(
@@ -76,8 +83,11 @@ class RunCleanupPostStep(Step):
     def _delete_configmap(cmd, name: str, namespace: str, context) -> None:
         """Delete a ConfigMap, logging success or warning."""
         result = cmd.kube(
-            "delete", "configmap", name,
-            "--namespace", namespace,
+            "delete",
+            "configmap",
+            name,
+            "--namespace",
+            namespace,
             "--ignore-not-found",
             check=False,
         )

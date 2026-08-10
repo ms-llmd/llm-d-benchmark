@@ -30,8 +30,10 @@ def create_tmp_directory(
 ) -> Path:
     """Create a temporary directory and return its path."""
     try:
-        p = Path(base_dir) if base_dir is not None else None
-        return Path(tempfile.mkdtemp(prefix=prefix, suffix=suffix, dir=p))
+        if base_dir is not None:
+            p = Path(base_dir)
+        d = Path(tempfile.mkdtemp(prefix=prefix, suffix=suffix, dir=p))
+        return d
     except OSError as exc:
         raise OSError(f"Failed to create temporary directory: {exc}") from exc
 
@@ -74,10 +76,6 @@ def get_absolute_path(path: Union[str, Path]) -> Path:
 
 _SPEC_DIR = "config/specification"
 _SPEC_SUFFIX = ".yaml.j2"
-# Overlay folder that bundles add-on scenarios/specs/profiles without copying
-# them into the repo's standard locations (see ipp_benchmarking/). Searched in
-# addition to the standard dirs so `--spec <name>` resolves bundle specs too.
-_OVERLAY_DIR = "ipp_benchmarking"
 
 
 def resolve_specification_file(
@@ -106,21 +104,18 @@ def resolve_specification_file(
             stem = stem[: -len(ext)]
             break
 
-    # base_dir takes priority, fall back to package root. For each base, search
-    # the standard spec dir AND the ipp_benchmarking overlay (so bundle specs
-    # resolve without copying them into config/specification/).
-    bases: list[Path] = []
-    if base_dir:
-        bases.append(Path(base_dir).expanduser().resolve())
-    # utilities/os/filesystem.py to 4 parents up = project root
-    bases.append(Path(__file__).resolve().parent.parent.parent.parent)
-
+    # base_dir takes priority, fall back to package root
     search_roots: list[Path] = []
-    for base in bases:
-        for sub in (_SPEC_DIR, f"{_OVERLAY_DIR}/{_SPEC_DIR}"):
-            spec_dir = base / sub
-            if spec_dir.is_dir() and spec_dir not in search_roots:
-                search_roots.append(spec_dir)
+    if base_dir:
+        bd = Path(base_dir).expanduser().resolve()
+        spec_dir = bd / _SPEC_DIR
+        if spec_dir.is_dir():
+            search_roots.append(spec_dir)
+    # utilities/os/filesystem.py to 4 parents up = project root
+    pkg_root = Path(__file__).resolve().parent.parent.parent.parent
+    pkg_spec = pkg_root / _SPEC_DIR
+    if pkg_spec.is_dir() and pkg_spec not in search_roots:
+        search_roots.append(pkg_spec)
 
     # Try category/name match first (e.g. "guides/inference-scheduling")
     for root in search_roots:
@@ -157,7 +152,9 @@ def resolve_specification_file(
             short = str(rel).removesuffix(_SPEC_SUFFIX)
             available.append(short)
 
-    listing = "\n".join(f"  - {s}" for s in available) if available else "  (none found)"
+    listing = (
+        "\n".join(f"  - {s}" for s in available) if available else "  (none found)"
+    )
     raise FileNotFoundError(
         f"Specification '{name_or_path}' not found.\n\n"
         f"Available specifications:\n{listing}\n\n"
@@ -194,8 +191,14 @@ def create_sub_dir_workload(
     if not sub_dir:
         prefix = get_user_id()
         suffix = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-        sub_workspace = p / f"{prefix}-{suffix}"
+        sub_workspace_target = p / f"{prefix}-{suffix}"
+        sub_workspace_link = p / "latest"
     else:
-        sub_workspace = p / sub_dir
-
-    return create_directory(sub_workspace)
+        sub_workspace_target = p / sub_dir
+        sub_workspace_link = None
+    sd = create_directory(sub_workspace_target)
+    if sub_workspace_link:
+        if sub_workspace_link.is_symlink():
+            sub_workspace_link.unlink()
+        sub_workspace_link.symlink_to(sub_workspace_target)
+    return sd

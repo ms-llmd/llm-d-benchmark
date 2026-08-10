@@ -7,6 +7,7 @@ step_08, and step_10.
 
 from __future__ import annotations
 
+import json
 import shutil
 import time
 from pathlib import Path
@@ -29,9 +30,70 @@ CRASH_STATES = {
 DATA_ACCESS_LABEL = "role=llm-d-benchmark-data-access"
 
 
+def _terminated_state_detail(prefix: str, state: dict) -> str:
+    """Format a terminated container state for a user-facing error."""
+    reason = state.get("reason") or "unknown reason"
+    detail = f"{prefix}{reason}"
+    if state.get("exitCode") is not None:
+        detail += f", exit_code={state['exitCode']}"
+    return detail
+
+
+def _pod_crash_details(pod: dict) -> list[str]:
+    """Return concrete crash details for containers in a pod."""
+    metadata = pod.get("metadata", {})
+    status = pod.get("status", {})
+    pod_name = metadata.get("name", "unknown-pod")
+    failures: list[str] = []
+
+    status_groups = (
+        status.get("initContainerStatuses", []),
+        status.get("containerStatuses", []),
+        status.get("ephemeralContainerStatuses", []),
+    )
+    for container_statuses in status_groups:
+        for container_status in container_statuses or []:
+            state = container_status.get("state", {})
+            details: list[str] = []
+
+            waiting = state.get("waiting") or {}
+            waiting_reason = waiting.get("reason")
+            if waiting_reason in CRASH_STATES:
+                details.append(waiting_reason)
+
+            terminated = state.get("terminated") or {}
+            terminated_reason = terminated.get("reason")
+            terminated_exit_code = terminated.get("exitCode")
+            if terminated and (
+                terminated_reason in CRASH_STATES
+                or (terminated_exit_code is not None and terminated_exit_code != 0)
+            ):
+                details.append(_terminated_state_detail("terminated: ", terminated))
+
+            if not details:
+                continue
+
+            last_terminated = (container_status.get("lastState") or {}).get(
+                "terminated"
+            )
+            if last_terminated:
+                details.append(
+                    _terminated_state_detail("last terminated: ", last_terminated)
+                )
+
+            container_name = container_status.get("name", "unknown-container")
+            failures.append(f"{pod_name}/{container_name} ({', '.join(details)})")
+
+    if not failures and status.get("reason") in CRASH_STATES:
+        failures.append(f"{pod_name} ({status['reason']})")
+
+    return failures
+
+
 # ---------------------------------------------------------------------------
 # Pod discovery
 # ---------------------------------------------------------------------------
+
 
 def find_data_access_pod(cmd, namespace: str) -> str | None:
     """Find the data-access pod by its well-known label.
@@ -39,10 +101,14 @@ def find_data_access_pod(cmd, namespace: str) -> str | None:
     Returns the pod name, or ``None`` if not found.
     """
     result = cmd.kube(
-        "get", "pod",
-        "-l", DATA_ACCESS_LABEL,
-        "--namespace", namespace,
-        "-o", "jsonpath={.items[0].metadata.name}",
+        "get",
+        "pod",
+        "-l",
+        DATA_ACCESS_LABEL,
+        "--namespace",
+        namespace,
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
         check=False,
     )
     if result.success and result.stdout.strip():
@@ -53,6 +119,7 @@ def find_data_access_pod(cmd, namespace: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Pod waiting
 # ---------------------------------------------------------------------------
+
 
 def wait_for_pods_deleted(
     cmd,
@@ -72,10 +139,12 @@ def wait_for_pods_deleted(
         f"(timeout={timeout}s)..."
     )
     result = cmd.kube(
-        "wait", "pod",
+        "wait",
+        "pod",
         "--for=delete",
         f"--selector={selector}",
-        "--namespace", namespace,
+        "--namespace",
+        namespace,
         f"--timeout={timeout}s",
         check=False,
     )
@@ -92,14 +161,15 @@ def force_remove_finalizers_by_selector(
     namespace: str,
     context: ExecutionContext,
 ) -> None:
-    """Force-remove all finalizers from pods matching a label selector,
-    then force-delete them so they don't linger in the namespace.
-    """
+    """Force-remove all finalizers from pods matching a label selector."""
     result = cmd.kube(
-        "get", "pod",
+        "get",
+        "pod",
         f"--selector={selector}",
-        "--namespace", namespace,
-        "-o", "name",
+        "--namespace",
+        namespace,
+        "-o",
+        "name",
         "--ignore-not-found",
         check=False,
     )
@@ -111,10 +181,13 @@ def force_remove_finalizers_by_selector(
             emoji="🗑️",
         )
         cmd.kube(
-            "patch", pod,
-            "--namespace", namespace,
+            "patch",
+            pod,
+            "--namespace",
+            namespace,
             "--type=merge",
-            "-p", '{"metadata":{"finalizers":null}}',
+            "-p",
+            '{"metadata":{"finalizers":null}}',
             check=False,
         )
         context.logger.log_info(
@@ -122,9 +195,12 @@ def force_remove_finalizers_by_selector(
             emoji="🗑️",
         )
         cmd.kube(
-            "delete", pod,
-            "--namespace", namespace,
-            "--grace-period=0", "--force",
+            "delete",
+            pod,
+            "--namespace",
+            namespace,
+            "--grace-period=0",
+            "--force",
             "--ignore-not-found=true",
             check=False,
         )
@@ -148,61 +224,84 @@ def wait_for_pods_by_label(
     """
     errors: list[str] = []
 
-    # Phase A: Wait for pods to become Ready (running)
+    # POLL-based wait (replaces two-phase `kubectl wait`). A short-lived agentic
+    # pod can reach Succeeded/Failed before/at `kubectl wait --for=Ready=True`
+    # (which then hangs the full timeout: a terminal pod never becomes Ready nor
+    # is deleted), and phase B errors NotFound when a finished pod is GC'd
+    # between polls. Polling phases is immune: "arrived" = Running or terminal;
+    # "done" = all terminal OR gone. --natan (via claude)
+    import time as _time
+
+    def _phases():
+        r = cmd.kube(
+            "get",
+            "pods",
+            "-l",
+            f"app={label}",
+            "--namespace",
+            namespace,
+            "-o",
+            "jsonpath={.items[*].status.phase}",
+            check=False,
+        )
+        return r.stdout.split() if r.success else []
+
     context.logger.log_info(
-        f"Waiting for pods (label=app={label}) to start "
-        f"(timeout={timeout}s)..."
+        f"Waiting for pods (label=app={label}) to start (timeout={timeout}s)..."
     )
-    result = cmd.kube(
-        "wait", "--for=condition=Ready=True",
-        "pod", "-l", f"app={label}",
-        "--namespace", namespace,
-        f"--timeout={timeout}s",
-        check=False,
-    )
-    if not result.success:
+    ARRIVED = ("Running", "Succeeded", "Failed")
+    TERMINAL = ("Succeeded", "Failed")
+    waited = 0
+    poll = 5
+    arrived = False
+    while waited < timeout:
+        ph = _phases()
+        if ph and all(p in ARRIVED for p in ph):
+            arrived = True
+            break
+        _time.sleep(poll)
+        waited += poll
+    if not arrived:
         errors.append(
-            f"Pods failed to become Ready: {result.stderr.strip()}"
+            f"Pods failed to reach Running/terminal within {timeout}s (phases={_phases()})"
         )
         return errors
-
     context.logger.log_info("All pods are running")
-
-    # Phase B: Wait for pods to complete (Ready=False after finish)
     context.logger.log_info(
-        f"Waiting for pods (label=app={label}) to complete "
-        f"(timeout={timeout}s)..."
+        f"Waiting for pods (label=app={label}) to complete (timeout={timeout}s)..."
     )
-    result = cmd.kube(
-        "wait", f"--timeout={timeout}s",
-        "--for=condition=ready=False",
-        "pod", "-l", f"app={label}",
-        "--namespace", namespace,
-        check=False,
-    )
-    if not result.success:
-        errors.append(
-            f"Pods did not complete within timeout: {result.stderr.strip()}"
-        )
+    done = False
+    while waited < timeout:
+        ph = _phases()
+        if not ph or all(p in TERMINAL for p in ph):
+            done = True
+            break
+        _time.sleep(poll)
+        waited += poll
+    if not done:
+        errors.append(f"Pods did not complete within {timeout}s (phases={_phases()})")
         return errors
 
     # Check for crash states
     check_result = cmd.kube(
-        "get", "pods",
-        "-l", f"app={label}",
-        "--namespace", namespace,
-        "--no-headers",
+        "get",
+        "pods",
+        "-l",
+        f"app={label}",
+        "--namespace",
+        namespace,
+        "-o",
+        "json",
         check=False,
     )
     if check_result.success and check_result.stdout:
-        for state in CRASH_STATES:
-            if state in check_result.stdout:
-                errors.append(
-                    f"Found pods in error state. Run: "
-                    f"kubectl --namespace {namespace} get pods "
-                    f"-l app={label}"
-                )
-                break
+        try:
+            pods = json.loads(check_result.stdout).get("items", [])
+        except (json.JSONDecodeError, AttributeError):
+            pods = []
+        crash_details = [detail for pod in pods for detail in _pod_crash_details(pod)]
+        if crash_details:
+            errors.append("Found pods in error state: " + "; ".join(crash_details))
 
     if not errors:
         context.logger.log_info("All pods completed successfully")
@@ -235,9 +334,13 @@ def wait_for_pod(
             return f"Timed out after {timeout}s"
 
         result = cmd.kube(
-            "get", "pod", pod_name,
-            "--namespace", namespace,
-            "-o", "jsonpath={.status.phase}:{.status.containerStatuses[0].state}",
+            "get",
+            "pod",
+            pod_name,
+            "--namespace",
+            namespace,
+            "-o",
+            "jsonpath={.status.phase}:{.status.containerStatuses[0].state}",
             check=False,
         )
 
@@ -255,32 +358,36 @@ def wait_for_pod(
 
         if phase == "Succeeded":
             context.logger.log_info(
-                f"Pod '{pod_name}' completed successfully "
-                f"({int(elapsed)}s)"
+                f"Pod '{pod_name}' completed successfully ({int(elapsed)}s)"
             )
             return "Succeeded"
 
         if phase == "Failed":
             exit_result = cmd.kube(
-                "get", "pod", pod_name,
-                "--namespace", namespace,
-                "-o", "jsonpath={.status.containerStatuses[0].state.terminated.exitCode}",
+                "get",
+                "pod",
+                pod_name,
+                "--namespace",
+                namespace,
+                "-o",
+                "jsonpath={.status.containerStatuses[0].state.terminated.exitCode}",
                 check=False,
             )
-            exit_code = (
-                exit_result.stdout.strip() if exit_result.success else "?"
-            )
+            exit_code = exit_result.stdout.strip() if exit_result.success else "?"
             context.logger.log_error(
-                f"Pod '{pod_name}' failed (exit_code={exit_code}, "
-                f"{int(elapsed)}s)"
+                f"Pod '{pod_name}' failed (exit_code={exit_code}, {int(elapsed)}s)"
             )
             return "Failed"
 
         # Check for crash states via container status
         container_result = cmd.kube(
-            "get", "pod", pod_name,
-            "--namespace", namespace,
-            "-o", "jsonpath={.status.containerStatuses[0].state.waiting.reason}",
+            "get",
+            "pod",
+            pod_name,
+            "--namespace",
+            namespace,
+            "-o",
+            "jsonpath={.status.containerStatuses[0].state.waiting.reason}",
             check=False,
         )
         if container_result.success and container_result.stdout.strip():
@@ -303,6 +410,7 @@ def wait_for_pod(
 # Result collection
 # ---------------------------------------------------------------------------
 
+
 def collect_pod_results(
     cmd,
     data_pod: str,
@@ -322,31 +430,32 @@ def collect_pod_results(
         ``(local_path, success, error_msg)`` tuple.
     """
     pod_suffix = f"{experiment_id}_{parallel_idx}"
-    remote_path = (
-        f"{data_pod}:"
-        f"{remote_prefix}/{pod_suffix}"
-    )
+    remote_path = f"{data_pod}:{remote_prefix}/{pod_suffix}"
     local_path = local_results_dir / pod_suffix
     local_path.mkdir(parents=True, exist_ok=True)
 
+    # oc cp does not support --retries; kubectl cp does (v1.23+). Skip flag for oc.
+    cp_args = ["cp"]
+    if not cmd.openshift:
+        cp_args.append("--retries=5")
+    cp_args.extend([remote_path, str(local_path)])
+
     cp_result = cmd.kube(
-        "cp", "--retries=5",
-        remote_path, str(local_path),
+        *cp_args,
         namespace=namespace,
         check=False,
     )
 
     if not cp_result.success:
-        return local_path, False, (
-            f"Failed to copy results for {pod_suffix}: "
-            f"{cp_result.stderr[:200]}"
+        return (
+            local_path,
+            False,
+            (f"Failed to copy results for {pod_suffix}: {cp_result.stderr[:200]}"),
         )
 
     file_count = sum(1 for f in local_path.rglob("*") if f.is_file())
     if file_count > 0:
-        context.logger.log_info(
-            f"Collected {file_count} file(s) for {pod_suffix}"
-        )
+        context.logger.log_info(f"Collected {file_count} file(s) for {pod_suffix}")
     else:
         context.logger.log_warning(
             f"No files collected for {pod_suffix} (directory may be empty)"
@@ -385,6 +494,7 @@ def sync_analysis_dir(
 # Pod cleanup
 # ---------------------------------------------------------------------------
 
+
 def delete_pods_by_names(
     cmd,
     pod_names: list[str],
@@ -394,8 +504,11 @@ def delete_pods_by_names(
     """Delete pods by individual name."""
     for pod_name in pod_names:
         result = cmd.kube(
-            "delete", "pod", pod_name,
-            "--namespace", namespace,
+            "delete",
+            "pod",
+            pod_name,
+            "--namespace",
+            namespace,
             "--ignore-not-found",
             check=False,
         )
@@ -415,23 +528,25 @@ def delete_pods_by_label(
 ) -> None:
     """Delete all pods matching a label selector."""
     result = cmd.kube(
-        "delete", "pod",
-        "-l", f"app={label}",
-        "--namespace", namespace,
+        "delete",
+        "pod",
+        "-l",
+        f"app={label}",
+        "--namespace",
+        namespace,
         "--ignore-not-found",
         check=False,
     )
     if result.success:
         context.logger.log_info("Harness pods deleted")
     else:
-        context.logger.log_warning(
-            f"Pod cleanup warning: {result.stderr}"
-        )
+        context.logger.log_warning(f"Pod cleanup warning: {result.stderr}")
 
 
 # ---------------------------------------------------------------------------
 # Log capture
 # ---------------------------------------------------------------------------
+
 
 def capture_pod_logs(
     cmd,
@@ -444,20 +559,18 @@ def capture_pod_logs(
     log_dir.mkdir(parents=True, exist_ok=True)
     for pod_name in pod_names:
         result = cmd.kube(
-            "logs", pod_name,
-            "--namespace", namespace,
+            "logs",
+            pod_name,
+            "--namespace",
+            namespace,
             check=False,
         )
         if result.success and result.stdout:
             log_file = log_dir / f"{pod_name}.log"
             log_file.write_text(result.stdout, encoding="utf-8")
-            context.logger.log_info(
-                f"Captured logs for pod '{pod_name}'"
-            )
+            context.logger.log_info(f"Captured logs for pod '{pod_name}'")
         else:
-            context.logger.log_warning(
-                f"Could not capture logs for pod '{pod_name}'"
-            )
+            context.logger.log_warning(f"Could not capture logs for pod '{pod_name}'")
 
 
 def capture_label_logs(
@@ -474,21 +587,19 @@ def capture_label_logs(
         "--tail=-1",
         "--prefix=true",
         "--all-containers=true",
-        "-l", label,
-        "--namespace", namespace,
+        "-l",
+        label,
+        "--namespace",
+        namespace,
         check=False,
     )
     if result.success and result.stdout.strip():
         dest.write_text(result.stdout, encoding="utf-8")
-        context.logger.log_info(
-            f"Captured {label_name} logs \u2192 {dest.name}"
-        )
+        context.logger.log_info(f"Captured {label_name} logs \u2192 {dest.name}")
     else:
         # Write an empty file so the user knows we tried
         dest.write_text("", encoding="utf-8")
-        context.logger.log_info(
-            f"No {label_name} pods found (label={label})"
-        )
+        context.logger.log_info(f"No {label_name} pods found (label={label})")
 
 
 def capture_infrastructure_logs(
@@ -504,48 +615,68 @@ def capture_infrastructure_logs(
     Captures:
     - Pod status (``kubectl get pods -o wide``) \u2192 ``pod_status.txt``
     - Model-serving logs (``llm-d.ai/model=<label>``) \u2192 ``modelserving_pods.log``
-    - EPP logs (``inferencepool=<label>-gaie-epp``) \u2192 ``epp_pods.log``
+    - EPP logs (``llm-d-router-{standalone,gateway}=<label>-router-epp``,
+      whichever matches the deployed mode) \u2192 ``epp_pods.log``
     - IGW logs (``app.kubernetes.io/component=inference-gateway``) \u2192 ``igw_pods.log``
     """
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Pod status snapshot
-    context.logger.log_info(
-        f"Capturing pod status in namespace '{namespace}'..."
-    )
+    context.logger.log_info(f"Capturing pod status in namespace '{namespace}'...")
     status_result = cmd.kube(
-        "get", "pods", "-o", "wide",
-        "--namespace", namespace,
+        "get",
+        "pods",
+        "-o",
+        "wide",
+        "--namespace",
+        namespace,
         check=False,
     )
     if status_result.success and status_result.stdout:
         status_file = log_dir / "pod_status.txt"
         status_file.write_text(status_result.stdout, encoding="utf-8")
-        context.logger.log_info(
-            f"Pod status captured to {status_file.name}"
-        )
+        context.logger.log_info(f"Pod status captured to {status_file.name}")
 
     # Infrastructure logs (require model label)
     if model_label:
         capture_label_logs(
-            cmd, namespace,
+            cmd,
+            namespace,
             f"llm-d.ai/model={model_label}",
             log_dir / "modelserving_pods.log",
-            "model-serving", context,
+            "model-serving",
+            context,
         )
-        capture_label_logs(
-            cmd, namespace,
-            f"inferencepool={model_label}-gaie-epp",
-            log_dir / "epp_pods.log",
-            "EPP", context,
-        )
+        # The llm-d-router chart migration renamed the EPP chart and
+        # dropped the legacy `inferencepool=<release>-epp` label. The new
+        # llm-d-router-{standalone,gateway}-dev charts apply only the
+        # mode-specific selector on the Pod template
+        # (`charts/router/templates/_helpers.tpl::selectorLabels`); the
+        # common `app.kubernetes.io/*` labels are on the Deployment, not
+        # the Pod, so `kubectl logs -l ...` can't use them. We don't have
+        # the gateway.className in this code path, so try both -- exactly
+        # one will match and the other writes an empty log.
+        _epp_log_path = log_dir / "epp_pods.log"
+        for _mode in ("llm-d-router-gateway", "llm-d-router-standalone"):
+            capture_label_logs(
+                cmd,
+                namespace,
+                f"{_mode}={model_label}-router-epp",
+                _epp_log_path,
+                "EPP",
+                context,
+            )
+            if _epp_log_path.exists() and _epp_log_path.stat().st_size > 0:
+                break
 
     # IGW logs (no model label needed)
     capture_label_logs(
-        cmd, namespace,
+        cmd,
+        namespace,
         "app.kubernetes.io/component=inference-gateway",
         log_dir / "igw_pods.log",
-        "IGW", context,
+        "IGW",
+        context,
     )
 
     # Process EPP logs if present
@@ -553,10 +684,18 @@ def capture_infrastructure_logs(
     if epp_log.exists() and epp_log.stat().st_size > 0:
         try:
             import subprocess
-            script = Path(__file__).resolve().parents[1] / ".." / "workload" / "harnesses" / "process_epp_logs.py"
+
+            script = (
+                Path(__file__).resolve().parents[1]
+                / ".."
+                / "workload"
+                / "harnesses"
+                / "process_epp_logs.py"
+            )
             if not script.exists():
                 # Try installed location
                 import shutil
+
                 script_str = shutil.which("process_epp_logs.py")
                 if script_str:
                     script = Path(script_str)
@@ -564,7 +703,9 @@ def capture_infrastructure_logs(
                 context.logger.log_info("Processing EPP logs...")
                 result = subprocess.run(
                     ["python3", str(script), str(results_dir), "--visualize"],
-                    capture_output=True, text=True, timeout=120,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
                 )
                 if result.returncode == 0:
                     context.logger.log_info("EPP log processing complete")

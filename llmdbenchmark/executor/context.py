@@ -85,6 +85,7 @@ class ExecutionContext:  # pylint: disable=too-many-instance-attributes
     # Run-phase configuration (set by _execute_run)
     harness_name: str | None = None
     harness_profile: str | None = None
+    workload_file_path: str | None = None
     experiment_treatments_file: str | None = None
     profile_overrides: str | None = None
     harness_output: str = "local"
@@ -92,6 +93,29 @@ class ExecutionContext:  # pylint: disable=too-many-instance-attributes
     harness_wait_timeout: int = 3600
     harness_debug: bool = False
     harness_skip_run: bool = False
+    # When True, collect results via a gzip'd ``oc exec | tar`` stream instead
+    # of ``oc cp``. Copies the same files -- only the transfer mechanism
+    # differs -- but is much faster for large result trees. Relies on the
+    # fragile apiserver exec stream (retried). Off by default. See step_07.
+    harness_fast_collect: bool = False
+    # When True, reset the vLLM prefix, multimodal, and encoder caches
+    # (POST /reset_prefix_cache, /reset_mm_cache, /reset_encoder_cache) on
+    # every serving pod before each treatment's run, so every treatment
+    # starts against cold caches. Set via the top-level ``reset_caches`` key
+    # in the --experiments YAML. Requires the server to run with
+    # VLLM_SERVER_DEV_MODE=1 (the repo default); resets are non-fatal.
+    reset_caches: bool = False
+    # Retry a failed treatment up to this many times, each attempt deleting
+    # its pods and faulty results and re-running with a fresh experiment_id
+    # (so reset_caches re-fires). 1 = no retry.
+    treatment_max_attempts: int = 1
+    # Abort the treatment loop once a treatment exhausts its attempts, instead
+    # of recording it failed and continuing to the remaining treatments.
+    treatment_stop_on_error: bool = False
+    # Gate treatment success on the harness-reported failure count, not just
+    # pod state. Workload-specific (see _FAILURE_VALIDATORS in step_07); an
+    # unrecognized workload warns and falls back to pod state.
+    validate_failures: bool = False
     harness_service_account: str | None = None
     harness_envvars_to_pod: str | None = None
     analyze_locally: bool = False
@@ -109,8 +133,15 @@ class ExecutionContext:  # pylint: disable=too-many-instance-attributes
     # Standup pod deployment timeouts
     kustomize_deploy_timeout: int = 900
     standalone_deploy_timeout: int = 900
+    nok8s_deploy_timeout: int = 900
     gateway_deploy_timeout: int = 120
     modelservice_deploy_timeout: int = 1500
+
+    # No-Kubernetes (nok8s) deployment: run the stack + harness as local
+    # containers on the host, with no cluster at all.  When container_only is
+    # True, cluster resolution is skipped and steps talk to docker/podman.
+    container_only: bool = False
+    container_runtime: str = "docker"
 
     pvc_bind_timeout: int = 240
 
@@ -154,6 +185,12 @@ class ExecutionContext:  # pylint: disable=too-many-instance-attributes
     def resolve_cluster(self) -> None:
         """Resolve cluster connectivity and metadata (idempotent)."""
         if self._cluster_resolved:
+            return
+        # No-Kubernetes deployment: there is no cluster to resolve.  Still
+        # build a CommandExecutor so steps can invoke docker/podman.
+        if self.container_only:
+            self.rebuild_cmd()
+            self._cluster_resolved = True
             return
         from llmdbenchmark.utilities.cluster import resolve_cluster as _resolve
 
@@ -264,3 +301,17 @@ class ExecutionContext:  # pylint: disable=too-many-instance-attributes
             if d.is_dir():
                 return d
         return None
+
+
+def is_fma_only_mode(context: ExecutionContext) -> bool:
+    """True when fma is the sole deploy method (no modelservice/standalone/kustomize).
+
+    Run-phase steps use this to distinguish FMA-only scenarios (where the harness
+    talks directly to the requester pod and inference verification is skipped)
+    from FMA-on-top-of-modelservice (where routing goes through the gateway and
+    standard inference verification applies).
+    """
+    if "fma" not in context.deployed_methods:
+        return False
+    other_primaries = ("modelservice", "standalone", "kustomize")
+    return not any(m in context.deployed_methods for m in other_primaries)

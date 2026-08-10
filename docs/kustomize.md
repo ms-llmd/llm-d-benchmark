@@ -29,6 +29,23 @@ llmdbenchmark --spec guides/optimized-baseline standup -t kustomize -p NS
 methods). Equivalently, set `kustomize.enabled: true` in the scenario. If
 `kustomize.enabled` is false the step is a no-op.
 
+Any key in the `kustomize:` block below can also be set per-invocation with
+`--set`, so a backend or guide variant needs no separate scenario file:
+
+```bash
+# same guide, SGLang model servers
+llmdbenchmark --spec guides/optimized-baseline standup \
+  -t kustomize -p NS --set kustomize.acceleratorBackend=gpu/sglang
+
+# fill a guide README ${VAR} without editing the scenario
+llmdbenchmark --spec guides/tiered-prefix-cache standup \
+  -t kustomize -p NS --set kustomize.guideVariableOverrides.INFRA_PROVIDER=base
+```
+
+Pass the same `--set` to every phase (`smoketest`/`run`/`teardown`) -- they
+re-render the plan. See
+[standup.md](standup.md#overriding-scenario-values-from-the-cli---set).
+
 ## Config reference (`kustomize:` block)
 
 | Key | Default | Effect |
@@ -38,13 +55,14 @@ methods). Equivalently, set `kustomize.enabled: true` in the scenario. If
 | `repoPath` | `""` | Local llm-d clone to use. Falls back to `--llmd-repo-path`; empty ⇒ clone `https://github.com/llm-d/llm-d.git` into `workspace/llm-d`. |
 | `repoRef` | `"main"` | Git ref used when cloning. |
 | `acceleratorBackend` | `"gpu/vllm"` | Swaps `modelserver/gpu/vllm` → `modelserver/<backend>` in guide paths. |
-| `gaieVersion` | README `GAIE_VERSION` or `v1.5.0` | GAIE version substituted into README commands. |
+| `gaieVersion` | README `GAIE_VERSION` or `v1.5.0` | GAIE CRD bundle version substituted into README commands. |
+| `routerChartVersion` | README `ROUTER_CHART_VERSION` or `v0` | llm-d-router chart version. |
 | `monitoring` | `false` | Also applies `guides/recipes/modelserver/components/monitoring`. |
 | `deployTimeout` | `900` | Pod-readiness wait (seconds). |
 | `patches` | `[]` | Inline strategic-merge patches (modelserver). See below. |
 | `overlayPath` | `""` | Directory overlay (modelserver). See below. |
-| `extraHelmValues` | `[]` | `-f <file>` appended to the router/GAIE helm command. |
-| `extraHelmSets` | `{}` | `--set k=v` appended to the router/GAIE helm command. |
+| `extraHelmValues` | `[]` | `-f <file>` appended to the router helm command. |
+| `extraHelmSets` | `{}` | `--set k=v` appended to the router helm command. |
 | `guideVariableOverrides` | `{}` | Override/fill the guide README's `${VAR}` values (cannot add new variables). |
 
 ## Two scopes
@@ -68,43 +86,70 @@ kustomize:
 
   # patches → modelserver. Strategic-merge, matched by
   # apiVersion + kind + metadata.name against the guide's base.
+  # NB: HF_TOKEN env injection is NOT needed here -- the upstream
+  # guides ship it (since llm-d/llm-d#1684) and step 06 creates the
+  # Secret automatically. See `## HF_TOKEN handling` below.
   patches:
     - patch: |                       # override the guide's replica count
         apiVersion: apps/v1
         kind: Deployment
         metadata: { name: decode }
         spec: { replicas: 4 }
-    - patch: |                       # gated models: inject HF token env
-        apiVersion: apps/v1
-        kind: Deployment
-        metadata: { name: decode }
-        spec:
-          template:
-            spec:
-              containers:
-                - name: modelserver
-                  env:
-                    - name: HF_TOKEN
-                      valueFrom:
-                        secretKeyRef:
-                          name: llm-d-hf-token
-                          key: HF_TOKEN
 
   # overlayPath → modelserver. If the dir contains kustomization.yaml it
   # is added as a kustomize component; otherwise every *.yaml in it is
   # applied as a patch file. Combinable with `patches`.
   overlayPath: "/abs/path/my-overlay"
 
-  # extraHelmValues / extraHelmSets → router/GAIE helm release ONLY.
-  extraHelmValues: ["/abs/path/gaie-values.yaml"]
+  # extraHelmValues / extraHelmSets → router helm release ONLY.
+  # Keys are passed straight through to helm and therefore must match the
+  # llm-d-router chart's values schema (`router.epp.replicas`, etc.).
+  extraHelmValues: ["/abs/path/router-values.yaml"]
   extraHelmSets:
-    inferenceExtension.replicas: "2"
+    router.epp.replicas: "2"
 
   # guideVariableOverrides → override/fill ${VAR} tokens the guide
   # README already uses (cannot introduce new variables).
   guideVariableOverrides:
     SOME_README_VAR: "value"
 ```
+
+## HF_TOKEN handling
+
+Upstream llm-d guides (since
+[llm-d/llm-d#1684](https://github.com/llm-d/llm-d/pull/1684)) reference
+`secret/llm-d-hf-token` directly in their modelserver manifests
+without `optional: true`. **Kustomize standup hard-requires the Secret
+to be available** — if the Pod can't resolve the `secretKeyRef` it
+hangs in `CreateContainerConfigError` until the deploy timeout
+elapses.
+
+`step_06_kustomize_deploy` enforces this in
+[`_ensure_hf_token_secret`](../llmdbenchmark/standup/steps/step_06_kustomize_deploy.py).
+Three branches:
+
+| Condition | Behaviour |
+|---|---|
+| Secret `llm-d-hf-token` already exists in the namespace | Leave it alone, log "already exists" (supports externally managed Secrets via ESO / Vault / hand-create). No env token required. |
+| Secret absent, env token set (`HF_TOKEN`, `LLMDBENCH_HF_TOKEN`, or `HUGGING_FACE_HUB_TOKEN`, in that order) | Create the Secret. |
+| **Secret absent AND no env token** | **Standup fails fast** before applying any modelserver manifests, with a message naming the namespace and the two fix paths (export the env var or `kubectl create secret …` by hand). |
+
+The token value is never written to a `kubectl` command line.  The
+manifest is built in-process, base64-encoded, written to a temp file
+(mode 0600), `kubectl apply -f`'d, and the temp file is unlinked
+afterwards — so `CommandExecutor`'s command log only ever sees
+`kubectl apply -f /tmp/llm-d-hf-token-XXXX.yaml`.  If `kubectl`
+somehow echoes the token in stderr, the surfaced error string is
+scrubbed before propagation.
+
+When a scenario sets a separate `harness_namespace`, the Secret is
+ensured in **both** namespaces — the same fail-fast rule applies to
+each.
+
+This fail-fast behaviour is **kustomize-only**.  The `modelservice` and
+`standalone` paths remain tolerant of missing tokens (auto-disabling
+`huggingface.enabled` when no token is found and gating later steps),
+because their generated manifests don't have the hard requirement.
 
 ## Caveats
 
@@ -116,8 +161,8 @@ kustomize:
   appear in that guide's README; it cannot introduce new variables.
   Precedence (`llmdbenchmark/kustomize/variable_resolver.py`):
   README-declared defaults < `guideVariableOverrides` < forced
-  `GUIDE_NAME` / `NAMESPACE` / `GAIE_VERSION` (those three cannot be
-  overridden).
+  `GUIDE_NAME` / `NAMESPACE` / `GAIE_VERSION` / `ROUTER_CHART_VERSION`
+  (those four cannot be overridden).
 - The deployed model is whatever the guide pins; change it via a `patches`
   entry against the resource that carries it, not via `-m`/`model.name`.
 - **Multi-model (multi-stack) is NOT supported with kustomize.** The

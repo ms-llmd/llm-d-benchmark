@@ -1,0 +1,37 @@
+{# Modelservice-only template. -t kustomize uses upstream guide manifests. #}
+{#
+   Renders the values file for the llm-d-router chart (standalone or
+   gateway variant; see 10_helmfile-main.yaml.j2). The scenario layer uses
+   the chart's `router.*` keys directly, so this template is largely a
+   pass-through: any field the user / scenario / setup-treatment sets
+   under `router:` flows straight into the chart, and any benchmark
+   runtime details (HF_TOKEN env, zmq port expansion, EPP image, default
+   modelServers labels, port 80 for epponly, providerConfig lift to
+   provider.<gw>) are already layered in by render_plans.py:
+   `_normalize_router_block`.
+
+   That means scenarios can override anything the chart accepts -- e.g.
+   `router.epp.affinity`, `router.epp.tolerations`, `router.epp.parsers`,
+   `router.epp.metricsDataSource`, `router.tokenizer.image`,
+   `router.tracing`, `router.modelServers.type`,
+   `router.inferenceObjectives`, `router.proxy.presets`, etc. -- without
+   the template needing to know about each new field.
+
+   Scope of this template:
+     - gate on standalone/kustomize (the kustomize standup path uses
+       upstream guide manifests, not these values),
+     - dump the `router:` block as YAML,
+     - dump the root-level `provider:` block for the gateway chart
+       (gke / istio) when present.
+
+   Field reference (upstream chart values for the routerlib subchart):
+     https://github.com/llm-d/llm-d-router/blob/main/config/charts/routerlib/values.yaml
+#}
+{% if standalone.enabled is defined and not standalone.enabled and not (kustomize.enabled | default(false)) %}
+router:
+{{ router | toyaml | indent(2, true) }}
+{% if provider is defined and provider %}
+provider:
+{{ provider | toyaml | indent(2, true) }}
+{% endif %}
+{% endif %}

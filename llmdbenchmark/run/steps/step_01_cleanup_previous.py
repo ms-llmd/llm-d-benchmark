@@ -19,7 +19,9 @@ class RunCleanupPreviousStep(Step):
         )
 
     def should_skip(self, context: ExecutionContext) -> bool:
-        """Skip cleanup in skip-run mode (collecting results only)."""
+        """Skip cleanup in skip-run mode, or for nok8s (no cluster)."""
+        if "nok8s" in (context.deployed_methods or []):
+            return True
         return context.harness_skip_run
 
     def execute(
@@ -38,7 +40,9 @@ class RunCleanupPreviousStep(Step):
 
         plan_config = self._load_plan_config(context)
         pod_label = self._resolve(
-            plan_config, "harness.podLabel", default="llmdbench-harness-launcher",
+            plan_config,
+            "harness.podLabel",
+            default="llmdbench-harness-launcher",
         )
 
         context.logger.log_info(
@@ -46,9 +50,12 @@ class RunCleanupPreviousStep(Step):
         )
 
         result = cmd.kube(
-            "delete", "pod",
-            "-l", f"app={pod_label},function=load_generator",
-            "--namespace", harness_ns,
+            "delete",
+            "pod",
+            "-l",
+            f"app={pod_label},function=load_generator",
+            "--namespace",
+            harness_ns,
             "--ignore-not-found",
             check=False,
         )

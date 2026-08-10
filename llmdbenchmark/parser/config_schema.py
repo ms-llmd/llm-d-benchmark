@@ -107,8 +107,11 @@ class AcceleratorTypeConfig(BaseModel):
 
     model_config = STRICT_CONFIG
 
-    labelKey: str
-    labelValue: str
+    # The cluster resolver deliberately removes both fields when a device
+    # resource is available but no portable SKU label exists. In that case
+    # Kubernetes schedules from the accelerator resource request alone.
+    labelKey: str | None = None
+    labelValue: str | None = None
     labelValues: list[str] | None = None
 
 
@@ -207,6 +210,10 @@ class DeploymentBaseConfig(BaseModel):
 
     parallelism: ParallelismConfig
     resources: ResourcesConfig
+    # Pod-level securityContext (e.g. supplementalGroups for /dev/dri access on
+    # Intel XPU nodes). Distinct from the container-level securityContext under
+    # ``extraContainerConfig`` -- supplementalGroups is a Pod field.
+    podSecurityContext: dict[str, Any] | None = None
     shm: dict[str, str] | None = None
     probes: ProbesConfig
     vllm: VllmServeConfig
@@ -390,6 +397,11 @@ class HarnessConfig(BaseModel):
     profile: str | None = None
     experimentProfile: str | None = None
     executable: str
+    # Optional pod-entrypoint override. step_07 reads harness.entrypoint
+    # (default: the llm-d-benchmark.sh launcher); harnesses whose image has no
+    # launcher in /usr/local/bin (e.g. eval-containers, which runs a standalone
+    # eval image) point this at their script in the mounted scripts ConfigMap.
+    entrypoint: str | None = None
     condaEnvName: str
     waitTimeout: int = Field(ge=0)
     loadParallelism: int = Field(ge=1)
@@ -402,6 +414,13 @@ class HarnessConfig(BaseModel):
     inferencePerf: InferencePerfConfig
     namespace: str | None = None
     pvcSize: str | None = None
+    # Cluster-specific overrides supplied via --cluster-config (deep-merged onto
+    # the scenario). They render the harness pod's securityContext.runAsUser and
+    # serviceAccountName (see 20_harness_pod.yaml.j2). Modeled here so a valid
+    # cluster-config does not trip the extra="forbid" "Extra inputs" warning.
+    # Type-only, no default: defaults.yaml remains the source of truth.
+    runAsUser: int | None = None
+    serviceAccount: str | None = None
 
 
 # ---------------------------------------------------------------------------

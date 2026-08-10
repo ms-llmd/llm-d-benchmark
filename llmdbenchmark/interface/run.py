@@ -2,7 +2,7 @@
 
 import argparse
 from llmdbenchmark.interface.commands import Command
-from llmdbenchmark.interface.env import env, env_int
+from llmdbenchmark.interface.env import env, env_bool, env_int
 
 
 def add_subcommands(
@@ -36,7 +36,7 @@ def add_subcommands(
         "-t",
         "--methods",
         default=env("LLMDBENCH_METHODS"),
-        help="Deploy method used during standup (standalone, modelservice, or custom resource name).",
+        help="Deploy method used during standup (standalone, modelservice, nok8s, or custom resource name).",
     )
     run_parser.add_argument(
         "--gateway-class",
@@ -44,7 +44,8 @@ def add_subcommands(
         help=(
             "Override the scenario's gateway.className when the run phase "
             "re-renders templates for setup overrides. Supported values: "
-            "epponly, istio, agentgateway, gke, data-science-gateway-class."
+            "none, epponly, istio, agentgateway, gke, "
+            "data-science-gateway-class."
         ),
     )
     run_parser.add_argument(
@@ -73,6 +74,14 @@ def add_subcommands(
         "--workload",
         default=env("LLMDBENCH_WORKLOAD"),
         help="Workload profile name (e.g., sanity_random.yaml).",
+    )
+    run_parser.add_argument(
+        "--workload-file-path",
+        default=env("LLMDBENCH_WORKLOAD_FILE_PATH"),
+        help=(
+            "Path to a local workload profile file. When set, this file is used "
+            "instead of resolving --workload under workload/profiles/<harness>."
+        ),
     )
     run_parser.add_argument(
         "-e",
@@ -131,6 +140,40 @@ def add_subcommands(
         help="Seconds to wait for harness completion (0 = do not wait).",
     )
     run_parser.add_argument(
+        "--treatment-max-attempts",
+        type=int,
+        default=env_int("LLMDBENCH_TREATMENT_MAX_ATTEMPTS"),
+        help=(
+            "Retry a failed treatment up to N times: delete its pods and faulty "
+            "results dir, then re-run with a fresh experiment_id (so reset_caches "
+            "fires again for cold caches). 1 = no retry (default). Overrides the "
+            "top-level treatment_max_attempts key in --experiments YAML."
+        ),
+    )
+    run_parser.add_argument(
+        "--treatment-stop-on-error",
+        action="store_true",
+        default=None,
+        help=(
+            "Abort the run's treatment loop once a treatment exhausts its "
+            "attempts, instead of recording it failed and continuing. Default: "
+            "continue remaining treatments. Overrides the top-level "
+            "treatment_stop_on_error key in --experiments YAML."
+        ),
+    )
+    run_parser.add_argument(
+        "--validate-failures",
+        action="store_true",
+        default=None,
+        help=(
+            "Fail (and retry) a treatment when its summary_lifecycle_metrics.json "
+            "reports failures.count > 0, or the file is missing/unparseable. "
+            "Only applies to the otel_traces workload; other workloads warn and "
+            "fall back to Kubernetes pod state. Default: pod state only. "
+            "Overrides the top-level validate_failures key in --experiments YAML."
+        ),
+    )
+    run_parser.add_argument(
         "-x",
         "--dataset",
         default=env("LLMDBENCH_DATASET"),
@@ -141,6 +184,20 @@ def add_subcommands(
         type=int,
         default=env_int("LLMDBENCH_DATA_ACCESS_TIMEOUT"),
         help="Seconds to wait for the harness data-access pod to become Ready.",
+    )
+    run_parser.add_argument(
+        "--pvc-bind-timeout",
+        type=int,
+        default=env_int("LLMDBENCH_PVC_BIND_TIMEOUT"),
+        help="Seconds to wait for the harness workload PVC to reach the "
+        "Bound phase before failing the run. The PVC is the same one "
+        "standup binds, so this mirrors the standup flag and accepts the "
+        "same env var (LLMDBENCH_PVC_BIND_TIMEOUT). Use a larger value "
+        "when the cluster's StorageClass provisions slowly (some shared "
+        "storage backends -- weka, ceph, gpfs -- can take several minutes "
+        "for the first workload-pvc bind in a fresh namespace). Default: "
+        "240. A PVC that never binds fails fast rather than masquerading "
+        "as a downstream pod/job timeout.",
     )
 
     # Monitoring
@@ -183,6 +240,14 @@ def add_subcommands(
         action="store_true",
         default=env("LLMDBENCH_RUN_EXPERIMENT_ANALYZE_LOCALLY") == "1",
         help="Run local analysis on collected results (env: LLMDBENCH_RUN_EXPERIMENT_ANALYZE_LOCALLY=1).",
+    )
+    run_parser.add_argument(
+        "--fast-collect",
+        action="store_true",
+        default=env_bool("LLMDBENCH_FAST_COLLECT"),
+        help="Collect results via a gzip'd 'oc exec | tar' stream instead of "
+        "'oc cp'. Copies the same files, just much faster for large result "
+        "trees (env: LLMDBENCH_FAST_COLLECT). Default: off.",
     )
 
     # Run-only / existing-stack mode

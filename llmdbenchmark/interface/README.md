@@ -37,8 +37,10 @@ Each subcommand module provides an `add_subcommands(parser)` function that regis
 def env(name: str, default=None):
     """Return env var value or default. For use as argparse default=."""
 
+
 def env_bool(name: str, default: bool = False) -> bool:
     """Return env var as boolean. Truthy: '1', 'true', 'yes' (case-insensitive)."""
+
 
 def env_int(name: str, default: int | None = None) -> int | None:
     """Return env var as int, or default if not set / not parseable."""
@@ -81,6 +83,7 @@ Provisions model infrastructure from a specification. Implicitly generates a pla
 | `--gateway-deploy-timeout` | `LLMDBENCH_GATEWAY_DEPLOY_TIMEOUT` | Seconds to wait for gateway infrastructure pods to deploy during standup with modelservice. |
 | `--modelservice-deploy-timeout` | `LLMDBENCH_MODELSERVICE_DEPLOY_TIMEOUT` | Seconds to wait for decode, prefill and inference pool pods to deploy during standup with modelservice (Generic timeout for Step 9). |
 | `--pvc-bind-timeout` | `LLMDBENCH_PVC_BIND_TIMEOUT` | Seconds to wait for each PVC (workload, model, extra) to reach the Bound phase during standup. Fails fast on missing default StorageClass instead of masking as a downstream pod/job timeout. Default: 240 (some dynamic provisioners take 1-3 minutes per volume). |
+| `--data-access-timeout` | `LLMDBENCH_DATA_ACCESS_TIMEOUT` | Seconds to wait for the harness data-access pod to become Ready. On a `WaitForFirstConsumer` StorageClass the unspent `--pvc-bind-timeout` is added to this budget, since the volume is only provisioned once that pod schedules. Default: 120. |
 
 ### smoketest (`smoketest.py`)
 
@@ -107,6 +110,7 @@ Executes benchmark experiments against deployed infrastructure.
 | `-m` / `--model` | `LLMDBENCH_MODEL` | Model name override |
 | `-l` / `--harness` | `LLMDBENCH_HARNESS` | Harness name |
 | `-w` / `--workload` | `LLMDBENCH_WORKLOAD` | Workload profile name |
+| `--workload-file-path` | `LLMDBENCH_WORKLOAD_FILE_PATH` | Local workload profile file path |
 | `-e` / `--experiments` | `LLMDBENCH_EXPERIMENTS` | Experiment treatments YAML |
 | `-o` / `--overrides` | `LLMDBENCH_OVERRIDES` | Profile parameter overrides (param=value,...) |
 | `-r` / `--output` | `LLMDBENCH_OUTPUT` | Results destination (local, gs://, s3://) |

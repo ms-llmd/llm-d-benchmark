@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -24,10 +24,10 @@ jobs:
       - name: Install llmdbenchmark
         run: |
           ./install.sh -y 2>&1
-          pip install pytest
+          pip install pytest pytest-xdist
 
       - name: Run unit tests
-        run: python -m pytest tests/ -x -q
+        run: python -m pytest tests/ -x -q -n2
 
   # -- Standalone deployment (own Kind cluster) --
   benchmark-standalone:
@@ -165,5 +165,32 @@ jobs:
       dry_run: false
       verbose: false
       harness: guidellm
+      workload: sanity_random.yaml
+    secrets: inherit
+
+  benchmark-kustomize-optimized-baseline:
+    name: Benchmark - kustomize / epponly / optimized-baseline (Kind)
+    uses: llm-d/llm-d-benchmark/.github/workflows/reusable-ci-nightly-benchmark.yaml@main
+    with:
+      scenario_dir: guides
+      standup_method: kustomize
+      standup_scenario: optimized-baseline
+      decode_pods: 2
+      prefill_pods: auto
+      accelerator_type: gpu
+      backend_type: vllm
+      infra_provider: base
+      connector:
+      cluster_namespace: llmdbenchcicd-sa-${{ github.event.number }}
+      helm_release: lmdbenchcicdr
+      workspace_dir: tmp/cicd-sa-${{ github.event.number }}
+      bucket_project: llm-d-scale
+      bucket_provider: none
+      bucket_path: /tmp/llmdbenchcicd
+      gateway_class: epponly
+      monitoring_enabled: true
+      dry_run: true
+      verbose: false
+      harness: inference-perf
       workload: sanity_random.yaml
     secrets: inherit

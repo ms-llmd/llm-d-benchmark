@@ -16,11 +16,19 @@ spec:
   - name: harness
     image: {{ images.benchmark.repository }}:{{ images.benchmark.tag }}
     imagePullPolicy: {{ images.benchmark.pullPolicy }}
+{% if harness.runAsUser is defined and harness.runAsUser is not none %}
     securityContext:
-      runAsUser: 0
+      runAsUser: {{ harness.runAsUser }}
+{% endif %}
     command: ["sh", "-c"]
     args:
-    - "{{ harness_command }}"
+    - >-
+      for script in /workspace/harnesses/*; do
+        [ -f "$script" ] || continue;
+        cp "$script" /usr/local/bin/;
+        chmod +x "/usr/local/bin/$(basename "$script")";
+      done;
+      {{ harness_command }}
     resources:
       limits:
         cpu: "{{ harness.resources.cpu }}"
@@ -55,14 +63,36 @@ spec:
       value: "{{ experiment_id }}"
     - name: RAYON_NUM_THREADS
       value: "{{ harness.inferencePerf.rayonNumThreads }}"
+    - name: HOME
+      value: "{{ harness.resultsDirPrefix | default('/requests') }}/.home"
+    - name: HF_HOME
+      value: "{{ harness.resultsDirPrefix | default('/requests') }}/.cache/huggingface"
+    - name: XDG_CACHE_HOME
+      value: "{{ harness.resultsDirPrefix | default('/requests') }}/.cache"
+    - name: MPLCONFIGDIR
+      value: "{{ harness.resultsDirPrefix | default('/requests') }}/.cache/matplotlib"
 {% if huggingface.enabled %}
     - name: HF_TOKEN_SECRET
       value: "{{ huggingface.secretName }}"
+    # HuggingFace harness binaries split between the two env-var
+    # names: guidellm and a number of vLLM utilities read HF_TOKEN,
+    # while huggingface_hub-based libraries also accept
+    # HUGGING_FACE_HUB_TOKEN.  Setting both from the same secretKeyRef
+    # eliminates the question -- any harness that reads either name
+    # gets the token.
+    - name: HF_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: {{ huggingface.secretName }}
+          key: {{ huggingface.tokenKey }}
+          # optional: offline / external-endpoint harnesses start without the secret.
+          optional: true
     - name: HUGGING_FACE_HUB_TOKEN
       valueFrom:
         secretKeyRef:
           name: {{ huggingface.secretName }}
           key: {{ huggingface.tokenKey }}
+          optional: true
 {% endif %}
     - name: POD_NAME
       valueFrom:
@@ -92,7 +122,12 @@ spec:
     - name: LLMDBENCH_VLLM_MONITORING_METRICS_PATH
       value: "{{ monitoring.metricsPath }}"
     - name: LLMDBENCH_EPP_METRICS_SECRET
-      value: "{{ inferenceExtension.monitoring.secretName | default('inference-gateway-sa-metrics-reader-secret') }}"
+      value: "{{ router.monitoring.secretName | default('inference-gateway-sa-metrics-reader-secret') }}"
+{% if monitoring.timeSeriesMetrics is defined %}
+    - name: LLMDBENCH_TIME_SERIES_METRICS
+      value: >-
+        {{ monitoring.timeSeriesMetrics | tojson }}
+{% endif %}
 {% endif %}
     - name: LLMDBENCH_STANDALONE_ENABLED
       value: "{{ standalone.enabled | lower }}"
@@ -113,6 +148,8 @@ spec:
       value: "{{ fma.launcherConfigurator.port }}"
     - name: LLMDBENCH_FMA_ITERATIONS
       value: "{{ fma.iterations }}"
+    - name: LLMDBENCH_FMA_MAX_INSTANCES
+      value: "{{ fma.launcher.maxInstances }}"
 {% endif %}
 {% if harness.extraEnvVars is defined and harness.extraEnvVars %}
 {% for env_entry in harness.extraEnvVars %}
@@ -123,17 +160,22 @@ spec:
     volumeMounts:
     - name: results
       mountPath: /requests
-    - name: {{ harness.name }}-profiles
-      mountPath: /workspace/profiles/{{ harness.name }}
+{% set profile_mounts = profile_mounts | default([harness.name]) %}
+{% for profile_harness in profile_mounts %}
+    - name: {{ profile_harness }}-profiles
+      mountPath: /workspace/profiles/{{ profile_harness }}
+{% endfor %}
     - name: harness-scripts
       mountPath: /workspace/harnesses
   volumes:
   - name: results
     persistentVolumeClaim:
       claimName: {{ storage.workloadPvc.name }}
-  - name: {{ harness.name }}-profiles
+{% for profile_harness in profile_mounts %}
+  - name: {{ profile_harness }}-profiles
     configMap:
-      name: {{ harness.name }}-profiles
+      name: {{ profile_harness }}-profiles
+{% endfor %}
   - name: harness-scripts
     configMap:
       name: llmdbench-harness-scripts

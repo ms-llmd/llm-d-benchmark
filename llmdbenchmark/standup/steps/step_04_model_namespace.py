@@ -26,6 +26,10 @@ class ModelNamespaceStep(Step):
 
     def should_skip(self, context: ExecutionContext) -> bool:
         methods = context.deployed_methods or []
+        if "nok8s" in methods:
+            # vLLM pulls the model from Hugging Face at container runtime;
+            # no k8s namespace/PVC/download Job is needed.
+            return True
         return methods == ["kustomize"] and context.kustomize_skip_infra
 
     def execute(
@@ -79,23 +83,38 @@ class ModelNamespaceStep(Step):
             self._warn_on_undersized_model_pvc(context, pvc_stacks)
 
         for stack_path in pvc_stacks:
+            stack_cfg = self._load_stack_config(stack_path)
+            if self._is_hostpath_enabled(stack_cfg):
+                self._apply_hostpath_pv(cmd, context, errors, stack_path)
             self._create_model_pvc(cmd, context, errors, stack_path)
             self._create_extra_pvc(cmd, context, errors, stack_path)
 
         self._add_context_secret(cmd, context, errors, plan_config)
 
         if pvc_stacks:
-            # Two-phase parallel download (only for stacks that need it):
-            #   Phase 1 - apply every download Job back-to-back; they all
-            #             start running concurrently in the cluster.
-            #   Phase 2 - wait on each in turn. Subsequent waits return
-            #             nearly instantly once their Job is already done,
-            #             so total wall time ~ max(individual), not sum.
-            launched = []
+            # Separate stacks into hostPath (DaemonSet) vs regular (Job) flows.
+            hostpath_stacks: list[Path] = []
+            regular_stacks: list[Path] = []
             for stack_path in pvc_stacks:
-                applied = self._apply_download_job(
+                stack_cfg = self._load_stack_config(stack_path)
+                if self._is_hostpath_enabled(stack_cfg):
+                    hostpath_stacks.append(stack_path)
+                else:
+                    regular_stacks.append(stack_path)
+
+            # hostPath flow: apply DaemonSets for per-node downloads.
+            ds_launched: list[tuple[Path, str]] = []
+            for stack_path in hostpath_stacks:
+                ds_name = self._apply_download_daemonset(
                     cmd, context, errors, stack_path
                 )
+                if ds_name:
+                    ds_launched.append((stack_path, ds_name))
+
+            # Regular flow: two-phase parallel download Jobs.
+            launched = []
+            for stack_path in regular_stacks:
+                applied = self._apply_download_job(cmd, context, errors, stack_path)
                 if applied is not None:
                     job_name, download_yaml = applied
                     launched.append((stack_path, job_name, download_yaml))
@@ -104,6 +123,11 @@ class ModelNamespaceStep(Step):
                 context.logger.log_info(
                     f"📦 Launched {len(launched)} model downloads in parallel; "
                     "waiting for completion..."
+                )
+
+            for stack_path, ds_name in ds_launched:
+                self._wait_for_download_daemonset(
+                    cmd, context, errors, stack_path, ds_name
                 )
 
             for stack_path, job_name, download_yaml in launched:
@@ -154,16 +178,26 @@ class ModelNamespaceStep(Step):
         unit = (m.group(2) or "Gi").strip()
         table = {
             # Binary (IEC) units
-            "Ki": n / (1024 ** 2), "Mi": n / 1024,
-            "Gi": n, "Ti": n * 1024, "Pi": n * 1024 ** 2, "Ei": n * 1024 ** 3,
+            "Ki": n / (1024**2),
+            "Mi": n / 1024,
+            "Gi": n,
+            "Ti": n * 1024,
+            "Pi": n * 1024**2,
+            "Ei": n * 1024**3,
             # Decimal (SI) units - approximate to GiB
-            "K": n / (1024 ** 2), "M": n / 1024, "G": n,
-            "T": n * 1024, "P": n * 1024 ** 2, "E": n * 1024 ** 3,
+            "K": n / (1024**2),
+            "M": n / 1024,
+            "G": n,
+            "T": n * 1024,
+            "P": n * 1024**2,
+            "E": n * 1024**3,
         }
         return table.get(unit, n)
 
     def _warn_on_undersized_model_pvc(
-        self, context: ExecutionContext, pvc_stacks: list[Path],
+        self,
+        context: ExecutionContext,
+        pvc_stacks: list[Path],
     ) -> None:
         """Warn if the shared model PVC looks too small to hold all models.
 
@@ -178,9 +212,7 @@ class ModelNamespaceStep(Step):
         don't have a summing problem.
         """
         first_cfg = self._load_stack_config(pvc_stacks[0])
-        pvc_capacity_str = (
-            first_cfg.get("storage", {}).get("modelPvc", {}).get("size")
-        )
+        pvc_capacity_str = first_cfg.get("storage", {}).get("modelPvc", {}).get("size")
         capacity_gib = self._parse_size_to_gib(pvc_capacity_str)
         if capacity_gib == 0:
             return
@@ -215,11 +247,16 @@ class ModelNamespaceStep(Step):
             )
 
         uri_protocol = self._require_config(plan_config, "modelservice", "uriProtocol")
-        standalone_enabled = (
-            plan_config.get("standalone", {}).get("enabled", False)
-        )
+        standalone_enabled = plan_config.get("standalone", {}).get("enabled", False)
 
         return uri_protocol == "pvc" or standalone_enabled
+
+    @staticmethod
+    def _is_hostpath_enabled(plan_config: dict | None) -> bool:
+        """Return True when hostPath-backed model storage is enabled."""
+        if not plan_config:
+            return False
+        return plan_config.get("storage", {}).get("hostPath", {}).get("enabled", False)
 
     def _apply_namespace_resources(
         self, cmd: CommandExecutor, context: ExecutionContext, errors: list
@@ -228,6 +265,16 @@ class ModelNamespaceStep(Step):
         ns_yaml = self._find_rendered_yaml(context, "05_namespace_sa_rbac_secret")
         if not ns_yaml:
             return
+
+        if context.non_admin:
+            # The render pipeline elides ClusterRole/ClusterRoleBinding when
+            # --non-admin is set; surface that here so it's not silent and
+            # so the 'nop' harness mismatch is callable out in the log.
+            context.logger.log_info(
+                "--non-admin: skipped ClusterRole/ClusterRoleBinding "
+                "'inference-perf-service-viewer' (only the 'nop' harness "
+                "needs them; use inference-perf / guidellm / vllm-benchmark)"
+            )
 
         result = cmd.kube("apply", "-f", str(ns_yaml))
         if not result.success:
@@ -266,10 +313,8 @@ class ModelNamespaceStep(Step):
         pvc_size = self._require_config(plan_config, "storage", "modelPvc", "size")
 
         namespace = context.require_namespace()
-        already_exists = (
-            not context.dry_run and self._check_existing_pvc(
-                cmd, context, pvc_name, pvc_size, namespace, errors
-            )
+        already_exists = not context.dry_run and self._check_existing_pvc(
+            cmd, context, pvc_name, pvc_size, namespace, errors
         )
         if not already_exists:
             result = cmd.kube("apply", "-f", str(pvc_yaml))
@@ -318,7 +363,9 @@ class ModelNamespaceStep(Step):
             return
 
         plan_config = self._load_stack_config(stack_path)
-        extra_pvc = plan_config.get("storage", {}).get("extraPvc", {}) if plan_config else {}
+        extra_pvc = (
+            plan_config.get("storage", {}).get("extraPvc", {}) if plan_config else {}
+        )
         pvc_name = extra_pvc.get("name", "")
         pvc_size = extra_pvc.get("size", "10Gi")
 
@@ -326,10 +373,8 @@ class ModelNamespaceStep(Step):
             return
 
         namespace = context.require_namespace()
-        already_exists = (
-            not context.dry_run and self._check_existing_pvc(
-                cmd, context, pvc_name, pvc_size, namespace, errors
-            )
+        already_exists = not context.dry_run and self._check_existing_pvc(
+            cmd, context, pvc_name, pvc_size, namespace, errors
         )
         if not already_exists:
             result = cmd.kube("apply", "-f", str(extra_pvc_yaml))
@@ -359,8 +404,11 @@ class ModelNamespaceStep(Step):
             )
 
     def _add_context_secret(
-        self, cmd: CommandExecutor, context: ExecutionContext,
-        errors: list, plan_config: dict | None = None,
+        self,
+        cmd: CommandExecutor,
+        context: ExecutionContext,
+        errors: list,
+        plan_config: dict | None = None,
     ):
         """Save the kubeconfig as a Secret so downstream pods can access the cluster."""
         namespace = context.require_namespace()
@@ -410,8 +458,11 @@ class ModelNamespaceStep(Step):
             )
 
     def _apply_download_job(
-        self, cmd: CommandExecutor, context: ExecutionContext,
-        errors: list, stack_path: Path,
+        self,
+        cmd: CommandExecutor,
+        context: ExecutionContext,
+        errors: list,
+        stack_path: Path,
     ) -> tuple[str, Path] | None:
         """Apply a single stack's download Job without waiting.
 
@@ -447,8 +498,13 @@ class ModelNamespaceStep(Step):
         return job_name, download_yaml
 
     def _wait_for_download_job(
-        self, cmd: CommandExecutor, context: ExecutionContext,
-        errors: list, stack_path: Path, job_name: str, download_yaml: Path,
+        self,
+        cmd: CommandExecutor,
+        context: ExecutionContext,
+        errors: list,
+        stack_path: Path,
+        job_name: str,
+        download_yaml: Path,
     ) -> None:
         """Wait for a single stack's download Job to complete, with retries.
 
@@ -460,7 +516,9 @@ class ModelNamespaceStep(Step):
         """
         plan_config = self._load_stack_config(stack_path)
         timeout = int(self._require_config(plan_config, "storage", "downloadTimeout"))
-        max_retries = int(self._require_config(plan_config, "storage", "downloadMaxRetries"))
+        max_retries = int(
+            self._require_config(plan_config, "storage", "downloadMaxRetries")
+        )
 
         for attempt in range(1, max_retries + 1):
             wait_result = cmd.wait_for_job(
@@ -494,6 +552,93 @@ class ModelNamespaceStep(Step):
                     f"Model download job {job_name} did not complete after "
                     f"{max_retries} attempts: {wait_result.stderr}"
                 )
+
+    def _apply_hostpath_pv(
+        self,
+        cmd: CommandExecutor,
+        context: ExecutionContext,
+        errors: list,
+        stack_path: Path,
+    ) -> None:
+        """Apply the static hostPath PV for a stack."""
+        pv_yaml = self._find_yaml(stack_path, "02a_pv_model-hostpath")
+        if not pv_yaml or not self._has_yaml_content(pv_yaml):
+            return
+
+        result = cmd.kube("apply", "-f", str(pv_yaml))
+        if not result.success and "AlreadyExists" not in result.stderr:
+            errors.append(f"Failed to create hostPath PV: {result.stderr}")
+
+    def _apply_download_daemonset(
+        self,
+        cmd: CommandExecutor,
+        context: ExecutionContext,
+        errors: list,
+        stack_path: Path,
+    ) -> str | None:
+        """Apply the model download DaemonSet for hostPath mode.
+
+        Returns the DaemonSet name on success, or None on failure.
+        """
+        ds_yaml = self._find_yaml(stack_path, "03_download_daemonset")
+        if not ds_yaml or not self._has_yaml_content(ds_yaml):
+            return None
+
+        plan_config = self._load_stack_config(stack_path)
+        ds_name = (
+            plan_config.get("storage", {})
+            .get("hostPath", {})
+            .get("daemonSetName", "download-model-ds")
+        )
+
+        cmd.kube(
+            "delete",
+            "daemonset",
+            ds_name,
+            "--namespace",
+            context.require_namespace(),
+            "--ignore-not-found",
+        )
+
+        result = cmd.kube("apply", "-f", str(ds_yaml))
+        if not result.success:
+            errors.append(
+                f"Failed to apply download DaemonSet {ds_name}: {result.stderr}"
+            )
+            return None
+
+        return ds_name
+
+    def _wait_for_download_daemonset(
+        self,
+        cmd: CommandExecutor,
+        context: ExecutionContext,
+        errors: list,
+        stack_path: Path,
+        ds_name: str,
+    ) -> None:
+        """Wait for the download DaemonSet to be fully ready."""
+        plan_config = self._load_stack_config(stack_path)
+        timeout = int(
+            plan_config.get("storage", {})
+            .get("hostPath", {})
+            .get("daemonSetTimeout", 3600)
+        )
+
+        wait_result = cmd.wait_for_daemonset(
+            ds_name=ds_name,
+            namespace=context.require_namespace(),
+            timeout=timeout,
+            poll_interval=15,
+            description=f"model download DaemonSet {ds_name}",
+        )
+        if not wait_result.success:
+            errors.append(
+                f"Download DaemonSet {ds_name} did not become ready: "
+                f"{wait_result.stderr}"
+            )
+        else:
+            context.logger.log_info(f"✅ Model download DaemonSet {ds_name} completed")
 
     def _cleanup_download_pods(
         self,
@@ -554,6 +699,13 @@ class ModelNamespaceStep(Step):
 
         storage = plan_config.get("storage", {})
 
+        hostpath_enabled = self._is_hostpath_enabled(plan_config)
+        hostpath_sc = (
+            storage.get("hostPath", {}).get("storageClassName", "")
+            if hostpath_enabled
+            else ""
+        )
+
         storage_classes_to_check: set[str] = set()
         for pvc_key in ("modelPvc", "workloadPvc", "extraPvc"):
             pvc = storage.get(pvc_key, {})
@@ -561,6 +713,15 @@ class ModelNamespaceStep(Step):
 
             if pvc_key == "extraPvc" and not pvc.get("name"):
                 continue  # extraPvc disabled
+
+            # When hostPath is enabled, the modelPvc's storageClassName is
+            # a synthetic label for static PV binding, not a real SC object.
+            if pvc_key == "modelPvc" and hostpath_enabled:
+                context.logger.log_info(
+                    f'StorageClass "{hostpath_sc}" is a synthetic hostPath '
+                    "binding label -- skipping cluster validation"
+                )
+                continue
 
             if sc:
                 storage_classes_to_check.add(sc)
@@ -631,7 +792,7 @@ class ModelNamespaceStep(Step):
         )
         if not result.success or not result.stdout.strip():
             context.logger.log_info(
-                "ℹ️  Could not read openshift.io/sa.scc.uid-range -- " "proxy_uid not set"
+                "ℹ️  Could not read openshift.io/sa.scc.uid-range -- proxy_uid not set"
             )
             return
 

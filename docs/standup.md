@@ -5,9 +5,10 @@
 In order to allow reproducible and flexible experiments, and taking into account that the configuration paramaters have significant impact on the overall performance, it is necessary to provide the user with the ability to `standup` and `teardown` stacks.
 
 ## Methods
-Currently, two main standup methods are supported
+Currently, the following standup methods are supported
 a) "Standalone", with multiple VLLM `pods` controlled by a `deployment` behind a single `service`
 b) "llm-d", which leverages a combination of [llm-d-infra](https://github.com/llm-d-incubation/llm-d-infra.git) and [llm-d-modelservice](https://github.com/llm-d/llm-d-model-service.git) to deploy a full-fledged `llm-d` stack
+c) "No-Kubernetes (`nok8s`)", which runs the routing stack (vLLM + EPP + Envoy) as plain `docker`/`podman` containers on a single host, with **no cluster** -- see [No-Kubernetes deploy method](nok8s.md)
 
 ## Scenarios
 All the information required for the standup of a stack is contained on a "scenario file". This information is encoded in the form of environment variables, with default values defined in `config/defaults.yaml` which can be then overriden inside a [scenario file](../config/scenarios) (YAML-based) or via [specification templates](../config/specification) (Jinja2 `.yaml.j2` files).
@@ -59,6 +60,123 @@ llmdbenchmark --spec examples/multi-model-wva standup -p my-namespace --stack qw
 
 The same flag works on `smoketest`, `run`, and `teardown` with identical
 semantics, so you can scope every lifecycle phase to the same subset.
+
+## Overriding scenario values from the CLI (`--set`)
+
+A scenario variant that differs from an existing one in only a handful of
+fields does not need its own YAML file. Every subcommand that renders
+templates accepts `--set`, which deep-merges dotted-path values on top of
+the scenario:
+
+```bash
+# Run the SGLang flavour of a guide without a separate scenario file
+llmdbenchmark --spec guides/optimized-baseline standup \
+  -t kustomize --set kustomize.acceleratorBackend=gpu/sglang
+```
+
+Pairs are comma-separated and the flag is repeatable. Values are parsed as
+YAML, so `4`, `true`, `[a, b]` and `{x: 1}` mean what they would inside the
+scenario file; commas inside `[]`, `{}` or quotes belong to the value.
+
+> [!WARNING]
+> **Multi-line values are folded onto one line.** A value containing real
+> newlines is read as a YAML plain scalar, so its line breaks collapse into
+> spaces -- which silently changes the meaning of a shell command
+> (`export FOO=1`⏎`vllm serve` becomes `export FOO=1 vllm serve`). To keep
+> the breaks, wrap the value in double quotes so `\n` is an escape:
+> `--set 'decode.vllm.customCommand="export FOO=1\nvllm serve /model-cache/x"'`.
+> For a full multi-line `customCommand`, prefer the scenario file or
+> `--cluster-config` -- `--set` is best suited to single-line values.
+
+> [!IMPORTANT]
+> `--set` always means the **scenario**, on every subcommand. It is not the
+> same as `run`/`experiment`'s `-o/--overrides`, which overrides the
+> **workload profile**. Those two are separate flags and can be combined:
+> `run --set decode.replicas=4 -o max-concurrency=8`. `standup` has no
+> workload profile, so it accepts `--set` only.
+
+The same value can be supplied via `LLMDBENCH_SET`. Pass `--set` to every
+lifecycle phase (`plan`/`standup`/`smoketest`/`run`/`teardown`) so each one
+renders the same plan -- these phases re-render templates, and a phase that
+misses the flag will disagree with what was deployed.
+
+### Scoping overrides in multi-stack scenarios
+
+Prefix the key with a stack name, or an fnmatch glob, to scope an override
+in a [multi-stack scenario](#multi-stack-scenarios). Unprefixed applies to
+every stack:
+
+```bash
+# every stack
+llmdbenchmark --spec examples/multi-model-wva standup --set decode.replicas=2
+
+# one stack; both are still deployed
+llmdbenchmark --spec examples/multi-model-wva standup \
+  --set 'qwen3-06b:decode.replicas=4,llama-31-8b:decode.replicas=1'
+
+# a common floor with one exception
+llmdbenchmark --spec examples/multi-model-wva standup \
+  --set 'wva.hpa.maxReplicas=6' --set 'llama-31-8b:wva.hpa.maxReplicas=2'
+
+# every stack whose name ends in -8b
+llmdbenchmark --spec examples/multi-model-wva standup \
+  --set '*-8b:decode.resources.limits.memory=64Gi'
+```
+
+When several selectors match a stack they are applied by specificity --
+global, then globs, then exact names -- so the exception above wins
+regardless of the order the flags were typed. A selector that matches no
+stack in the scenario is a hard error, not a silent no-op.
+
+`--stack` and override selectors are orthogonal: `--stack` chooses which
+stacks are **deployed**, a selector chooses which stacks are **modified**.
+Note that an unprefixed `--set` applies to every stack even when `--stack`
+narrows the deployment, which differs from `-m/--models` (that one scopes
+itself to a single filtered stack).
+
+### Precedence and limits
+
+Highest wins:
+
+```
+defaults.yaml → shared: → stack block → --cluster-config → --set
+  → DoE setup.treatments → dedicated flags (-m, -t, --gateway-class,
+                                            --monitoring, --wva)
+```
+
+`--set` beats the stack's own block -- unlike a value in `shared:`, which
+loses to it. DoE `setup.treatments` beat `--set`, because the treatment is
+the deliberate sweep factor.
+
+The dedicated flags sit at the top because they are applied by resolver
+functions that run *after* the whole merge, not as another merge layer. So
+`-m facebook/opt-125m` wins over both `--set model.name=...` and a
+treatment that sets `model.name`. Use `--set` for keys with no dedicated
+flag; when a flag exists, the flag is authoritative.
+
+Every applied override is logged with its previous value
+(`[stack] Scenario override: decode.replicas: 1 -> 4`), and an override
+whose *parent* path does not exist warns about a possible typo.
+
+**Lists are assigned whole, never indexed.** A dotted path cannot address a
+list element, so `--set vllmCommon.volumeMounts.0.mountPath=/x` is rejected
+rather than silently replacing the whole list. Assign the list instead:
+
+```bash
+--set 'vllmCommon.volumeMounts=[{name: dshm, mountPath: /dev/shm}]'
+```
+
+(This differs from `run -o`, which overrides the workload profile and *does*
+support list indices.)
+
+Three things overrides cannot do:
+
+- **Add or remove a stack.** Scenarios differing in stack *count* cannot be
+  collapsed into one file.
+- **Change a stack's `name`.** It names the plan output directory and is
+  read before the merge.
+- **Move the workspace via `workDir`.** That is read before rendering; use
+  `--workspace` instead.
 
 ## Multiple steps
 The full standup of a stack is a multi-step process. The [lifecycle](lifecycle.md) document go into more details explaning the meaning of each different individual step.
@@ -141,17 +259,21 @@ The scenario parameters can be roughly categorized in four groups:
 
 | Variable                                     | Meaning                                                                | Note                                                                                                     |
 | -------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| LLMDBENCH_VLLM_MODELSERVICE_GATEWAY_CLASS_NAME | Gateway implementation used for the inference gateway                 | Default=`istio`. Supported: `istio`, `agentgateway`, `gke`, `data-science-gateway-class`, `epponly`.     |
+| LLMDBENCH_VLLM_MODELSERVICE_GATEWAY_CLASS_NAME | Gateway implementation used for the inference gateway                 | Default=`istio`. Supported: `none`, `istio`, `agentgateway`, `gke`, `data-science-gateway-class`, `epponly`.     |
 
 Gateway class options (set via `gateway.className` in the scenario YAML):
 
 | `className`                  | What it deploys                                                                                                  | Use when                                                          |
 |------------------------------|------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------|
-| `istio` (default)            | istio-base + istiod control plane, a Gateway + HTTPRoute, the `inferencepool` GAIE chart                         | Default; most flexible / production deployments                   |
-| `agentgateway`               | agentgateway-crds + agentgateway controller, a Gateway + HTTPRoute, the `inferencepool` GAIE chart               | Want agentgateway's data plane instead of Envoy/Istio             |
-| `gke`                        | Uses GKE-managed Gateway controller; same `inferencepool` GAIE chart                                             | Running on GKE                                                    |
-| `data-science-gateway-class` | OpenDataHub / OpenShift AI managed Gateway                                                                       | Running on OpenShift AI                                           |
-| `epponly`                    | **No** Kubernetes Gateway, **no** HTTPRoute, the `standalone` GAIE chart (EPP with an Envoy sidecar serving HTTP) | You want llm-d's standalone router topology without any gateway   |
+| `none`                       | ModelService decode pods plus a plain ClusterIP Service; **no** Gateway, HTTPRoute, EPP, Envoy, or routing proxy | Measuring direct model-server performance and routing overhead    |
+| `istio` (default)            | istio-base + istiod control plane, a Gateway + HTTPRoute, the `llm-d-router-gateway-dev` chart                       | Default; most flexible / production deployments                   |
+| `agentgateway`               | agentgateway-crds + agentgateway controller, a Gateway + HTTPRoute, the `llm-d-router-gateway-dev` chart             | Want agentgateway's data plane instead of Envoy/Istio             |
+| `gke`                        | Uses GKE-managed Gateway controller; same `llm-d-router-gateway-dev` chart                                           | Running on GKE                                                    |
+| `data-science-gateway-class` | OpenDataHub / OpenShift AI managed Gateway                                                                           | Running on OpenShift AI                                           |
+| `epponly`                    | **No** Kubernetes Gateway, **no** HTTPRoute, the `llm-d-router-standalone-dev` chart (EPP with an Envoy sidecar serving HTTP) | You want llm-d's standalone router topology without any gateway   |
+
+`none` is a baseline lane, not a routing topology. It requires at least one
+decode replica and does not support P/D disaggregation.
 
 ### Overriding `gateway.className` from the CLI
 
@@ -237,10 +359,11 @@ That single change is all that's needed.  The benchmark tool handles everything 
 ([guides/recipes/router/README.md](https://github.com/llm-d/llm-d/blob/main/guides/recipes/router/README.md))
 and used by every well-lit-path guide (e.g.
 [optimized-baseline](https://github.com/llm-d/llm-d/blob/main/guides/optimized-baseline/README.md)).
-The EPP is deployed via the upstream
-`oci://registry.k8s.io/gateway-api-inference-extension/charts/standalone`
-chart, which adds an Envoy sidecar to the EPP pod so HTTP traffic can hit
-the EPP service directly -- no Kubernetes Gateway, no HTTPRoute, no
+The EPP is deployed via the llm-d-owned
+`oci://ghcr.io/llm-d/charts/llm-d-router-standalone-dev`
+chart (migrated from the upstream GAIE-published `standalone` chart),
+which adds an Envoy sidecar to the EPP pod so HTTP traffic can hit the
+EPP service directly -- no Kubernetes Gateway, no HTTPRoute, no
 `llm-d-infra` Helm release.
 
 ```yaml
@@ -260,11 +383,11 @@ When `epponly` is selected, standup automatically:
    or agentgateway CRDs / controllers.
 2. **Skips the `llm-d-infra` Helm release** -- no Gateway resource is created.
 3. **Skips HTTPRoute rendering** -- nothing references a Gateway.
-4. **Swaps the GAIE chart** to the upstream `standalone` chart, which
-   bundles the EPP + Envoy sidecar in a single pod.
+4. **Swaps the router chart** to the `llm-d-router-standalone-dev` chart,
+   which bundles the EPP + Envoy sidecar in a single pod.
 5. **Adds a `port 80 -> targetPort 8081` extraServicePort** to the EPP
    service so HTTP requests reach the Envoy sidecar.
-6. **Points endpoint discovery at `{model_id_label}-gaie-epp:80`** -- the
+6. **Points endpoint discovery at `{model_id_label}-router-epp:80`** -- the
    smoketest and run phase resolve to the EPP service directly instead
    of a Gateway IP.
 
@@ -283,12 +406,12 @@ When `epponly` is selected, standup automatically:
 
 | Aspect                   | Gateway-based (istio / agentgateway / gke)             | `epponly`                                                    |
 |--------------------------|--------------------------------------------------------|--------------------------------------------------------------|
-| GAIE Helm chart          | `inferencepool`                                        | `standalone`                                                 |
+| Router Helm chart        | `llm-d-router-gateway-dev`                             | `llm-d-router-standalone-dev`                                |
 | `llm-d-infra` release    | Installed (creates `Gateway`)                          | **Skipped** (no Gateway needed)                              |
 | HTTPRoute                | Rendered                                               | **Not rendered**                                             |
 | Provider control plane   | istio / agentgateway controller installed via helmfile | **Not installed**                                            |
-| Endpoint                 | `Gateway` resource IP                                  | `{model_id_label}-gaie-epp` Service ClusterIP, port 80       |
-| Number of EPP replicas   | Configurable                                           | **1** (matches default `inferenceExtension.replicas: 1`)     |
+| Endpoint                 | `Gateway` resource IP                                  | `{model_id_label}-router-epp` Service ClusterIP, port 80     |
+| Number of EPP replicas   | Configurable                                           | **1** (matches default `router.epp.replicas: 1`)             |
 | Multi-stack support      | Yes                                                    | **No** (single-stack only)                                   |
 
 #### Example scenario using epponly

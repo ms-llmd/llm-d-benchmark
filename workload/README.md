@@ -56,6 +56,7 @@ workload/
     guidellm-llm-d-benchmark.sh             # guidellm harness wrapper
     inference-perf-llm-d-benchmark.sh       # inference-perf harness wrapper
     inferencemax-llm-d-benchmark.sh         # inferencemax harness wrapper
+    lm-eval-llm-d-benchmark.sh              # lm-eval (accuracy) harness wrapper
     nop-llm-d-benchmark.py                  # No-op harness (testing/validation)
     vllm-benchmark-llm-d-benchmark.sh       # vllm-benchmark harness wrapper
   profiles/                                 # Workload profile templates
@@ -77,6 +78,8 @@ workload/
       summarization_synthetic.yaml.in
     inferencemax/                            # Profiles for inferencemax
       random_concurrent.yaml.in
+    lm-eval/                                 # Profiles for the lm-eval (accuracy) harness
+      accuracy_default.yaml.in
     nop/                                     # Profiles for the no-op harness
       nop.yaml.in
     vllm-benchmark/                          # Profiles for vllm-benchmark
@@ -160,7 +163,10 @@ The harness script runs inside the **benchmark container image** as a Kubernetes
 | `guidellm` | `guidellm-llm-d-benchmark.sh` | `guidellm benchmark` | Load testing with configurable request patterns |
 | `vllm-benchmark` | `vllm-benchmark-llm-d-benchmark.sh` | `vllm bench serve` | vLLM-native benchmarking with latency percentiles |
 | `inferencemax` | `inferencemax-llm-d-benchmark.sh` | Custom Python script | Benchmarking with warmup and random seed control |
+| `lm-eval` | `lm-eval-llm-d-benchmark.sh` | `lm_eval` (lm-evaluation-harness) | Accuracy/quality evaluation against standard tasks (hellaswag, mmlu, piqa, ...) |
 | `nop` | `nop-llm-d-benchmark.py` | No-op | Testing and validation without running real benchmarks |
+
+> **lm-eval smoke test:** the `accuracy_default` profile runs the full task set. For a quick pipeline check, cap samples per task and propagate the override into the harness pod, e.g. `LIMIT=10 llmdbenchmark ... -l lm-eval -w accuracy_default.yaml -g LIMIT ...`.
 
 ### Harness Script Contract
 
@@ -282,6 +288,42 @@ Unknown tokens (not in the substitution map) are left unchanged.
 | Profile | Load Pattern | Data Type | Description |
 |---------|-------------|-----------|-------------|
 | `random_concurrent.yaml.in` | Concurrent | Random | Concurrent random workload |
+
+#### lm-eval (1 profile)
+
+Unlike the load-generation harnesses, `lm-eval` measures **accuracy** rather than throughput/latency. Profiles configure the evaluation tasks instead of a load pattern.
+
+| Profile | Tasks | Sample Cap | Description |
+|---------|-------|-----------|-------------|
+| `accuracy_default.yaml.in` | hellaswag, mmlu, piqa | none (full run) | Full-accuracy evaluation; override with `LIMIT=<n>` env for a quick smoke test |
+
+Profile keys live under an `evaluation:` block (`tasks`, `num_fewshot`, `limit`, `num_concurrent`, `max_gen_toks`). Any key can be overridden at runtime via the matching env var (`TASKS`, `NUM_FEWSHOT`, `LIMIT`, `NUM_CONCURRENT`, `MAX_GEN_TOKS`); `LM_EVAL_BASE_URL` optionally overrides the detected endpoint.
+
+```bash
+# Quick pipeline smoke test: cap samples per task
+LIMIT=10 llmdbenchmark --spec <your-spec> run \
+  -p llmd-bench -l lm-eval -w accuracy_default.yaml -g LIMIT
+
+# Full accuracy run (hellaswag, mmlu, piqa)
+llmdbenchmark --spec <your-spec> run \
+  -p llmd-bench -l lm-eval -w accuracy_default.yaml
+
+# Override tasks / few-shot at runtime via env vars
+TASKS=hellaswag NUM_FEWSHOT=5 llmdbenchmark --spec <your-spec> run \
+  -p llmd-bench -l lm-eval -w accuracy_default.yaml
+```
+
+The PD disaggregation router is intended for generation and currently cannot
+return prompt logprobs required by lm-eval multiple-choice tasks. Run lm-eval
+against a ready decode pod while retaining the same PD deployment:
+
+```bash
+DECODE_IP=$(kubectl get pod -n llmd-pd-disaggregation \
+  -l llm-d.ai/role=decode -o jsonpath='{.items[0].status.podIP}')
+llmdbenchmark --spec guides/pd-disaggregation run \
+  -p llmd-pd-disaggregation -l lm-eval -w accuracy_default.yaml \
+  -U "http://${DECODE_IP}:8000"
+```
 
 #### nop (1 profile)
 
@@ -507,6 +549,59 @@ treatments:
 - `setup.constants` -- merged into every setup treatment's overrides (base values)
 - `setup.treatments[].name` -- identifier for the treatment
 - All other keys in a setup treatment are **config overrides** -- dotted key paths applied to the plan config via deep merge (e.g. `vllmCommon.flags.numCpuBlocks: 500`)
+
+#### Sweeping EPP plugins config (`router.epp.pluginsConfigFile`)
+
+The EPP's inference-scheduling plugin set (prefix-cache routing, predicted-latency
+scoring, queue policies, etc.) is selected by `router.epp.pluginsConfigFile`.
+It flows straight through to the chart at render time:
+
+```
+  router.epp.pluginsConfigFile
+       (set by setup.treatment override)
+                |
+                v
+  config/templates/jinja/12_router-values.yaml.j2
+       -> router.epp.pluginsConfigFile (pass-through)
+                |
+                v
+  llm-d-router-standalone-dev helm chart
+       -> EPP plugins ConfigMap entry selected at startup
+```
+
+Each treatment names one of the plugin config files shipped by the chart (or one
+you've added via `router.epp.pluginsCustomConfig`):
+
+```yaml
+experiment:
+  name: epp-plugin-sweep
+  harness: inference-perf
+  profile: shared_prefix_synthetic.yaml
+
+setup:
+  constants:
+    decode.replicas: 2
+    decode.parallelism.tensor: 2
+  treatments:
+    - name: default-plugins
+      router.epp.pluginsConfigFile: "default-plugins.yaml"
+    - name: precise-prefix
+      router.epp.pluginsConfigFile: "precise-prefix-cache-config.yaml"
+    - name: predicted-latency
+      router.epp.pluginsConfigFile: "predicted-latency-slo-plugins.yaml"
+    - name: wva
+      router.epp.pluginsConfigFile: "wva-plugins.yaml"
+
+treatments:
+  - name: light
+    load.stages[0].rate: 4
+    load.stages[0].duration: 60
+  - name: heavy
+    load.stages[0].rate: 32
+    load.stages[0].duration: 120
+```
+
+Yields 4 setup × 2 run = 8 result sets, each cleanly isolated.
 
 **Treatment keys:**
 - `name` (required) -- identifier used in the experiment ID and rendered profile filename

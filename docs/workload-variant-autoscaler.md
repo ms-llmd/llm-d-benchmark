@@ -63,7 +63,7 @@ llmdbenchmark --spec guides/workload-autoscaling standup  -p <namespace>
 
 The shared cluster-wide infrastructure (`prometheus-adapter`, ClusterRole,
 prometheus-ca ConfigMap) survives teardown automatically - see
-[Section 4](#4-cluster-wide-vs-per-tenant-resources--teardown-semantics)
+[Section 4](#4-cluster-wide-vs-per-tenant-resources-and-teardown-semantics)
 for the full preservation policy.
 
 ---
@@ -208,7 +208,7 @@ What the scenario layout buys you:
   away before the request reaches upstream vLLM, so pods continue to see
   plain `/v1/*` paths.
 - **`flowControl` feature gate on every pool** - enabled in the
-  `shared.inferenceExtension.pluginsCustomConfig` block and inherited by
+  `shared.router.epp.pluginsCustomConfig` block and inherited by
   every stack. This is non-optional for WVA: the controller reads EPP
   queue depth to compute scale signals, and flow-control is what
   exposes queue depth in the metrics.
@@ -313,7 +313,7 @@ chartVersions:
 
 ---
 
-## 4. Cluster-wide vs per-tenant resources & teardown semantics
+## 4. Cluster-wide vs per-tenant resources and teardown semantics
 
 WVA installs a mix of cluster-wide and per-tenant resources. To keep
 multi-tenant clusters healthy, our standup and teardown follow this policy:
@@ -513,11 +513,9 @@ HPA, but it's still considered cluster-hygiene rude to run cluster-scoped.
 
 | Artifact | File |
 |---|---|
-| Chart values rendered into the helm install | [`config/templates/jinja/19_wva-values.yaml.j2`](../config/templates/jinja/19_wva-values.yaml.j2) |
+| Kustomize wrapper for the WVA controller install | [`config/templates/jinja/19_wva-kustomize.yaml.j2`](../config/templates/jinja/19_wva-kustomize.yaml.j2) |
 | WVA namespace label patch | [`config/templates/jinja/23_wva-namespace.yaml.j2`](../config/templates/jinja/23_wva-namespace.yaml.j2) |
-| Per-stack `VariantAutoscaling` | [`config/templates/jinja/27_wva-variantautoscaling.yaml.j2`](../config/templates/jinja/27_wva-variantautoscaling.yaml.j2) |
-| Per-stack `HorizontalPodAutoscaler` | [`config/templates/jinja/28_wva-hpa.yaml.j2`](../config/templates/jinja/28_wva-hpa.yaml.j2) |
-| `prometheus-adapter` values | [`config/templates/jinja/21_prometheus-adapter-values.yaml.j2`](../config/templates/jinja/21_prometheus-adapter-values.yaml.j2) |
+| Per-stack `VariantAutoscaling` + `HorizontalPodAutoscaler` | [`config/templates/jinja/28_wva-scaledobject.yaml.j2`](../config/templates/jinja/28_wva-scaledobject.yaml.j2) |
 | `allow-thanos-querier-api-access` ClusterRole | [`config/templates/jinja/22_prometheus-rbac.yaml.j2`](../config/templates/jinja/22_prometheus-rbac.yaml.j2) |
 | Cluster-wide WVA defaults (chart version, image, monitoring URL) | [`config/templates/values/defaults.yaml`](../config/templates/values/defaults.yaml) (`wva:` and `chartVersions.wva` blocks) |
 | Standup admin install (controller + adapter) | [`llmdbenchmark/standup/steps/step_03_workload_monitoring.py`](../llmdbenchmark/standup/steps/step_03_workload_monitoring.py) |
@@ -547,7 +545,7 @@ llmdbenchmark --spec examples/multi-model-wva standup -p <namespace>
 
 Renders both stacks, installs shared infra (istio, Gateway,
 `infra-llmdbench`, WVA controller, prometheus-adapter, model PVC) once,
-then deploys each pool's `-ms` + `-gaie` + VA + HPA. Downloads run in
+then deploys each pool's `-ms` + `-router` + VA + HPA. Downloads run in
 parallel - wall time ~ slowest model, not the sum. Standup
 auto-chains into the smoketest phase unless you pass
 `--skip-smoketest`.
@@ -663,7 +661,7 @@ llmdbenchmark --spec guides/multi-model-wva teardown -p <namespace> \
   --stack llama-31-8b
 ```
 
-Uninstalls the `llama-31-8b-ms` and `llama-31-8b-gaie` Helm releases
+Uninstalls the `llama-31-8b-ms` and `llama-31-8b-router` Helm releases
 (plus their VA + HPA), leaves `qwen3-06b` and the shared
 `infra-llmdbench` + WVA controller + prometheus-adapter in place.
 Useful for cost management - shrink to one pool over a weekend

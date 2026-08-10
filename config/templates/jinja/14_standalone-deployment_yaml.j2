@@ -77,7 +77,12 @@ spec:
         {{ key }}: "{{ value }}"
 {% endfor %}
 {% endif %}
-{% if (standalone.parallelism.tensor | int) > 0 %}
+{% if (standalone.parallelism.tensor | int) > 0
+  and standalone.acceleratorType is defined
+  and standalone.acceleratorType.labelKey is defined
+  and standalone.acceleratorType.labelKey
+  and ((standalone.acceleratorType.labelValues is defined and standalone.acceleratorType.labelValues)
+       or (standalone.acceleratorType.labelValue is defined and standalone.acceleratorType.labelValue)) %}
 {# GPU scenario — use acceleratorType-based nodeAffinity #}
       affinity:
         nodeAffinity:
@@ -149,6 +154,13 @@ spec:
         env:
         - name: HOME
           value: "{{ vllmCommon.containerHome }}"
+        # Workaround for https://github.com/vllm-project/vllm/issues/44548
+        # (vLLM v0.20.0+ with torch 2.11). torch._inductor's cache_dir() calls
+        # getpass.getuser() -> pwd.getpwuid(uid), which raises KeyError on
+        # OpenShift's random UIDs that aren't in the container's /etc/passwd.
+        # Setting USER bypasses the lookup; the value is arbitrary.
+        - name: USER
+          value: "llm-d"
         - name: HF_HOME
           value: "{{ vllmCommon.hfHome }}"
         - name: VLLM_CACHE_ROOT
@@ -239,7 +251,12 @@ spec:
         - name: LLMDBENCH_VLLM_COMMON_MODEL_LOADER_EXTRA_CONFIG
           value: "{{ standalone.vllm.modelLoaderExtraConfig }}"
         - name: LLMDBENCH_VLLM_COMMON_AFFINITY
-{% if (standalone.parallelism.tensor | int) > 0 %}
+{% if (standalone.parallelism.tensor | int) > 0
+  and standalone.acceleratorType is defined
+  and standalone.acceleratorType.labelKey is defined
+  and standalone.acceleratorType.labelKey
+  and standalone.acceleratorType.labelValue is defined
+  and standalone.acceleratorType.labelValue %}
           value: "nvidia.com/gpu:{{ standalone.acceleratorType.labelKey }}:{{ standalone.acceleratorType.labelValue }}"
 {% elif affinity is defined and affinity.enabled and affinity.nodeSelector is defined and affinity.nodeSelector %}
 {% set ns_items = affinity.nodeSelector.items() | list %}
@@ -256,6 +273,14 @@ spec:
 {% endif %}
         - name: HOME
           value: "{{ vllmCommon.containerHome }}"
+        # Workaround for https://github.com/vllm-project/vllm/issues/44548:
+        # vLLM v0.20.0+ (torch 2.11) calls getpass.getuser() at import time,
+        # which raises KeyError under OpenShift's restricted-v2 SCC (random
+        # UID not in /etc/passwd). Setting USER bypasses the pwd lookup; the
+        # value is arbitrary. Without this the standalone pod CrashLoopBackOffs
+        # on restricted-v2 (CI) while running fine under anyuid (dev ns).
+        - name: USER
+          value: "llm-d"
         - name: HF_HOME
           value: "{{ vllmCommon.hfHome }}"
         - name: MODEL_NAME
@@ -459,7 +484,12 @@ spec:
         - name: LLMDBENCH_VLLM_COMMON_MODEL_LOADER_EXTRA_CONFIG
           value: "{{ standalone.vllm.modelLoaderExtraConfig }}"
         - name: LLMDBENCH_VLLM_COMMON_AFFINITY
-{% if (standalone.parallelism.tensor | int) > 0 %}
+{% if (standalone.parallelism.tensor | int) > 0
+  and standalone.acceleratorType is defined
+  and standalone.acceleratorType.labelKey is defined
+  and standalone.acceleratorType.labelKey
+  and standalone.acceleratorType.labelValue is defined
+  and standalone.acceleratorType.labelValue %}
           value: "nvidia.com/gpu:{{ standalone.acceleratorType.labelKey }}:{{ standalone.acceleratorType.labelValue }}"
 {% elif affinity is defined and affinity.enabled and affinity.nodeSelector is defined and affinity.nodeSelector %}
 {% set ns_items = affinity.nodeSelector.items() | list %}

@@ -16,7 +16,9 @@ from typing import Any
 class TokenDef:
     """A REPLACE_ENV_* profile token definition."""
 
-    config_path: str | None  # dotted path into plan config.yaml, or None for runtime-only
+    config_path: (
+        str | None
+    )  # dotted path into plan config.yaml, or None for runtime-only
     description: str
 
 
@@ -90,6 +92,7 @@ def build_env_map(
 
 def render_profile(template_content: str, env_map: dict[str, str]) -> str:
     """Replace REPLACE_ENV_{KEY} tokens in template_content. Unknown tokens are left as-is."""
+
     def _replace(match: re.Match) -> str:
         key = match.group(1)
         return env_map.get(key, match.group(0))
@@ -110,34 +113,145 @@ def render_profile_file(
     return dest_path
 
 
-def apply_overrides(profile_content: str, overrides: dict[str, str]) -> str:
+# Dotted-key prefixes that flag a workload-treatment override as actually
+# being a plan/scenario field. These never match the workload profile YAML,
+# so a treatment override on one is a silent no-op; to vary them the user
+# wants ``setup.treatments`` or ``kustomize.extraHelmSets`` instead.
+# ``classify_override_miss`` returns a sharper hint for these prefixes.
+_PLAN_LEVEL_PREFIXES: tuple[str, ...] = (
+    "decode.",
+    "prefill.",
+    "standalone.",
+    "modelservice.",
+    "fma.",
+    "kustomize.",
+    "router.",
+    "vllmCommon.",
+    "model.",
+    "scheduler.",  # gentle warning -- could also be the K8s pod scheduler
+    "schedulerName",  # top-level K8s pod scheduler
+    "gateway.",
+    "routing.",
+    "storage.",
+    "wva.",
+    "huggingface.",
+)
+
+
+def classify_override_miss(key: str) -> str:
+    """Build a one-line hint for a workload-treatment override that didn't match.
+
+    Two classes:
+
+    - Plan/scenario field. Workload-treatment overrides only touch the
+      rendered profile YAML; we point at ``setup.treatments`` or
+      ``kustomize.extraHelmSets``.
+    - Typo / wrong harness.
+    """
+    if any(key.startswith(p) for p in _PLAN_LEVEL_PREFIXES):
+        return (
+            f"override '{key}' looks like a plan/scenario field; "
+            "workload-treatment overrides only touch the rendered profile YAML "
+            "(load.*, data.*, api.*, etc.). To vary this field, move it to "
+            "setup.treatments in an experiment YAML (modelservice/standalone "
+            "standups) or kustomize.extraHelmSets (kustomize standups)."
+        )
+    return (
+        f"override '{key}' did not match any path in the workload profile "
+        "and was silently dropped. Check the profile YAML for the correct "
+        "dotted path (typo? wrong harness?)."
+    )
+
+
+_MISSING = object()
+
+
+def _descend(container: Any, part: str) -> Any:
+    """Step one level into a dict key or a list index.
+
+    Returns the child node, or ``_MISSING`` if ``part`` doesn't address an
+    existing element. Integer-looking ``part`` values index into lists, so
+    dotted paths can traverse list elements.
+    """
+    if isinstance(container, dict):
+        return container[part] if part in container else _MISSING
+    if isinstance(container, list):
+        try:
+            idx = int(part)
+        except ValueError:
+            return _MISSING
+        if -len(container) <= idx < len(container):
+            return container[idx]
+    return _MISSING
+
+
+def _assign(container: Any, part: str, value: Any) -> bool:
+    """Set ``part`` on the parent ``container`` (dict key or list index).
+
+    Returns True on success. A list index must already be in range (we set,
+    never append/grow); a bad index or non-container parent fails.
+    """
+    if isinstance(container, dict):
+        container[part] = value
+        return True
+    if isinstance(container, list):
+        try:
+            idx = int(part)
+        except ValueError:
+            return False
+        if -len(container) <= idx < len(container):
+            container[idx] = value
+            return True
+    return False
+
+
+def apply_overrides(
+    profile_content: str, overrides: dict[str, str]
+) -> tuple[str, list[str]]:
     """Apply dotted key=value overrides to a rendered YAML profile.
 
-    Parses the YAML, walks dotted keys to set values, and re-dumps.
-    Falls back to the original content if YAML parsing fails.
+    Parses the YAML, walks dotted keys to set values, and re-dumps. Path
+    segments address dict keys or (when integer-looking) list indices.
+
+    Returns ``(rendered_content, unmatched_keys)``, where ``unmatched_keys``
+    are override keys whose dotted path did not exist in the profile. The
+    caller is expected to log a warning per unmatched key (see
+    :func:`classify_override_miss` for a pre-built hint).
+
+    Falls back to ``(original_content, [])`` if YAML parsing fails.
     """
     import yaml  # pylint: disable=import-outside-toplevel
 
     try:
         data = yaml.safe_load(profile_content)
         if not isinstance(data, dict):
-            return profile_content
+            return profile_content, []
 
+        # An override is "unmatched" when a PARENT key along its dotted path
+        # doesn't exist, so we can't reach the leaf to write to. A missing
+        # leaf on a dict parent is still allowed (add-new-field overrides);
+        # a list parent requires an in-range index (see _assign).
+        unmatched: list[str] = []
         for key, value in overrides.items():
             parts = key.split(".")
             target = data
+            parent_chain_intact = True
             for part in parts[:-1]:
-                if isinstance(target, dict) and part in target:
-                    target = target[part]
-                else:
-                    target = None
+                target = _descend(target, part)
+                if target is _MISSING:
+                    parent_chain_intact = False
                     break
-            if isinstance(target, dict):
-                target[parts[-1]] = _coerce_value(value)
+            if not parent_chain_intact or not _assign(
+                target, parts[-1], _coerce_value(value)
+            ):
+                unmatched.append(key)
 
-        return yaml.dump(data, default_flow_style=False, sort_keys=False)
+        return (
+            yaml.dump(data, default_flow_style=False, sort_keys=False),
+            unmatched,
+        )
     except yaml.YAMLError:
-        return profile_content
+        return profile_content, []
 
 
 def _coerce_value(value: str):

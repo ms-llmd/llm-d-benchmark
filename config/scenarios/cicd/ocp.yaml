@@ -2,7 +2,8 @@
 # Based on scenarios/cicd/ocp_fb.sh
 #
 # CI/CD scenario for OpenShift clusters.
-# Uses facebook/opt-125m for fast validation with Istio gateway.
+# Uses Qwen/Qwen3-8B so the standalone baseline and FMA nightlies exercise a
+# representative model whose cold start is measurable.
 # GPU affinity is auto-detected (commented out in original).
 
 scenario:
@@ -10,10 +11,13 @@ scenario:
 
     # Model
     model:
-      name: facebook/opt-125m
-      shortName: facebook-opt-125m
-      path: models/facebook/opt-125m
-      huggingfaceId: facebook/opt-125m
+      name: Qwen/Qwen3-8B
+      shortName: qwen-qwen3-8b
+      path: models/Qwen/Qwen3-8B
+      huggingfaceId: Qwen/Qwen3-8B
+      # Keeping it similar to FMA launcher's vLLM (24_fma-deployment.yaml.j2)
+      maxModelLen: 40960
+      blockSize: 16
 
     # Deployment method
     modelservice:
@@ -22,7 +26,7 @@ scenario:
       enabled: false
     fma:
       enabled: false
-      iterations: 5
+      iterations: 10
 
 #    gateway:
 #      className: istio
@@ -63,6 +67,13 @@ scenario:
 
     vllmCommon:
       priorityClassName: nightly-gpu-critical
+      flags:
+        # Disable enforce_eager so the standalone vLLM runs torch.compile +
+        # CUDA-graph capture -- otherwise Dynamo / Torch Compile / Memory
+        # Profiling metrics are all 0 (those phases are skipped under eager).
+        enforceEager: false
+        # FMA runs with prefix caching off (--no-enable-prefix-caching)
+        noPrefixCaching: true
 
     workDir: /tmp/llmdbenchcicd-ocp/
 

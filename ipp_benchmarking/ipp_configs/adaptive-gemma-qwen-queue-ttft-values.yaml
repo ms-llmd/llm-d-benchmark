@@ -1,0 +1,64 @@
+# Same experiment as adaptive-gemma-qwen-smart-values.yaml, on the queue-ttft image
+# (build 8eaa3ca). That image registers the scorer as `queue-ttft-scorer` (no
+# `ttft-aware-scorer`, no anchorGapScale) and its extractor takes inflightEmaAlpha/
+# lowLoadWindowAge instead of the p25 bucket params -- plugin list and params follow
+# ipp-pr188 examples/medianttft-values.yaml.
+#
+# NO name filter: this build registers none, and model-selector scores over every model in
+# models.json regardless of the request's `model` field (which it then overwrites). So a
+# pinned stream CANNOT be pinned here -- every request is routed.
+provider:
+  supportedEvents:
+    requestTrailers: true
+    responseHeaders: true
+    responseBody: true
+payloadProcessor:
+  image:
+    # Build the IPP yourself and supply your own registry, e.g.
+    #   --set payloadProcessor.image.registry=ghcr.io/<you>
+    # The tag below names the IPP build this arm requires.
+    repository: llm-d-inference-payload-processor
+    tag: queue-ttft
+    pullPolicy: Always
+  listModels:
+    - RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic
+    - Qwen/Qwen3.6-35B-A3B-FP8
+  customConfig:
+    plugins:
+    - type: body-field-to-header
+      parameters:
+        fieldName: model
+        headerName: X-Gateway-Model-Name
+    - type: base-model-to-header
+    - type: model-selector
+    - type: queue-ttft-scorer
+      parameters:
+        explorationRate: 0.1
+    - type: max-score-picker
+    - type: ttft-percentile-extractor
+      parameters:
+        intervalDuration: 1s
+        windowSize: 5000
+        maxObservationAge: 3m
+        inflightEmaAlpha: 0.2
+        lowLoadWindowAge: 1h
+        maxRequests: 100
+        minRequests: 20
+    - type: model-config-datasource
+      parameters:
+        modelsPath: /config/models.json
+    profiles:
+    - name: default
+      plugins:
+        request:
+        - pluginRef: model-selector
+        - pluginRef: queue-ttft-scorer
+          weight: 1.0
+        - pluginRef: max-score-picker
+        - pluginRef: body-field-to-header
+        - pluginRef: base-model-to-header
+    datalayer:
+      extractors:
+      - pluginRef: ttft-percentile-extractor
+      datasources:
+      - pluginRef: model-config-datasource

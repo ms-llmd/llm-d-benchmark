@@ -4,7 +4,7 @@ Behavior under test:
 - Full-scenario teardown (no ``--stack`` filter): controller is uninstalled.
 - Partial-stack teardown (``--stack X`` filter set): controller is preserved.
 - ``--deep``: controller is uninstalled regardless of filter.
-- Per-stack VariantAutoscaling + HPA are always deleted, regardless of mode.
+- Per-stack KEDA ScaledObject is always deleted, regardless of mode.
 - Non-OpenShift platforms: WVA teardown is skipped entirely.
 """
 
@@ -18,7 +18,6 @@ import pytest
 import yaml
 
 from llmdbenchmark.teardown.steps.step_01_uninstall_helm import UninstallHelmStep
-
 
 # ---------------------------------------------------------------------------
 # Stubs / fixtures
@@ -74,7 +73,14 @@ class _StubContext:
     logger: _StubLogger = field(default_factory=_StubLogger)
 
 
-def _write_stack(tmp_path: Path, name: str, *, wva_ns: str, model_id: str) -> Path:
+def _write_stack(
+    tmp_path: Path,
+    name: str,
+    *,
+    wva_ns: str,
+    model_id: str,
+    fma_enabled: bool = False,
+) -> Path:
     """Create a rendered-stack directory with a wva-enabled config.yaml."""
     stack_dir = tmp_path / name
     stack_dir.mkdir(parents=True)
@@ -82,8 +88,18 @@ def _write_stack(tmp_path: Path, name: str, *, wva_ns: str, model_id: str) -> Pa
         "wva": {"enabled": True, "namespace": wva_ns},
         "namespace": {"name": wva_ns},
         "model_id_label": model_id,
+        "fma": {"enabled": fma_enabled},
     }
     (stack_dir / "config.yaml").write_text(yaml.safe_dump(cfg))
+    kustomization = (
+        "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+        "kind: Kustomization\n"
+        f"namespace: {wva_ns}\n"
+        "resources:\n"
+        "- github.com/llm-d/llm-d-workload-variant-autoscaler/"
+        "config/overlays/namespace-scoped/openshift?ref=main\n"
+    )
+    (stack_dir / "19_wva-kustomize.yaml").write_text(kustomization)
     return stack_dir
 
 
@@ -92,19 +108,43 @@ def _write_stack(tmp_path: Path, name: str, *, wva_ns: str, model_id: str) -> Pa
 # ---------------------------------------------------------------------------
 
 
-def _controller_was_uninstalled(cmd: _StubCmd) -> bool:
-    return any(
-        "uninstall" in args and "workload-variant-autoscaler" in args
-        for args in cmd.helm_calls
-    )
-
-
-def _va_hpa_deleted_for(cmd: _StubCmd, model_id: str) -> bool:
-    expected = f"{model_id}-decode"
-    return any(
-        "delete" in args and expected in args
+def _kustomize_delete_calls(cmd: _StubCmd) -> list[tuple]:
+    """All ``kubectl delete -k <dir> ...`` invocations recorded on the stub."""
+    return [
+        args
         for args in cmd.kube_calls
-    )
+        if len(args) >= 2 and args[0] == "delete" and "-k" in args
+    ]
+
+
+def _controller_was_uninstalled(cmd: _StubCmd) -> bool:
+    """Detect a ``kubectl delete -k`` (kustomize-based controller uninstall)."""
+    return len(_kustomize_delete_calls(cmd)) > 0
+
+
+def _kustomize_delete_namespaces(cmd: _StubCmd) -> set[str]:
+    """Read the staged kustomization.yaml at each delete-k call's tempdir
+    and pull out the ``namespace:`` field. Used to verify per-namespace
+    coverage when multiple WVA namespaces are torn down in one pass."""
+    namespaces: set[str] = set()
+    for args in _kustomize_delete_calls(cmd):
+        # args looks like ("delete", "-k", "<tempdir>", "--ignore-not-found")
+        idx = args.index("-k") + 1
+        kustomize_dir = Path(args[idx])
+        kfile = kustomize_dir / "kustomization.yaml"
+        if not kfile.exists():
+            continue
+        body = yaml.safe_load(kfile.read_text()) or {}
+        ns = body.get("namespace")
+        if ns:
+            namespaces.add(ns)
+    return namespaces
+
+
+def _va_hpa_deleted_for(cmd: _StubCmd, model_id: str, *, fma: bool = False) -> bool:
+    suffix = "fma" if fma else "decode"
+    expected = f"{model_id}-{suffix}"
+    return any("delete" in args and expected in args for args in cmd.kube_calls)
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +170,7 @@ class TestWvaTeardownPolicy:
 
         assert _controller_was_uninstalled(cmd), (
             f"Expected controller uninstall on full-scenario teardown; "
-            f"helm calls={cmd.helm_calls}"
+            f"kube calls={cmd.kube_calls}"
         )
         assert _va_hpa_deleted_for(cmd, "modelA")
         assert _va_hpa_deleted_for(cmd, "modelB")
@@ -152,11 +192,11 @@ class TestWvaTeardownPolicy:
 
         assert not _controller_was_uninstalled(cmd), (
             f"Expected controller preservation under --stack filter; "
-            f"helm calls={cmd.helm_calls}"
+            f"kube calls={cmd.kube_calls}"
         )
-        assert any(
-            "Preserving WVA controller" in m for m in ctx.logger.messages
-        ), f"Expected preservation log message; got: {ctx.logger.messages}"
+        assert any("Preserving WVA controller" in m for m in ctx.logger.messages), (
+            f"Expected preservation log message; got: {ctx.logger.messages}"
+        )
 
     def test_deep_clean_uninstalls_controller_even_with_stack_filter(
         self, tmp_path: Path
@@ -176,7 +216,7 @@ class TestWvaTeardownPolicy:
 
         assert _controller_was_uninstalled(cmd), (
             f"Expected --deep to force controller uninstall; "
-            f"helm calls={cmd.helm_calls}"
+            f"kube calls={cmd.kube_calls}"
         )
 
     def test_non_openshift_skips_entirely(self, tmp_path: Path) -> None:
@@ -210,24 +250,49 @@ class TestWvaTeardownPolicy:
 
         step._teardown_wva(cmd, ctx, errors=[])
 
-        # Controller uninstalled once per unique namespace
-        ns_uninstalls = [
-            args for args in cmd.helm_calls
-            if "uninstall" in args and "workload-variant-autoscaler" in args
-        ]
-        namespaces = {args[args.index("--namespace") + 1] for args in ns_uninstalls}
-        assert namespaces == {"ns1", "ns2"}, (
+        # Controller uninstalled once per unique WVA namespace -- verified by
+        # reading the staged kustomization.yaml from each delete-k tempdir.
+        assert _kustomize_delete_namespaces(cmd) == {"ns1", "ns2"}, (
             f"Expected controller uninstall in both ns1 and ns2; "
-            f"got {namespaces}"
+            f"got namespaces={_kustomize_delete_namespaces(cmd)}; "
+            f"kube calls={cmd.kube_calls}"
+        )
+
+    def test_fma_enabled_stack_uses_fma_suffix(self, tmp_path: Path) -> None:
+        """Under fma.enabled the per-stack VA + HPA names use ``-fma`` suffix."""
+        step = UninstallHelmStep()
+        ctx = _StubContext(
+            rendered_stacks=[
+                _write_stack(
+                    tmp_path,
+                    "stack-fma",
+                    wva_ns="ns1",
+                    model_id="modelA",
+                    fma_enabled=True,
+                ),
+            ],
+            stack_filter=None,
+        )
+        cmd = _StubCmd()
+
+        step._teardown_wva(cmd, ctx, errors=[])
+
+        assert _va_hpa_deleted_for(cmd, "modelA", fma=True), (
+            f"Expected VA/HPA delete with -fma suffix under fma.enabled; "
+            f"kube calls={cmd.kube_calls}"
+        )
+        assert not _va_hpa_deleted_for(cmd, "modelA", fma=False), (
+            f"Did not expect -decode suffix when fma.enabled is true; "
+            f"kube calls={cmd.kube_calls}"
         )
 
     @pytest.mark.parametrize(
         "stack_filter,deep,expected_uninstall",
         [
-            (None, False, True),       # full scenario: uninstall
-            (None, True, True),        # full scenario + deep: uninstall
+            (None, False, True),  # full scenario: uninstall
+            (None, True, True),  # full scenario + deep: uninstall
             (["stack-a"], False, False),  # partial: preserve
-            (["stack-a"], True, True),    # partial + deep: uninstall
+            (["stack-a"], True, True),  # partial + deep: uninstall
         ],
     )
     def test_policy_matrix(
@@ -252,5 +317,122 @@ class TestWvaTeardownPolicy:
         assert _controller_was_uninstalled(cmd) == expected_uninstall, (
             f"stack_filter={stack_filter}, deep={deep}: "
             f"expected uninstall={expected_uninstall}, "
-            f"helm calls={cmd.helm_calls}"
+            f"kube calls={cmd.kube_calls}"
         )
+
+
+# ---------------------------------------------------------------------------
+# _uninstall_releases: handling of releases stuck in a transitional state
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ListStubCmd(_StubCmd):
+    """Stub whose ``helm list`` returns a canned JSON payload of releases."""
+
+    releases: list[dict] = field(default_factory=list)
+
+    def helm(self, *args: str, **kwargs: Any) -> _StubResult:
+        self.helm_calls.append(args)
+        if args and args[0] == "list":
+            import json as _json
+
+            return _StubResult(success=True, stdout=_json.dumps(self.releases))
+        return _StubResult(success=True)
+
+
+def _secret_delete_calls(cmd: _StubCmd) -> list[tuple]:
+    """All ``kube delete secret ...`` invocations recorded on the stub."""
+    return [
+        args
+        for args in cmd.kube_calls
+        if len(args) >= 2 and args[0] == "delete" and args[1] == "secret"
+    ]
+
+
+def _helm_uninstall_calls(cmd: _StubCmd) -> list[tuple]:
+    return [args for args in cmd.helm_calls if args and args[0] == "uninstall"]
+
+
+class TestUninstallReleasesWedged:
+    def test_wedged_release_secret_deleted_not_uninstalled(self) -> None:
+        """A release stuck 'uninstalling' has its release secret deleted
+        directly; `helm uninstall` is NOT (re-)issued for it."""
+        step = UninstallHelmStep()
+        ctx = _StubContext()
+        cmd = _ListStubCmd(
+            releases=[
+                {"name": "mymodel-router", "status": "uninstalling"},
+            ]
+        )
+        errors: list = []
+
+        step._uninstall_releases(
+            cmd, ctx, "ns1", release="", model_labels=["mymodel"], errors=errors
+        )
+
+        # list enumerates every status so transitional releases are visible
+        # (replaces the v3-only `--all` flag with the individual filters
+        # accepted by both Helm v3 and v4).
+        list_calls = [a for a in cmd.helm_calls if a and a[0] == "list"]
+        assert list_calls
+        for status in (
+            "--deployed",
+            "--failed",
+            "--pending",
+            "--uninstalled",
+            "--uninstalling",
+            "--superseded",
+        ):
+            assert status in list_calls[0]
+
+        deletes = _secret_delete_calls(cmd)
+        assert len(deletes) == 1
+        assert "owner=helm,name=mymodel-router" in deletes[0]
+        assert _helm_uninstall_calls(cmd) == []
+        assert errors == []
+
+    def test_healthy_release_uninstalled_normally(self) -> None:
+        """A deployed release is uninstalled via `helm uninstall`, not by
+        deleting its secret."""
+        step = UninstallHelmStep()
+        ctx = _StubContext()
+        cmd = _ListStubCmd(
+            releases=[
+                {"name": "mymodel-router", "status": "deployed"},
+            ]
+        )
+        errors: list = []
+
+        step._uninstall_releases(
+            cmd, ctx, "ns1", release="", model_labels=["mymodel"], errors=errors
+        )
+
+        assert _secret_delete_calls(cmd) == []
+        uninstalls = _helm_uninstall_calls(cmd)
+        assert len(uninstalls) == 1
+        assert "mymodel-router" in uninstalls[0]
+
+    def test_unrelated_release_ignored(self) -> None:
+        """A release matching neither the release name nor any model label is
+        left untouched."""
+        step = UninstallHelmStep()
+        ctx = _StubContext()
+        cmd = _ListStubCmd(
+            releases=[
+                {"name": "someone-elses-thing", "status": "uninstalling"},
+            ]
+        )
+        errors: list = []
+
+        step._uninstall_releases(
+            cmd,
+            ctx,
+            "ns1",
+            release="myrelease",
+            model_labels=["mymodel"],
+            errors=errors,
+        )
+
+        assert _secret_delete_calls(cmd) == []
+        assert _helm_uninstall_calls(cmd) == []

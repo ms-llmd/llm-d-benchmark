@@ -12,6 +12,7 @@ from llmdbenchmark.utilities.profile_renderer import (
     build_env_map,
     render_profile_file,
     apply_overrides,
+    classify_override_miss,
 )
 
 
@@ -60,38 +61,38 @@ class RenderProfilesStep(Step):
             default="sanity_random.yaml",
         )
 
-        # Locate source profiles directories. Search the standard location plus
-        # the ipp_benchmarking overlay, so bundle profiles resolve without copying
-        # them into workload/profiles/. The standard location wins on conflicts.
+        # Locate source profiles directory
         base_dir = context.base_dir or Path(__file__).resolve().parents[3]
-        profile_dirs = [
-            d
-            for d in (
-                base_dir / "workload" / "profiles" / harness_name,
-                base_dir / "ipp_benchmarking" / "workload" / "profiles" / harness_name,
-            )
-            if d.is_dir()
-        ]
-        if not profile_dirs:
+        workload_file_path = getattr(context, "workload_file_path", None)
+        source_profile_file: Path | None = None
+        profiles_source: Path | None = None
+        if workload_file_path:
+            source_profile_file = Path(workload_file_path).expanduser()
+            if not source_profile_file.is_absolute():
+                source_profile_file = Path.cwd() / source_profile_file
+            if not source_profile_file.is_file():
+                errors.append(f"Workload profile file not found: {source_profile_file}")
+                return StepResult(
+                    step_number=self.number,
+                    step_name=self.name,
+                    success=False,
+                    message="Workload profile file not found",
+                    errors=errors,
+                    stack_name=stack_name,
+                )
+            profile_name = source_profile_file.name
+        else:
             profiles_source = base_dir / "workload" / "profiles" / harness_name
-            errors.append(f"Profiles directory not found: {profiles_source}")
-            return StepResult(
-                step_number=self.number,
-                step_name=self.name,
-                success=False,
-                message="Profile source directory not found",
-                errors=errors,
-                stack_name=stack_name,
-            )
-        profiles_source = profile_dirs[0]
-
-        def _find_profile(name: str) -> Path | None:
-            """First match for ``name`` (or ``name.in``) across profile dirs."""
-            for d in profile_dirs:
-                for cand in (d / name, d / f"{name}.in"):
-                    if cand.exists():
-                        return cand
-            return None
+            if not profiles_source.is_dir():
+                errors.append(f"Profiles directory not found: {profiles_source}")
+                return StepResult(
+                    step_number=self.number,
+                    step_name=self.name,
+                    success=False,
+                    message="Profile source directory not found",
+                    errors=errors,
+                    stack_name=stack_name,
+                )
 
         # CLI flags and runtime values override plan_config defaults
         runtime_values: dict[str, str] = {
@@ -106,15 +107,30 @@ class RenderProfilesStep(Step):
 
         dataset_file_override: str | None = None
         if context.dataset_url:
-            # Trailing slash => directory replay: DIR is the full path, FILE is empty.
-            # Otherwise (path ends with a filename/extension) => single-file replay:
-            # DIR is the parent, FILE is the basename.
+            # For s3:// URLs the harness shell script downloads the file into
+            # /requests/datasets/ at pod runtime, so DIR must point at the
+            # local landing path, not at the s3:// prefix. For local-style
+            # URLs we still treat them as filesystem paths.
+            #
+            # Trailing slash => directory replay: DIR is the (resolved) path,
+            # FILE is empty.
+            # Otherwise (path ends with a filename/extension) => single-file
+            # replay: DIR is the parent (or the local landing dir for s3://),
+            # FILE is the basename.
+            is_s3 = context.dataset_url.startswith("s3://")
+            s3_local_dir = "/requests/datasets"
             if context.dataset_url.endswith("/"):
-                runtime_values["LLMDBENCH_RUN_DATASET_DIR"] = context.dataset_url
+                if is_s3:
+                    runtime_values["LLMDBENCH_RUN_DATASET_DIR"] = s3_local_dir
+                else:
+                    runtime_values["LLMDBENCH_RUN_DATASET_DIR"] = context.dataset_url
                 dataset_file_override = ""
             else:
                 dir_part, file_part = posixpath.split(context.dataset_url)
-                runtime_values["LLMDBENCH_RUN_DATASET_DIR"] = dir_part
+                if is_s3:
+                    runtime_values["LLMDBENCH_RUN_DATASET_DIR"] = s3_local_dir
+                else:
+                    runtime_values["LLMDBENCH_RUN_DATASET_DIR"] = dir_part
                 runtime_values["LLMDBENCH_RUN_DATASET_FILE"] = file_part
 
         env_map = build_env_map(
@@ -124,13 +140,21 @@ class RenderProfilesStep(Step):
         if dataset_file_override is not None:
             env_map["LLMDBENCH_RUN_DATASET_FILE"] = dataset_file_override
 
+        if getattr(context, "harness_debug", False) and workload_file_path is None:
+            return self._render_all_debug_profiles(
+                context,
+                base_dir,
+                env_map,
+                stack_name,
+            )
+
         # Output directory for rendered profiles
         output_dir = context.workload_profiles_dir() / harness_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Copy all profiles to output first (non-.yaml.in files are copied as-is)
-        for d in profile_dirs:
-            for src_file in d.iterdir():
+        if profiles_source is not None:
+            for src_file in profiles_source.iterdir():
                 if src_file.is_file() and not src_file.name.endswith(".yaml.in"):
                     shutil.copy2(src_file, output_dir / src_file.name)
 
@@ -139,13 +163,17 @@ class RenderProfilesStep(Step):
 
         if not treatments:
             # Single default treatment -- render the profile as-is
-            source_file = _find_profile(profile_name)
+            source_file = self._resolve_source_file(
+                profile_name, profiles_source, source_profile_file
+            )
             if source_file is not None:
                 # Determine output name (strip .in if present)
                 out_name = profile_name
                 if out_name.endswith(".in"):
                     out_name = out_name[:-3]
                 dest_file = output_dir / out_name
+                if source_profile_file is not None:
+                    context.harness_profile = out_name
 
                 if context.dry_run:
                     context.logger.log_info(
@@ -164,7 +192,9 @@ class RenderProfilesStep(Step):
                 treatment_name = treatment.get("name", f"treatment-{i}")
                 treatment_overrides = treatment.get("overrides", {})
 
-                source_file = _find_profile(profile_name)
+                source_file = self._resolve_source_file(
+                    profile_name, profiles_source, source_profile_file
+                )
                 if source_file is None:
                     errors.append(
                         f"Profile '{profile_name}' not found for treatment "
@@ -175,6 +205,8 @@ class RenderProfilesStep(Step):
                 out_name = profile_name
                 if out_name.endswith(".in"):
                     out_name = out_name[:-3]
+                if source_profile_file is not None:
+                    context.harness_profile = out_name
                 # Append treatment name to output file
                 stem = Path(out_name).stem
                 suffix = Path(out_name).suffix
@@ -192,8 +224,20 @@ class RenderProfilesStep(Step):
                 # Apply treatment-specific overrides
                 if treatment_overrides:
                     rendered_content = dest_file.read_text(encoding="utf-8")
-                    overridden = apply_overrides(rendered_content, treatment_overrides)
+                    overridden, unmatched = apply_overrides(
+                        rendered_content, treatment_overrides
+                    )
                     dest_file.write_text(overridden, encoding="utf-8")
+                    # Surface silent no-ops: a treatment override whose parent
+                    # path doesn't exist in the workload profile (most often a
+                    # plan-level field like decode.replicas or
+                    # router.epp.pluginsConfigFile placed under the
+                    # top-level treatments: block instead of setup.treatments).
+                    for missed_key in unmatched:
+                        context.logger.log_warning(
+                            f"Treatment '{treatment_name}': "
+                            + classify_override_miss(missed_key)
+                        )
 
                 context.logger.log_info(
                     f"Rendered profile: {dest_file.name} (treatment={treatment_name})"
@@ -220,6 +264,93 @@ class RenderProfilesStep(Step):
             message=f"Profiles rendered for {stack_name}",
             stack_name=stack_name,
         )
+
+    def _render_all_debug_profiles(
+        self,
+        context: ExecutionContext,
+        base_dir: Path,
+        env_map: dict[str, str],
+        stack_name: str,
+    ) -> StepResult:
+        """Render every built-in harness profile for a debug harness pod."""
+        profiles_root = base_dir / "workload" / "profiles"
+        if not profiles_root.is_dir():
+            return StepResult(
+                step_number=self.number,
+                step_name=self.name,
+                success=False,
+                message="Profile source directory not found",
+                errors=[f"Profiles directory not found: {profiles_root}"],
+                stack_name=stack_name,
+            )
+
+        rendered_count = 0
+        harness_count = 0
+        for harness_dir in sorted(profiles_root.iterdir()):
+            if not harness_dir.is_dir():
+                continue
+
+            output_dir = context.workload_profiles_dir() / harness_dir.name
+            output_dir.mkdir(parents=True, exist_ok=True)
+            harness_count += 1
+
+            for src_file in sorted(harness_dir.iterdir()):
+                if not src_file.is_file():
+                    continue
+                dest_name = (
+                    src_file.name[:-3]
+                    if src_file.name.endswith(".in")
+                    else src_file.name
+                )
+                dest_file = output_dir / dest_name
+                if context.dry_run:
+                    context.logger.log_info(
+                        f"[DRY RUN] Would render debug profile "
+                        f"{harness_dir.name}/{src_file.name} -> {dest_file}"
+                    )
+                    rendered_count += 1
+                    continue
+                if src_file.name.endswith(".yaml.in"):
+                    render_profile_file(src_file, dest_file, env_map)
+                else:
+                    shutil.copy2(src_file, dest_file)
+                rendered_count += 1
+
+        context.logger.log_info(
+            f"Debug profiles rendered to {context.workload_profiles_dir()}"
+        )
+        return StepResult(
+            step_number=self.number,
+            step_name=self.name,
+            success=True,
+            message=(
+                f"Rendered {rendered_count} debug workload profile(s) "
+                f"across {harness_count} harness(es)"
+            ),
+            stack_name=stack_name,
+        )
+
+    def _resolve_source_file(
+        self,
+        profile_name: str,
+        profiles_source: Path | None,
+        source_profile_file: Path | None,
+    ) -> Path | None:
+        if source_profile_file is not None:
+            return source_profile_file
+
+        if profiles_source is None:
+            return None
+
+        source_file = profiles_source / profile_name
+        if source_file.exists():
+            return source_file
+
+        source_file = profiles_source / f"{profile_name}.in"
+        if source_file.exists():
+            return source_file
+
+        return None
 
     def _resolve_treatments(
         self, context: ExecutionContext, plan_config: dict | None

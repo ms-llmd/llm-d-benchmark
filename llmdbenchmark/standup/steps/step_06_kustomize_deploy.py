@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import shlex
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -64,6 +66,11 @@ class KustomizeDeployStep(Step):
         repo_path = kust_config.get("repoPath") or context.llmd_repo_path or ""
         repo_ref = kust_config.get("repoRef", "main")
         gaie_version = kust_config.get("gaieVersion", "")
+        # `ROUTER_CHART_VERSION` is referenced by guide READMEs alongside
+        # `GAIE_VERSION` after the llm-d-router chart migration. Default
+        # to v0 (the published llm-d-router-* chart version) when the
+        # scenario doesn't pin one.
+        router_chart_version = kust_config.get("routerChartVersion", "") or "v0"
         accel_backend = kust_config.get("acceleratorBackend", "gpu/vllm")
         monitoring = kust_config.get("monitoring", False)
         overlay_path = kust_config.get("overlayPath", "")
@@ -75,25 +82,33 @@ class KustomizeDeployStep(Step):
         )
 
         if not guide_name:
-            return self._fail(["kustomize.guideName is required"], stack_path,
-                              "kustomize.guideName not set")
+            return self._fail(
+                ["kustomize.guideName is required"],
+                stack_path,
+                "kustomize.guideName not set",
+            )
 
         self._log_kustomize_authority(context, guide_name, repo_path, repo_ref)
 
         if not repo_path:
             clone_result = self._ensure_repo_cloned(
-                cmd, context, repo_ref, errors,
+                cmd,
+                context,
+                repo_ref,
+                errors,
             )
             if clone_result is None:
-                return self._fail(errors, stack_path, "Failed to clone llm-d repo",
-                                  context=context)
+                return self._fail(
+                    errors, stack_path, "Failed to clone llm-d repo", context=context
+                )
             repo_path = clone_result
 
         readme_path = Path(repo_path) / "guides" / guide_name / "README.md"
         if not readme_path.exists():
             return self._fail(
                 [f"File does not exist: {readme_path}"],
-                stack_path, f"Guide README not found: {readme_path}",
+                stack_path,
+                f"Guide README not found: {readme_path}",
             )
 
         context.logger.log_info(f"Parsing guide README: {readme_path}")
@@ -103,14 +118,28 @@ class KustomizeDeployStep(Step):
             context.logger.log_info(
                 f"README variables: {', '.join(f'{k}={v}' for k, v in parsed.variables.items())}"
             )
-
+        overrodevars = kust_config.get("guideVariableOverrides", {})
+        if overrodevars:
+            context.logger.log_info(
+                f"OVERRODE variables: {', '.join(f'{k}={v}' for k, v in overrodevars.items())}"
+            )
         if not gaie_version:
             gaie_version = parsed.variables.get("GAIE_VERSION", "v1.5.0")
+
+        # Allow the scenario / guide README to override the default. The
+        # scenario knob (kustomize.routerChartVersion) takes precedence; the
+        # README's `export ROUTER_CHART_VERSION=...` falls back next; we then
+        # fall back to the v0 default the resolver applies.
+        readme_router_chart_version = parsed.variables.get("ROUTER_CHART_VERSION", "")
+        effective_router_chart_version = (
+            router_chart_version or readme_router_chart_version or "v0"
+        )
 
         resolver = GuideVariableResolver(
             guide_name=guide_name,
             namespace=namespace,
             gaie_version=gaie_version,
+            router_chart_version=effective_router_chart_version,
             repo_path=repo_path,
             accelerator_backend=accel_backend,
             variable_overrides=kust_config.get("guideVariableOverrides", {}),
@@ -122,96 +151,136 @@ class KustomizeDeployStep(Step):
         for gc in prereq_cmds:
             resolved = resolver.resolve(gc.raw)
             if "create namespace" in resolved:
-                ns_check = cmd.kube("get", "namespace", namespace,
-                                    check=False, force=True)
+                ns_check = cmd.kube(
+                    "get", "namespace", namespace, check=False, force=True
+                )
                 if ns_check.success:
                     context.logger.log_info(
-                        f"Namespace {namespace} already exists, skipping create")
+                        f"Namespace {namespace} already exists, skipping create"
+                    )
                     continue
-            context.logger.log_info(f"[prerequisites] {resolved[:120]}")
-            result = self._run_resolved(cmd, resolved, check=False)
+            result = self._run_resolved(
+                cmd, resolved, check=False, context=context, phase="prerequisites"
+            )
             if not result.success:
                 errors.append(f"Prerequisite failed: {result.stderr}")
 
         if errors:
-            return self._fail(errors, stack_path, "Prerequisite commands failed",
-                              context=context)
+            return self._fail(
+                errors, stack_path, "Prerequisite commands failed", context=context
+            )
 
         # --- 1b. HF token secret ---
-        self._ensure_hf_token_secret(cmd, context, namespace)
+        # Upstream guide manifests (since llm-d/llm-d#1684) reference
+        # `secret/llm-d-hf-token` without `optional: true`, so missing
+        # the Secret hangs every Pod in CreateContainerConfigError.
+        # Ensure it exists (or fail fast) in both the deploy namespace
+        # and the harness namespace when they differ.
+        hf_error = self._ensure_hf_token_secret(cmd, context, namespace)
+        if hf_error:
+            return self._fail(
+                [hf_error], stack_path, "HF token setup failed", context=context
+            )
+        harness_ns = getattr(context, "harness_namespace", None)
+        if harness_ns and harness_ns != namespace:
+            hf_error = self._ensure_hf_token_secret(cmd, context, harness_ns)
+            if hf_error:
+                return self._fail(
+                    [hf_error],
+                    stack_path,
+                    "HF token setup failed in harness namespace",
+                    context=context,
+                )
 
         # --- 2. Router ---
         router_cmds = parsed.get_commands(CommandPhase.ROUTER, DeployMode.STANDALONE)
         for gc in router_cmds:
             resolved = resolver.resolve(gc.raw)
             resolved = self._inject_extra_helm_args(
-                resolved, extra_helm_values, extra_helm_sets,
+                resolved,
+                extra_helm_values,
+                extra_helm_sets,
             )
-            context.logger.log_info(f"[router] {resolved[:120]}")
-            result = self._run_resolved(cmd, resolved, check=False)
+            result = self._run_resolved(
+                cmd, resolved, check=False, context=context, phase="router"
+            )
             if not result.success:
                 errors.append(f"Router deploy failed: {result.stderr}")
 
         if errors:
-            return self._fail(errors, stack_path, "Router deployment failed",
-                              context=context)
+            return self._fail(
+                errors, stack_path, "Router deployment failed", context=context
+            )
 
         # --- 3. Model Server ---
         modelserver_cmds = parsed.get_commands(CommandPhase.MODELSERVER)
         target_cmd = self._select_modelserver_command(
-            modelserver_cmds, accel_backend, resolver,
+            modelserver_cmds,
+            accel_backend,
+            resolver,
         )
 
         if target_cmd is None:
             return self._fail(
                 [f"No modelserver command found for backend '{accel_backend}'"],
-                stack_path, "No modelserver command for backend",
+                stack_path,
+                "No modelserver command for backend",
             )
 
         resolved_ms = resolver.resolve(target_cmd.raw)
         ms_path = self._extract_kustomize_path(resolved_ms)
         if not ms_path:
             ms_path = str(
-                Path(repo_path) / "guides" / guide_name
-                / "modelserver" / accel_backend
+                Path(repo_path) / "guides" / guide_name / "modelserver" / accel_backend
             )
 
-        needs_wrapper = (
-            patches
-            or (overlay_path and Path(overlay_path).is_dir())
-        )
+        needs_wrapper = patches or (overlay_path and Path(overlay_path).is_dir())
 
         if needs_wrapper:
             kustomize_dir = self._build_overlay_wrapper(
-                context, Path(ms_path), overlay_path, patches,
+                context,
+                Path(ms_path),
+                overlay_path,
+                patches,
             )
             context.logger.log_info(
-                f"[modelserver] kubectl apply -k {kustomize_dir} (with overrides)")
-            result = cmd.kube("apply", "-n", namespace,
-                              "-k", str(kustomize_dir), check=False)
+                f"[modelserver] kubectl apply -n {namespace} -k {kustomize_dir} (with overrides)"
+            )
+            result = cmd.kube(
+                "apply", "-n", namespace, "-k", str(kustomize_dir), check=False
+            )
         else:
             context.logger.log_info(
-                f"[modelserver] kubectl apply -k {ms_path}")
-            result = cmd.kube("apply", "-n", namespace,
-                              "-k", ms_path, check=False)
+                f"[modelserver] kubectl apply -n {namespace} -k {ms_path}"
+            )
+            result = cmd.kube("apply", "-n", namespace, "-k", ms_path, check=False)
 
         if not result.success:
             errors.append(f"Model server deploy failed: {result.stderr}")
-            return self._fail(errors, stack_path, "Model server deployment failed",
-                              context=context)
+            return self._fail(
+                errors, stack_path, "Model server deployment failed", context=context
+            )
 
         # --- 4. Monitoring ---
         if monitoring:
             mon_path = (
-                Path(repo_path) / "guides" / "recipes"
-                / "modelserver" / "components" / "monitoring"
+                Path(repo_path)
+                / "guides"
+                / "recipes"
+                / "modelserver"
+                / "components"
+                / "monitoring"
             )
-            context.logger.log_info(f"[monitoring] kubectl apply -k {mon_path}")
-            result = cmd.kube("apply", "-n", namespace,
-                              "-k", str(mon_path), check=False)
+            context.logger.log_info(
+                f"[monitoring] kubectl apply -n {namespace} -k {mon_path}"
+            )
+            result = cmd.kube(
+                "apply", "-n", namespace, "-k", str(mon_path), check=False
+            )
             if not result.success:
                 context.logger.log_warning(
-                    f"Monitoring apply failed (non-fatal): {result.stderr}")
+                    f"Monitoring apply failed (non-fatal): {result.stderr}"
+                )
 
         # --- 5. Wait ---
         context.logger.log_info(f"Waiting for pods (timeout={deploy_timeout}s)...")
@@ -225,7 +294,8 @@ class KustomizeDeployStep(Step):
         if not wait_result.success:
             return self._fail(
                 [f"Pods not ready: {wait_result.stderr}"],
-                stack_path, "Pod readiness timeout",
+                stack_path,
+                "Pod readiness timeout",
                 context=context,
             )
 
@@ -234,8 +304,9 @@ class KustomizeDeployStep(Step):
         context.deployed_endpoints[stack_path.name] = epp_service
         context.logger.log_info(f"Endpoint registered: {epp_service}")
 
-        cmd.kube("get", "deployment,service,pods",
-                 "--namespace", namespace, check=False)
+        cmd.kube(
+            "get", "deployment,service,pods", "--namespace", namespace, check=False
+        )
 
         self._propagate_standup_parameters(cmd, context, plan_config, guide_name)
 
@@ -247,22 +318,69 @@ class KustomizeDeployStep(Step):
             stack_name=stack_path.name,
         )
 
-    @staticmethod
+    # Names of environment variables whose *value* we scrub from any log
+    # line before printing. Guides carry only placeholders in the README
+    # itself, but the process may hold real credentials in these vars
+    # (see `_ensure_hf_token_secret`); this is a belt-and-braces guard so
+    # a future refactor can't inadvertently echo them.
+    _SECRET_ENV_VARS = (
+        "HF_TOKEN",
+        "LLMDBENCH_HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+    )
+    _PLACEHOLDER_TOKENS = frozenset({"HF_TOKEN_PLACEHOLDER", ""})
+
+    @classmethod
+    def _scrub_secrets(cls, text: str) -> str:
+        """Replace any known secret env var value that appears literally in
+        *text* with ``<redacted>``. Placeholder-shaped values (empty or the
+        documented placeholder) are ignored — nothing to protect."""
+        import os
+
+        for env_var in cls._SECRET_ENV_VARS:
+            value = os.environ.get(env_var, "")
+            if value in cls._PLACEHOLDER_TOKENS:
+                continue
+            if value in text:
+                text = text.replace(value, "<redacted>")
+        return text
+
+    @classmethod
     def _run_resolved(
-        cmd: CommandExecutor, resolved: str, *, check: bool = True
+        cls,
+        cmd: CommandExecutor,
+        resolved: str,
+        *,
+        check: bool = True,
+        context: ExecutionContext | None = None,
+        phase: str | None = None,
     ):
+        """Execute the given resolved command via the right CommandExecutor
+        method, logging the exact final invocation (post-transformation)
+        with secrets scrubbed. Pass ``phase`` for the log tag; omit both
+        ``context`` and ``phase`` to run silently (used by tests)."""
         tokens = shlex.split(resolved)
         if not tokens:
+            if context is not None and phase is not None:
+                context.logger.log_info(f"[{phase}] {cls._scrub_secrets(resolved)}")
             return cmd.execute(resolved, check=check)
 
         binary = tokens[0]
         rest = tokens[1:]
 
+        if binary == "helm" and rest and rest[0] == "install":
+            # llm-d-benchmark rewrites `helm install` to
+            # `helm upgrade --install` so re-runs are idempotent. Log
+            # the transformed form so the log matches what actually ran.
+            rest = ["upgrade", "--install"] + rest[1:]
+
+        if context is not None and phase is not None:
+            display = f"{binary} {' '.join(shlex.quote(t) for t in rest)}"
+            context.logger.log_info(f"[{phase}] {cls._scrub_secrets(display)}")
+
         if binary in ("kubectl", "oc"):
             return cmd.kube(*rest, check=check)
         if binary == "helm":
-            if rest and rest[0] == "install":
-                rest = ["upgrade", "--install"] + rest[1:]
             return cmd.helm(*rest, check=check)
 
         return cmd.execute(resolved, check=check)
@@ -314,11 +432,41 @@ class KustomizeDeployStep(Step):
         return str(repo_dir)
 
     _HF_SECRET_NAME = "llm-d-hf-token"
+    _HF_SECRET_KEY = "HF_TOKEN"
 
     @staticmethod
     def _ensure_hf_token_secret(
-        cmd: CommandExecutor, context: ExecutionContext, namespace: str,
-    ) -> None:
+        cmd: CommandExecutor,
+        context: ExecutionContext,
+        namespace: str,
+    ) -> str | None:
+        """Ensure the HF token Secret exists in ``namespace``.
+
+        Kustomize-mode-only.  Upstream llm-d guide manifests (since PR
+        llm-d/llm-d#1684) reference ``secret/llm-d-hf-token`` directly
+        with no ``optional: true`` -- without it every Pod hangs in
+        ``CreateContainerConfigError``.  This helper enforces presence:
+
+        - If a Secret named ``llm-d-hf-token`` already exists in the
+          namespace, succeed and leave it alone (supports externally
+          managed Secrets via ESO / Vault / manual create).
+        - If no Secret exists and ``HF_TOKEN`` /
+          ``LLMDBENCH_HF_TOKEN`` / ``HUGGING_FACE_HUB_TOKEN`` is set in
+          the process env, create it from that value.
+        - If no Secret AND no env token, return a descriptive error
+          string so the caller can fail the step fast.
+
+        Returns ``None`` on success, or an error message string on
+        failure (caller is expected to surface via ``self._fail``).
+
+        Security: the token value is never passed on a command line
+        (which would be logged by ``CommandExecutor``).  Instead we
+        build the Secret manifest in-process, base64-encode the token,
+        write to a ``NamedTemporaryFile`` (Python defaults to mode
+        0600 on Unix), ``kubectl apply -f`` that file, then unlink it.
+        Any ``kubectl`` stderr we surface is also scrubbed of the
+        literal token value as a belt-and-braces precaution.
+        """
         import os
 
         hf_token = (
@@ -326,42 +474,112 @@ class KustomizeDeployStep(Step):
             or os.environ.get("LLMDBENCH_HF_TOKEN")
             or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         )
-        if not hf_token:
-            context.logger.log_info(
-                "No HF_TOKEN in environment -- skipping secret creation "
-                "(gated models will fail)"
-            )
-            return
 
         secret_name = KustomizeDeployStep._HF_SECRET_NAME
+        secret_key = KustomizeDeployStep._HF_SECRET_KEY
+
+        # 1. Already in the cluster? Leave it alone -- supports ESO /
+        #    Vault / hand-created Secret workflows where the operator
+        #    owns rotation.  No env token required in that case.
         check = cmd.kube(
-            "get", "secret", secret_name,
-            "--namespace", namespace,
+            "get",
+            "secret",
+            secret_name,
+            "--namespace",
+            namespace,
             check=False,
         )
         if check.success:
             context.logger.log_info(
                 f"HF token secret '{secret_name}' already exists in {namespace}"
             )
-            return
+            return None
 
-        result = cmd.kube(
-            "create", "secret", "generic", secret_name,
-            f"--from-literal=HF_TOKEN={hf_token}",
-            "--namespace", namespace,
-            check=False,
-        )
+        # 2. No Secret AND no env token -- fail fast with actionable
+        #    instructions.  We do this *only* in the kustomize path
+        #    because upstream guide manifests now hard-require the
+        #    Secret; modelservice/standalone keep their tolerant
+        #    behaviour.
+        if not hf_token:
+            return (
+                f"HF_TOKEN is not set and Secret '{secret_name}' does not "
+                f"exist in namespace {namespace}.  A HF_TOKEN is now "
+                f"required for well-lit-path guides.\n"
+                f"\n"
+                f"Either:\n"
+                f"  1. Export HF_TOKEN (or LLMDBENCH_HF_TOKEN, "
+                f"HUGGING_FACE_HUB_TOKEN) before running standup, or\n"
+                f"  2. Pre-create the Secret:\n"
+                f"     kubectl create secret generic {secret_name} \\\n"
+                f"       --from-literal={secret_key}=<your-token> "
+                f"-n {namespace}"
+            )
+
+        # 3. Have a token, no Secret -- create it without ever putting
+        #    the token on a command line.  We build the manifest in
+        #    Python, base64-encode the token, write to a temp file
+        #    (NamedTemporaryFile is mode 0600 by default on Unix),
+        #    apply, and unlink.  The logged kubectl invocation is just
+        #    ``kubectl apply -f /tmp/xxx.yaml``.
+        token_b64 = base64.b64encode(hf_token.encode("utf-8")).decode("ascii")
+        secret_manifest = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "type": "Opaque",
+            "metadata": {
+                "name": secret_name,
+                "namespace": namespace,
+            },
+            "data": {
+                secret_key: token_b64,
+            },
+        }
+
+        tmp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".yaml",
+                delete=False,
+                prefix="llm-d-hf-token-",
+            ) as tmp:
+                yaml.safe_dump(secret_manifest, tmp)
+                tmp_path = tmp.name
+
+            result = cmd.kube(
+                "apply",
+                "-f",
+                tmp_path,
+                "--namespace",
+                namespace,
+                check=False,
+            )
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
+
         if result.success:
             context.logger.log_info(
                 f"Created HF token secret '{secret_name}' in {namespace}"
             )
-        else:
-            context.logger.log_warning(
-                f"Failed to create HF token secret: {result.stderr[:200]}"
-            )
+            return None
+
+        # Scrub any accidental token echo from kubectl stderr before
+        # surfacing it -- not expected for ``apply -f`` failures but
+        # cheap insurance.
+        stderr = (result.stderr or "")[:300]
+        if hf_token and hf_token in stderr:
+            stderr = stderr.replace(hf_token, "<redacted>")
+        return (
+            f"Failed to create HF token secret '{secret_name}' in "
+            f"namespace {namespace}: {stderr}"
+        )
 
     def _fail(
-        self, errors: list[str], stack_path: Path, message: str,
+        self,
+        errors: list[str],
+        stack_path: Path,
+        message: str,
         context: ExecutionContext | None = None,
     ) -> StepResult:
         if context:
@@ -378,8 +596,10 @@ class KustomizeDeployStep(Step):
 
     @staticmethod
     def _log_kustomize_authority(
-        context: ExecutionContext, guide_name: str,
-        repo_path: str, repo_ref: str,
+        context: ExecutionContext,
+        guide_name: str,
+        repo_path: str,
+        repo_ref: str,
     ) -> None:
         """Make it explicit that kustomize mode ignores scenario/CLI tuning.
 
@@ -394,9 +614,15 @@ class KustomizeDeployStep(Step):
         w = context.logger.log_warning
         w("kustomize mode — scenario/CLI parameters are NOT applied:")
         w(f"source      : {src} (ref '{repo_ref}'), guide '{guide_name}'")
-        w("modifiable  : kustomize.patches, overlayPath, extraHelmValues, extraHelmSets, guideVariableOverrides")
-        w("ignored     : -m/--models, model.*, replicas, parallelism, resources, gateway, all other tuning")
-        w("experiments : DoE setup sweeps do NOT apply (use kustomize.patches); run/workload treatments do")
+        w(
+            "modifiable  : kustomize.patches, overlayPath, extraHelmValues, extraHelmSets, guideVariableOverrides"
+        )
+        w(
+            "ignored     : -m/--models, model.*, replicas, parallelism, resources, gateway, all other tuning"
+        )
+        w(
+            "experiments : DoE setup sweeps do NOT apply (use kustomize.patches); run/workload treatments do"
+        )
 
     @staticmethod
     def _extract_kustomize_path(resolved_cmd: str) -> str | None:
@@ -480,15 +706,19 @@ class KustomizeDeployStep(Step):
             wrapper["patches"] = patch_entries
 
         (overlay_dir / "kustomization.yaml").write_text(
-            yaml.dump(wrapper, default_flow_style=False), encoding="utf-8",
+            yaml.dump(wrapper, default_flow_style=False),
+            encoding="utf-8",
         )
 
         context.logger.log_info(f"Overlay wrapper written to {overlay_dir}")
         return overlay_dir
 
     def _propagate_standup_parameters(
-        self, cmd: CommandExecutor, context: ExecutionContext,
-        plan_config: dict, guide_name: str,
+        self,
+        cmd: CommandExecutor,
+        context: ExecutionContext,
+        plan_config: dict,
+        guide_name: str,
     ):
         """Persist deploy metadata as a ConfigMap."""
         from datetime import datetime, timezone
@@ -520,10 +750,17 @@ class KustomizeDeployStep(Step):
         for key, value in params.items():
             literal_args.append(f"--from-literal={key}={value}")
 
-        create_args = [
-            "create", "configmap", cm_name,
-            "--namespace", harness_ns,
-        ] + literal_args + ["--dry-run=client", "-o", "yaml"]
+        create_args = (
+            [
+                "create",
+                "configmap",
+                cm_name,
+                "--namespace",
+                harness_ns,
+            ]
+            + literal_args
+            + ["--dry-run=client", "-o", "yaml"]
+        )
 
         result = cmd.kube(*create_args)
         if result.success:

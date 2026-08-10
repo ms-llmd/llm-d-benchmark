@@ -8,8 +8,8 @@
 > `auto` Helm/image versions are resolved against live registries at
 > generation time via the existing `VersionResolver`.
 
-- Generated at: `2026-06-02 17:31:42` (UTC)
-- Generated against git ref: `d48798dd0895f565b943529d9791fb4ffbd1c432`
+- Generated at: `2026-07-31 22:39:07` (UTC)
+- Generated against git ref: `b1d2ed08943f35d1f207f02a3c9f9a8e824b49fd`
 
 ## System Tool Dependencies
 
@@ -19,18 +19,18 @@ whatever the host's package manager provides.
 
 | Dependency | Current Pin | Pin Type | File Location | Upstream Repo |
 |---|---|---|---|---|
-| **crane** | `0.21.6` | version | `install.sh` line 85 (`tool_version_for`) | [google/go-containerregistry](https://github.com/google/go-containerregistry) |
-| **curl** | `8_20_0` | version | `install.sh` line 78 (`tool_version_for`) | [curl/curl](https://github.com/curl/curl) |
+| **crane** | `0.21.7` | version | `install.sh` line 85 (`tool_version_for`) | [google/go-containerregistry](https://github.com/google/go-containerregistry) |
+| **curl** | `8_21_0` | version | `install.sh` line 78 (`tool_version_for`) | [curl/curl](https://github.com/curl/curl) |
 | **git** | `system-provided` | system-provided | `install.sh`: `command -v` check (no pin) | [git/git](https://github.com/git/git) |
 | **helm** | `v3.19.0` | version | `install.sh` line 81 (`tool_version_for`) | [helm/helm](https://github.com/helm/helm) |
 | **helm-diff** | `v3.13.0` | plugin (version) | `install.sh` line 82 (`tool_version_for`) | [databus23/helm-diff](https://github.com/databus23/helm-diff) |
 | **helmfile** | `1.5.1` | version | `install.sh` line 80 (`tool_version_for`) | [helmfile/helmfile](https://github.com/helmfile/helmfile) |
-| **jq** | `1.8.1` | version | `install.sh` line 87 (`tool_version_for`) | [jqlang/jq](https://github.com/jqlang/jq) |
+| **jq** | `1.8.2` | version | `install.sh` line 87 (`tool_version_for`) | [jqlang/jq](https://github.com/jqlang/jq) |
 | **kustomize** | `v5.8.1` | version | `install.sh` line 84 (`tool_version_for`) | [kubernetes-sigs/kustomize](https://github.com/kubernetes-sigs/kustomize) |
-| **llm-d-planner (git)** | `v0.1.0` | commit SHA | `install.sh` line 913 (`PLANNER_GIT`) | [llm-d-incubation/llm-d-planner](https://github.com/llm-d-incubation/llm-d-planner) |
+| **llm-d-planner (git)** | `v0.1.0` | commit SHA | `install.sh` line 924 (`PLANNER_GIT`) | [llm-d-incubation/llm-d-planner](https://github.com/llm-d-incubation/llm-d-planner) |
 | **oc** | `4.18.0` | version | `install.sh` line 83 (`tool_version_for`) | [openshift/oc](https://github.com/openshift/oc) |
 | **skopeo** | `1.20.1` | version | `install.sh` line 86 (`tool_version_for`) | [containers/skopeo](https://github.com/containers/skopeo) |
-| **yq** | `v4.53.2` | version | `install.sh` line 79 (`tool_version_for`) | [mikefarah/yq](https://github.com/mikefarah/yq) |
+| **yq** | `v4.53.3` | version | `install.sh` line 79 (`tool_version_for`) | [mikefarah/yq](https://github.com/mikefarah/yq) |
 
 
 ## Helm Chart Dependencies
@@ -41,15 +41,14 @@ OCI registry at generation (and plan) time.
 
 | Dependency | Current Pin | Pin Type | File Location | Upstream Repo |
 |---|---|---|---|---|
-| **agentgateway** | `v1.2.1` | tag | `config/templates/values/defaults.yaml` line 445 (`chartVersions.agentgateway`) | [agentgateway/agentgateway](https://github.com/agentgateway/agentgateway) (`oci://cr.agentgateway.dev/charts/`) |
-| **inferencePool** | `v1.5.0` | tag | `config/templates/values/defaults.yaml` line 444 (`chartVersions.inferencePool`) | [kubernetes-sigs/gateway-api-inference-extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension) |
-| **istioBase** | `1.29.2` | tag | `config/templates/values/defaults.yaml` line 438 (`chartVersions.istioBase`) | (unknown) |
-| **istiod** | `1.29.2` | tag | `config/templates/values/defaults.yaml` line 439 (`chartVersions.istiod`) | (unknown) |
-| **llmDInfra** | `v1.4.0` | tag (auto-resolved) | `config/templates/values/defaults.yaml` line 440 (`chartVersions.llmDInfra`) | [llm-d-incubation/llm-d-infra](https://github.com/llm-d-incubation/llm-d-infra) (`https://llm-d-incubation.github.io/llm-d-infra/`) |
-| **llmDModelservice** | `v0.4.12` | tag (auto-resolved) | `config/templates/values/defaults.yaml` line 441 (`chartVersions.llmDModelservice`) | [llm-d-incubation/llm-d-modelservice](https://github.com/llm-d-incubation/llm-d-modelservice) (`https://llm-d-incubation.github.io/llm-d-modelservice/`) |
-| **lws** | `0.8.0` | tag | `config/templates/values/defaults.yaml` line 446 (`chartVersions.lws`) | [kubernetes-sigs/lws](https://github.com/kubernetes-sigs/lws) |
-| **prometheusAdapter** | `5.3.0` | tag | `config/templates/values/defaults.yaml` line 443 (`chartVersions.prometheusAdapter`) | [prometheus-community/helm-charts](https://github.com/prometheus-community/helm-charts) (`https://prometheus-community.github.io/helm-charts`) |
-| **wva** | `0.6.0` | tag | `config/templates/values/defaults.yaml` line 442 (`chartVersions.wva`) | [llm-d/llm-d-workload-variant-autoscaler](https://github.com/llm-d/llm-d-workload-variant-autoscaler) (`oci://ghcr.io/llm-d/workload-variant-autoscaler`) |
+| **agentgateway** | `v1.3.1` | tag | `config/templates/values/defaults.yaml` line 494 (`chartVersions.agentgateway`) | [agentgateway/agentgateway](https://github.com/agentgateway/agentgateway) (`oci://cr.agentgateway.dev/charts/`) |
+| **inferencePool** | `v1.5.0` | tag | `config/templates/values/defaults.yaml` line 493 (`chartVersions.inferencePool`) | [kubernetes-sigs/gateway-api-inference-extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension) |
+| **istioBase** | `1.29.2` | tag | `config/templates/values/defaults.yaml` line 482 (`chartVersions.istioBase`) | (unknown) |
+| **istiod** | `1.29.2` | tag | `config/templates/values/defaults.yaml` line 483 (`chartVersions.istiod`) | (unknown) |
+| **llmDInfra** | `v1.4.0` | tag (auto-resolved) | `config/templates/values/defaults.yaml` line 484 (`chartVersions.llmDInfra`) | [llm-d-incubation/llm-d-infra](https://github.com/llm-d-incubation/llm-d-infra) (`https://llm-d-incubation.github.io/llm-d-infra/`) |
+| **llmDModelservice** | `v0.4.15` | tag (auto-resolved) | `config/templates/values/defaults.yaml` line 485 (`chartVersions.llmDModelservice`) | [llm-d-incubation/llm-d-modelservice](https://github.com/llm-d-incubation/llm-d-modelservice) (`https://llm-d-incubation.github.io/llm-d-modelservice/`) |
+| **llmDRouter** | `v0.9.0` | tag | `config/templates/values/defaults.yaml` line 489 (`chartVersions.llmDRouter`) | [llm-d/llm-d-router](https://github.com/llm-d/llm-d-router) |
+| **lws** | `0.9.0` | tag | `config/templates/values/defaults.yaml` line 495 (`chartVersions.lws`) | [kubernetes-sigs/lws](https://github.com/kubernetes-sigs/lws) |
 
 
 ## Container Image Dependencies
@@ -60,13 +59,13 @@ generation (and plan) time.
 
 | Dependency | Current Pin | Pin Type | File Location | Upstream Repo |
 |---|---|---|---|---|
-| **benchmark** | `v0.6.7` | tag | `config/templates/values/defaults.yaml` line 345 (`images.benchmark`) | [llm-d/llm-d-benchmark](https://github.com/llm-d/llm-d-benchmark) (`ghcr.io/llm-d/llm-d-benchmark`) |
-| **inferenceScheduler** | `v0.8.0` | tag | `config/templates/values/defaults.yaml` line 368 (`images.inferenceScheduler`) | [llm-d/llm-d-inference-scheduler](https://github.com/llm-d/llm-d-inference-scheduler) (`ghcr.io/llm-d/llm-d-inference-scheduler`) |
-| **python** | `3.10` | tag | `config/templates/values/defaults.yaml` line 387 (`images.python`) | [Docker Hub: python](https://hub.docker.com/_/python) (`python`) |
-| **routingSidecar** | `v0.8.0` | tag | `config/templates/values/defaults.yaml` line 374 (`images.routingSidecar`) | [llm-d/llm-d-routing-sidecar](https://github.com/llm-d/llm-d-routing-sidecar) (`ghcr.io/llm-d/llm-d-routing-sidecar`) |
-| **udsTokenizer** | `v0.8.0` | tag | `config/templates/values/defaults.yaml` line 380 (`images.udsTokenizer`) | [llm-d/llm-d-kv-cache (services/uds_tokenizer)](https://github.com/llm-d/llm-d-kv-cache) (`ghcr.io/llm-d/llm-d-uds-tokenizer`) |
-| **vllm** | `v0.20.2` | tag | `config/templates/values/defaults.yaml` line 351 (`images.vllm`) | [vllm-project/vllm](https://github.com/vllm-project/vllm) (`docker.io/vllm/vllm-openai`) |
-| **vllmOpenai** | `v0.20.2` | tag | `config/templates/values/defaults.yaml` line 362 (`images.vllmOpenai`) | [vllm-project/vllm](https://github.com/vllm-project/vllm) (`docker.io/vllm/vllm-openai`) |
+| **benchmark** | `v0.7.0` | tag | `config/templates/values/defaults.yaml` line 379 (`images.benchmark`) | [llm-d/llm-d-benchmark](https://github.com/llm-d/llm-d-benchmark) (`ghcr.io/llm-d/llm-d-benchmark`) |
+| **python** | `3.10` | tag | `config/templates/values/defaults.yaml` line 427 (`images.python`) | [Docker Hub: python](https://hub.docker.com/_/python) (`python`) |
+| **routerEndpointPicker** | `v0.9.0` | tag | `config/templates/values/defaults.yaml` line 404 (`images.routerEndpointPicker`) | [llm-d/llm-d-router](https://github.com/llm-d/llm-d-router) (`ghcr.io/llm-d/llm-d-router-endpoint-picker`) |
+| **routingSidecar** | `v0.9.0` | tag | `config/templates/values/defaults.yaml` line 410 (`images.routingSidecar`) | [llm-d/llm-d-router](https://github.com/llm-d/llm-d-router) (`ghcr.io/llm-d/llm-d-router-disagg-sidecar`) |
+| **udsTokenizer** | `v0.24.0` | tag | `config/templates/values/defaults.yaml` line 416 (`images.udsTokenizer`) | [vllm-project/vllm](https://github.com/vllm-project/vllm) (`docker.io/vllm/vllm-openai`) |
+| **vllm** | `v0.24.0` | tag | `config/templates/values/defaults.yaml` line 385 (`images.vllm`) | [vllm-project/vllm](https://github.com/vllm-project/vllm) (`docker.io/vllm/vllm-openai`) |
+| **vllmOpenai** | `v0.24.0` | tag | `config/templates/values/defaults.yaml` line 396 (`images.vllmOpenai`) | [vllm-project/vllm](https://github.com/vllm-project/vllm) (`docker.io/vllm/vllm-openai`) |
 
 
 ## Python Package Dependencies (declared)
@@ -117,7 +116,7 @@ annotated with their `pyproject.toml` line.
 | **cfgv** | `3.5.0` | version | (transitive in `.venv`) | [cfgv (PyPI)](https://pypi.org/project/cfgv/) |
 | **chardet** | `6.0.0.post1` | version | (transitive in `.venv`) | [chardet (PyPI)](https://pypi.org/project/chardet/) |
 | **charset-normalizer** | `3.4.4` | version | (transitive in `.venv`) | [charset-normalizer (PyPI)](https://pypi.org/project/charset-normalizer/) |
-| **click** | `8.3.1` | version | (transitive in `.venv`) | [click (PyPI)](https://pypi.org/project/click/) |
+| **click** | `8.4.1` | version | (transitive in `.venv`) | [click (PyPI)](https://pypi.org/project/click/) |
 | **config_explorer** | `(unknown)` | commit SHA | (transitive in `.venv`) | [config_explorer (PyPI)](https://pypi.org/project/config-explorer/) |
 | **contourpy** | `1.3.3` | version | (transitive in `.venv`) | [contourpy (PyPI)](https://pypi.org/project/contourpy/) |
 | **cryptography** | `46.0.7` | version | (transitive in `.venv`) | [cryptography (PyPI)](https://pypi.org/project/cryptography/) |
@@ -126,7 +125,7 @@ annotated with their `pyproject.toml` line.
 | **distlib** | `0.4.0` | version | (transitive in `.venv`) | [distlib (PyPI)](https://pypi.org/project/distlib/) |
 | **distro** | `1.9.0` | version | (transitive in `.venv`) | [distro (PyPI)](https://pypi.org/project/distro/) |
 | **durationpy** | `0.10` | version | (transitive in `.venv`) | [durationpy (PyPI)](https://pypi.org/project/durationpy/) |
-| **fastapi** | `0.136.1` | version | (transitive in `.venv`) | [fastapi (PyPI)](https://pypi.org/project/fastapi/) |
+| **fastapi** | `0.136.3` | version | (transitive in `.venv`) | [fastapi (PyPI)](https://pypi.org/project/fastapi/) |
 | **filelock** | `3.24.3` | version | (transitive in `.venv`) | [filelock (PyPI)](https://pypi.org/project/filelock/) |
 | **fonttools** | `4.61.1` | version | (transitive in `.venv`) | [fonttools (PyPI)](https://pypi.org/project/fonttools/) |
 | **frozenlist** | `1.8.0` | version | (transitive in `.venv`) | [frozenlist (PyPI)](https://pypi.org/project/frozenlist/) |
@@ -141,11 +140,11 @@ annotated with their `pyproject.toml` line.
 | **google-resumable-media** | `2.9.0` | version | (transitive in `.venv`) | [google-resumable-media (PyPI)](https://pypi.org/project/google-resumable-media/) |
 | **googleapis-common-protos** | `1.75.0` | version | (transitive in `.venv`) | [googleapis-common-protos (PyPI)](https://pypi.org/project/googleapis-common-protos/) |
 | **h11** | `0.16.0` | version | (transitive in `.venv`) | [h11 (PyPI)](https://pypi.org/project/h11/) |
-| **hf-xet** | `1.5.0` | version | (transitive in `.venv`) | [hf-xet (PyPI)](https://pypi.org/project/hf-xet/) |
+| **hf-xet** | `1.5.1` | version | (transitive in `.venv`) | [hf-xet (PyPI)](https://pypi.org/project/hf-xet/) |
 | **httpcore** | `1.0.9` | version | (transitive in `.venv`) | [httpcore (PyPI)](https://pypi.org/project/httpcore/) |
 | **httptools** | `0.7.1` | version | (transitive in `.venv`) | [httptools (PyPI)](https://pypi.org/project/httptools/) |
 | **httpx** | `0.28.1` | version | (transitive in `.venv`) | [httpx (PyPI)](https://pypi.org/project/httpx/) |
-| **huggingface_hub** | `1.14.0` | version | `pyproject.toml` line 15 (direct) | [huggingface_hub (PyPI)](https://pypi.org/project/huggingface-hub/) |
+| **huggingface_hub** | `1.19.0` | version | `pyproject.toml` line 15 (direct) | [huggingface_hub (PyPI)](https://pypi.org/project/huggingface-hub/) |
 | **identify** | `2.6.19` | version | (transitive in `.venv`) | [identify (PyPI)](https://pypi.org/project/identify/) |
 | **idna** | `3.11` | version | (transitive in `.venv`) | [idna (PyPI)](https://pypi.org/project/idna/) |
 | **iniconfig** | `2.3.0` | version | (transitive in `.venv`) | [iniconfig (PyPI)](https://pypi.org/project/iniconfig/) |
@@ -210,13 +209,13 @@ annotated with their `pyproject.toml` line.
 | **tabulate** | `0.10.0` | version | (transitive in `.venv`) | [tabulate (PyPI)](https://pypi.org/project/tabulate/) |
 | **tokenizers** | `0.22.2` | version | (transitive in `.venv`) | [tokenizers (PyPI)](https://pypi.org/project/tokenizers/) |
 | **tqdm** | `4.67.3` | version | (transitive in `.venv`) | [tqdm (PyPI)](https://pypi.org/project/tqdm/) |
-| **transformers** | `5.8.0` | version | `pyproject.toml` line 16 (direct) | [transformers (PyPI)](https://pypi.org/project/transformers/) |
+| **transformers** | `5.12.0` | version | `pyproject.toml` line 16 (direct) | [transformers (PyPI)](https://pypi.org/project/transformers/) |
 | **typer** | `0.24.1` | version | (transitive in `.venv`) | [typer (PyPI)](https://pypi.org/project/typer/) |
 | **typer-slim** | `0.24.0` | version | (transitive in `.venv`) | [typer-slim (PyPI)](https://pypi.org/project/typer-slim/) |
 | **typing-inspection** | `0.4.2` | version | (transitive in `.venv`) | [typing-inspection (PyPI)](https://pypi.org/project/typing-inspection/) |
 | **typing_extensions** | `4.15.0` | version | (transitive in `.venv`) | [typing_extensions (PyPI)](https://pypi.org/project/typing-extensions/) |
 | **urllib3** | `2.6.3` | version | (transitive in `.venv`) | [urllib3 (PyPI)](https://pypi.org/project/urllib3/) |
-| **uvicorn** | `0.47.0` | version | (transitive in `.venv`) | [uvicorn (PyPI)](https://pypi.org/project/uvicorn/) |
+| **uvicorn** | `0.48.0` | version | (transitive in `.venv`) | [uvicorn (PyPI)](https://pypi.org/project/uvicorn/) |
 | **uvloop** | `0.22.1` | version | (transitive in `.venv`) | [uvloop (PyPI)](https://pypi.org/project/uvloop/) |
 | **virtualenv** | `21.2.4` | version | (transitive in `.venv`) | [virtualenv (PyPI)](https://pypi.org/project/virtualenv/) |
 | **watchfiles** | `1.1.1` | version | (transitive in `.venv`) | [watchfiles (PyPI)](https://pypi.org/project/watchfiles/) |

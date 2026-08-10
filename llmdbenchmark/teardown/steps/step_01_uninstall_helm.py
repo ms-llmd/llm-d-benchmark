@@ -1,12 +1,19 @@
 """Teardown Step 01 -- Uninstall Helm releases, OpenShift routes, and download jobs."""
 
+import json
+import tempfile
 from pathlib import Path
 
 import yaml
 
-from llmdbenchmark.executor.step import Step, StepResult, Phase
-from llmdbenchmark.executor.context import ExecutionContext
 from llmdbenchmark.executor.command import CommandExecutor
+from llmdbenchmark.executor.context import ExecutionContext
+from llmdbenchmark.executor.step import Phase, Step, StepResult
+from llmdbenchmark.standup.keda_saturation import (
+    stacks_enabling_epp_keda_saturation,
+    unique_epp_keda_saturation_namespaces,
+)
+from llmdbenchmark.standup.wva import _find_yaml, _has_yaml_content
 from llmdbenchmark.utilities.kube_helpers import (
     force_remove_finalizers_by_selector,
     wait_for_pods_deleted,
@@ -15,6 +22,26 @@ from llmdbenchmark.utilities.kube_helpers import (
 
 class UninstallHelmStep(Step):
     """Uninstall Helm releases and associated routes."""
+
+    # Helm statuses that a plain `helm uninstall` cannot reliably clear and
+    # that block a subsequent standup `helmfile apply` from reinstalling.
+    # For releases in these states we delete the backing release secret
+    # directly instead of calling `helm uninstall`.
+    _WEDGED_HELM_STATES = frozenset(
+        {
+            "uninstalling",
+            "pending-install",
+            "pending-upgrade",
+            "pending-rollback",
+            "failed",
+        }
+    )
+
+    # Chart name prefixes used exclusively by modelservice deployments this
+    # tool creates (llm-d-modelservice, llm-d-router-gateway/-standalone).
+    # Used as a fallback match on full-scenario teardowns -- see
+    # _release_matches.
+    _MANAGED_CHART_PREFIXES = ("llm-d-modelservice", "llm-d-router-")
 
     def __init__(self):
         super().__init__(
@@ -26,11 +53,17 @@ class UninstallHelmStep(Step):
         )
 
     def should_skip(self, context: ExecutionContext) -> bool:
+        if "nok8s" in (context.deployed_methods or []):
+            return True
         # We still run for WVA-enabled stacks even when neither
         # modelservice nor fma is in deployed_methods, so the VA+HPA
         # resources get cleaned up.
-        if ("modelservice" in context.deployed_methods
-                or "fma" in context.deployed_methods):
+        if (
+            "modelservice" in context.deployed_methods
+            or "fma" in context.deployed_methods
+        ):
+            return False
+        if self._fma_guide_name(context):
             return False
         return not self._any_stack_has_wva(context)
 
@@ -50,6 +83,26 @@ class UninstallHelmStep(Step):
                 return True
         return False
 
+    @staticmethod
+    def _fma_guide_name(context: ExecutionContext) -> str:
+        """Return the guide name if any rendered stack is a kustomize FMA guide,
+        else "".
+        """
+        for stack_path in context.rendered_stacks or []:
+            cfg_file = stack_path / "config.yaml"
+            if not cfg_file.exists():
+                continue
+            try:
+                with open(cfg_file, encoding="utf-8") as fh:
+                    cfg = yaml.safe_load(fh) or {}
+            except (OSError, yaml.YAMLError):
+                continue
+            if (cfg.get("kustomize", {}) or {}).get("guideName", "") == (
+                "fast-model-actuation"
+            ):
+                return "fast-model-actuation"
+        return ""
+
     def execute(
         self, context: ExecutionContext, stack_path: Path | None = None
     ) -> StepResult:
@@ -61,13 +114,18 @@ class UninstallHelmStep(Step):
 
         model_labels = self._collect_model_labels(context)
 
-        is_fma_enabled = "fma" in context.deployed_methods
+        fma_guide_name = self._fma_guide_name(context)
+        is_fma_enabled = "fma" in context.deployed_methods or bool(fma_guide_name)
 
         # Delete FMA CRs before uninstalling the Helm chart so the
         # controller is still running and can remove pod finalizers.
         if is_fma_enabled:
             for ns in namespaces:
-                self._delete_fma_crs(cmd, context, ns)
+                self._delete_fma_crs(cmd, context, ns, fma_guide_name)
+            # Remove any node label standup applied for launcher node selection
+            # (mirrors step_06's fma.launcherNodeSelection). No-op unless that
+            # feature was enabled for a stack.
+            self._unlabel_launcher_nodes(cmd, context)
 
         for ns in namespaces:
             self._uninstall_releases(cmd, context, ns, release, model_labels, errors)
@@ -80,6 +138,7 @@ class UninstallHelmStep(Step):
         # partial-stack teardown preserves it because the remaining stacks
         # still depend on it. --deep forces uninstall regardless.
         self._teardown_wva(cmd, context, errors)
+        self._teardown_epp_keda_saturation(cmd, context, errors)
 
         if errors:
             return StepResult(
@@ -102,20 +161,26 @@ class UninstallHelmStep(Step):
         cmd: CommandExecutor,
         context: ExecutionContext,
         namespace: str,
+        guide_name: str = "",
     ) -> None:
         """Delete FMA objects so the controller can remove pod finalizers
         before the Helm chart uninstall takes it down.
         """
-        # Delete requester to start the unbinding
+        # Delete the requester Deployment to start unbinding
+        dep_selector = (
+            f"llm-d.ai/guide={guide_name}" if guide_name else "stood-up-via=fma"
+        )
         context.logger.log_info(
-            f"  Deleting FMA requester ReplicaSet in {namespace} "
+            f"  Deleting FMA requester Deployment ({dep_selector}) in {namespace} "
             "(before Helm uninstall)",
             emoji="🗑️",
         )
         cmd.kube(
-            "delete", "replicaset",
-            "--selector=stood-up-via=fma",
-            "--namespace", namespace,
+            "delete",
+            "deployment",
+            f"--selector={dep_selector}",
+            "--namespace",
+            namespace,
             "--ignore-not-found=true",
             check=False,
         )
@@ -128,8 +193,13 @@ class UninstallHelmStep(Step):
         ]
         for kind in fma_cr_kinds:
             result = cmd.kube(
-                "get", kind, "--namespace", namespace,
-                "-o", "name", "--ignore-not-found",
+                "get",
+                kind,
+                "--namespace",
+                namespace,
+                "-o",
+                "name",
+                "--ignore-not-found",
                 check=False,
             )
             if not result.success or not result.stdout.strip():
@@ -140,22 +210,72 @@ class UninstallHelmStep(Step):
                     emoji="🗑️",
                 )
                 cmd.kube(
-                    "delete", "--namespace", namespace,
+                    "delete",
+                    "--namespace",
+                    namespace,
                     "--ignore-not-found=true",
-                    cr, check=False,
+                    cr,
+                    check=False,
                 )
 
         # Wait for all FMA pods to terminate while the controller is still running.
         # Then force-remove any remaining finalizers and force-delete: this handles
         # pods left stuck from a previous teardown.
         timeout = context.fma_teardown_timeout
-        for selector in [
+        requester_selector = (
+            f"llm-d.ai/guide={guide_name}" if guide_name else "llm-d.ai/role=requester"
+        )
+        pod_selectors = [
             "app.kubernetes.io/component=launcher",
-            "llm-d.ai/role=requester",
-        ]:
+            requester_selector,
+        ]
+        for selector in pod_selectors:
             wait_for_pods_deleted(cmd, selector, namespace, timeout, context)
             force_remove_finalizers_by_selector(cmd, selector, namespace, context)
             wait_for_pods_deleted(cmd, selector, namespace, 30, context)
+
+    def _unlabel_launcher_nodes(
+        self, cmd: CommandExecutor, context: ExecutionContext
+    ) -> None:
+        """Remove the node label standup applied for FMA launcher pinning.
+
+        step_06 labels a chosen GPU node ``<nodeLabel>=true`` when a stack sets
+        ``fma.launcherNodeSelection.enabled``. On teardown we strip it so the
+        (shared) node is left clean for the next run. No-op for stacks that did
+        not enable the feature; unlabel failures are warnings, not fatal.
+        """
+
+        # `or {}` at each level guards against a stack setting fma: null or
+        # launcherNodeSelection: null; `or "fma-hotstart"` guards an explicit
+        # null/empty nodeLabel (.get default only applies to a MISSING key).
+        def _lns(cfg):
+            return (cfg.get("fma", {}) or {}).get("launcherNodeSelection", {}) or {}
+
+        node_labels = {
+            (_lns(cfg).get("nodeLabel") or "fma-hotstart")
+            for cfg in map(self._load_stack_config, context.rendered_stacks or [])
+            if _lns(cfg).get("enabled", False)
+        }
+        for node_label in node_labels:
+            # `<key>-` removes the label; `-l <key>=true` restricts to nodes
+            # that carry it, so this is a no-op (not an error) when none do.
+            result = cmd.kube(
+                "label",
+                "nodes",
+                "-l",
+                f"{node_label}=true",
+                f"{node_label}-",
+                check=False,
+            )
+            if result.success:
+                context.logger.log_info(
+                    f"  Removed FMA launcher node label {node_label}=true",
+                    emoji="🗑️",
+                )
+            else:
+                context.logger.log_warning(
+                    f"  Could not remove node label {node_label}=true: {result.stderr}"
+                )
 
     def _collect_model_labels(self, context: ExecutionContext) -> list[str]:
         """Collect model ID labels used to match helm releases."""
@@ -168,47 +288,137 @@ class UninstallHelmStep(Step):
         return labels
 
     def _uninstall_releases(
-        self, cmd: CommandExecutor, context: ExecutionContext,
-        namespace: str, release: str, model_labels: list[str], errors: list
+        self,
+        cmd: CommandExecutor,
+        context: ExecutionContext,
+        namespace: str,
+        release: str,
+        model_labels: list[str],
+        errors: list,
     ):
-        """Find and uninstall Helm releases matching the release name or model labels."""
+        """Find and uninstall Helm releases matching the release name or model labels.
+
+        Enumerates every release status explicitly so releases stuck in a
+        transitional state (``uninstalling`` / ``pending-*`` / ``failed``)
+        are visible -- Helm v3's default ``helm list`` hides them. A release
+        left ``uninstalling`` by a previously interrupted teardown is
+        otherwise never cleaned: it blocks the next standup's
+        ``helmfile apply`` (which no-ops on an already-present release) so
+        the EPP/InferencePool never redeploy. For such wedged releases
+        ``helm uninstall`` does not reliably clear the release, so we delete
+        the backing release secret directly.
+
+        Combining the status filters (rather than passing ``--all``) keeps
+        this working across both Helm v3 (pinned by ``install.sh``) and
+        Helm v4, which dropped the ``--all`` flag in favor of listing every
+        status by default.
+        """
         result = cmd.helm(
-            "list", "--namespace", namespace, "--no-headers",
+            "list",
+            "--namespace",
+            namespace,
+            "--deployed",
+            "--failed",
+            "--pending",
+            "--uninstalled",
+            "--uninstalling",
+            "--superseded",
+            "-o",
+            "json",
         )
         if not result.success:
             return
 
-        for line in result.stdout.strip().splitlines():
-            parts = line.split()
-            if not parts:
+        try:
+            releases = json.loads(result.stdout) or []
+        except ValueError:
+            releases = []
+
+        # Full-scenario teardowns (no --stack filter) are allowed to match
+        # releases by chart identity alone -- see _release_matches. A
+        # --stack-filtered (partial) teardown must not, since sibling
+        # stacks of this scenario can share the namespace and must be
+        # preserved.
+        full_teardown = not context.stack_filter
+
+        for rel in releases:
+            release_name = rel.get("name", "")
+            if not release_name or not self._release_matches(
+                release_name, release, model_labels, rel.get("chart", ""), full_teardown
+            ):
                 continue
-            release_name = parts[0]
-            if self._release_matches(release_name, release, model_labels):
-                context.logger.log_info(
-                    f"Uninstalling Helm release \"{release_name}\" "
-                    f"from {namespace}"
+
+            status = rel.get("status", "")
+            if status in self._WEDGED_HELM_STATES:
+                context.logger.log_warning(
+                    f'Helm release "{release_name}" in {namespace} is stuck in '
+                    f'state "{status}" (interrupted teardown); deleting its '
+                    "release secret(s) directly."
                 )
-                uninstall = cmd.helm(
-                    "uninstall", release_name, "--namespace", namespace,
+                cmd.kube(
+                    "delete",
+                    "secret",
+                    "-l",
+                    f"owner=helm,name={release_name}",
+                    "--ignore-not-found=true",
+                    namespace=namespace,
+                    check=False,
                 )
-                if not uninstall.success:
-                    errors.append(
-                        f"Failed to uninstall {release_name}: "
-                        f"{uninstall.stderr}"
-                    )
+                continue
+
+            context.logger.log_info(
+                f'Uninstalling Helm release "{release_name}" from {namespace}'
+            )
+            uninstall = cmd.helm(
+                "uninstall",
+                release_name,
+                "--namespace",
+                namespace,
+            )
+            if not uninstall.success:
+                errors.append(f"Failed to uninstall {release_name}: {uninstall.stderr}")
 
     @staticmethod
     def _release_matches(
-        release_name: str, release: str, model_labels: list[str]
+        release_name: str,
+        release: str,
+        model_labels: list[str],
+        chart: str,
+        full_teardown: bool,
     ) -> bool:
-        """Check if a helm release belongs to this deployment."""
+        """Check if a helm release belongs to this deployment.
+
+        ``model_labels`` is derived from a fresh render of the scenario at
+        teardown time, which depends on ``--models``/``LLMDBENCH_MODELS``
+        being re-supplied to match what was actually deployed at standup.
+        If it's omitted or doesn't match, a release can go unmatched here
+        even though it belongs to this deployment -- silently leaving it
+        (and everything it owns, e.g. the GAIE/EPP Deployment) behind with
+        teardown still reporting success.
+
+        On a full-scenario teardown (``full_teardown``, i.e. no --stack
+        filter), we also match by chart identity: any release using one of
+        our managed charts (llm-d-modelservice, llm-d-router-*) belongs to
+        this deployment regardless of model-label mismatches, since a full
+        teardown is meant to wipe everything this tool deployed in the
+        namespace anyway. A --stack-filtered (partial) teardown must not
+        use this broader match -- sibling stacks in the same namespace can
+        use the same charts and must be preserved.
+        """
         if release and release in release_name:
             return True
-        return any(label in release_name for label in model_labels)
+        if any(label in release_name for label in model_labels):
+            return True
+        return full_teardown and chart.startswith(
+            UninstallHelmStep._MANAGED_CHART_PREFIXES
+        )
 
     def _delete_openshift_routes(
-        self, cmd: CommandExecutor, context: ExecutionContext,
-        namespace: str, release: str
+        self,
+        cmd: CommandExecutor,
+        context: ExecutionContext,
+        namespace: str,
+        release: str,
     ):
         """Delete OpenShift routes for the inference gateway."""
         if not context.is_openshift:
@@ -219,42 +429,43 @@ class UninstallHelmStep(Step):
             f"{release}-inference-gateway",
         ]:
             context.logger.log_info(
-                f"Deleting OpenShift route \"{route_name}\" "
-                f"from {namespace}"
+                f'Deleting OpenShift route "{route_name}" from {namespace}'
             )
             result = cmd.kube(
-                "delete", "--namespace", namespace,
+                "delete",
+                "--namespace",
+                namespace,
                 "--ignore-not-found=true",
-                "route", route_name,
+                "route",
+                route_name,
             )
             if result.success:
-                context.logger.log_info(
-                    f"  Deleted route/{route_name}", emoji="🗑️"
-                )
+                context.logger.log_info(f"  Deleted route/{route_name}", emoji="🗑️")
 
     def _teardown_wva(
         self, cmd: CommandExecutor, context: ExecutionContext, errors: list
     ) -> None:
         """Tear down WVA resources.
 
-        Always deletes the per-stack VariantAutoscaling + HPA so the model
-        no longer auto-scales after teardown.
+        Always deletes the per-stack KEDA ScaledObject so the model
+        no longer auto-scales after teardown. Deleting the ScaledObject cascades
+        to KEDA's generated HPA deletion.
 
         The (per-namespace) WVA controller is uninstalled on full-scenario
         teardowns (no ``--stack`` filter), because there are no remaining
         stacks of this scenario to depend on it. A partial-stack teardown
         (``--stack X``) preserves the controller -- the sibling stacks of
         this scenario in the same namespace still need it. ``--deep``
-        forces uninstall regardless of the filter.
+        forces uninstall regardless of the filter. When the controller is
+        uninstalled, also cleans up the per-namespace resources we created:
+        ServiceAccount, Secret, and ClusterRoleBinding.
 
-        prometheus-adapter and its supporting cluster-wide resources
-        (``allow-thanos-querier-api-access`` ClusterRole, ``prometheus-ca``
-        ConfigMap) are NEVER touched by teardown — not even with --deep.
-        They are shared cluster-wide infrastructure used by every WVA
-        tenant's HPA pipeline. Their lifecycle is managed once at the
-        cluster level (e.g. by a platform admin), and removing them on a
-        per-tenant teardown would silently break every other namespace's
-        autoscaling.
+        KEDA operator and the cluster-wide ``allow-thanos-querier-api-access``
+        ClusterRole are NEVER touched by teardown — not even with --deep.
+        They are shared cluster-wide infrastructure used by every WVA tenant's
+        ScaledObject pipeline. Their lifecycle is managed once at the cluster
+        level (e.g. by a platform admin), and removing them on a per-tenant
+        teardown would silently break every other namespace's autoscaling.
 
         Skipped entirely on non-OpenShift platforms — standup gates the
         WVA install on OpenShift (see step_03), so on other platforms
@@ -267,8 +478,8 @@ class UninstallHelmStep(Step):
             )
             return
 
-        wva_stacks: list[tuple[str, str]] = []  # (wva_namespace, model_id_label)
-        seen_ns: set[str] = set()
+        wva_stacks: list[tuple[str, str, bool, Path]] = []
+        seen_ns: dict[str, Path] = {}  # wva_ns -> first stack_path with that ns
 
         for stack_path in context.rendered_stacks or []:
             cfg_file = stack_path / "config.yaml"
@@ -282,28 +493,35 @@ class UninstallHelmStep(Step):
             wva_cfg = cfg.get("wva", {}) or {}
             if not wva_cfg.get("enabled", False):
                 continue
-            wva_ns = (
-                wva_cfg.get("namespace")
-                or cfg.get("namespace", {}).get("name", "")
+            wva_ns = wva_cfg.get("namespace") or cfg.get("namespace", {}).get(
+                "name", ""
             )
             model_id_label = cfg.get("model_id_label", "")
+            fma_enabled = bool((cfg.get("fma", {}) or {}).get("enabled", False))
             if wva_ns and model_id_label:
-                wva_stacks.append((wva_ns, model_id_label))
-                seen_ns.add(wva_ns)
+                wva_stacks.append((wva_ns, model_id_label, fma_enabled, stack_path))
+                if wva_ns not in seen_ns:
+                    seen_ns[wva_ns] = stack_path
 
         if not wva_stacks:
             return
 
-        # 1. Per-stack VariantAutoscaling + HPA: always delete.
-        for wva_ns, model_id_label in wva_stacks:
-            resource_name = f"{model_id_label}-decode"
-            for kind in ("hpa", "variantautoscaling.llmd.ai"):
+        # 1. Per-stack ScaledObject: always delete. Suffix is
+        # `-fma` under FMA, `-decode` otherwise -- matches template 28.
+        # Deleting the ScaledObject cascades to KEDA's generated HPA.
+        for wva_ns, model_id_label, fma_enabled, _stack_path in wva_stacks:
+            variant_suffix = "fma" if fma_enabled else "decode"
+            resource_name = f"{model_id_label}-{variant_suffix}"
+            for kind in ("scaledobject.keda.sh",):
                 context.logger.log_info(
                     f"Deleting {kind}/{resource_name} from ns/{wva_ns}"
                 )
                 result = cmd.kube(
-                    "delete", kind, resource_name,
-                    "--namespace", wva_ns,
+                    "delete",
+                    kind,
+                    resource_name,
+                    "--namespace",
+                    wva_ns,
                     "--ignore-not-found=true",
                     check=False,
                 )
@@ -342,40 +560,197 @@ class UninstallHelmStep(Step):
         else:
             mode_msg = "Full-scenario teardown: uninstalling WVA controller(s)."
         context.logger.log_info(
-            f"{mode_msg} prometheus-adapter and shared cluster RBAC are "
-            "kept intact."
+            f"{mode_msg} KEDA operator and shared cluster RBAC are kept intact."
         )
         for wva_ns in sorted(seen_ns):
+            stack_path = seen_ns[wva_ns]
+            kustomize_yaml = _find_yaml(stack_path, "19_wva-kustomize")
+            if not kustomize_yaml or not _has_yaml_content(kustomize_yaml):
+                context.logger.log_info(
+                    f"WVA kustomization not found for ns/{wva_ns} "
+                    "-- skipping controller uninstall."
+                )
+                continue
             context.logger.log_info(
-                f"Uninstalling helm release "
-                f"workload-variant-autoscaler from ns/{wva_ns}"
+                f"Uninstalling WVA controller via kustomize from ns/{wva_ns}"
             )
-            uninstall = cmd.helm(
-                "uninstall", "workload-variant-autoscaler",
-                "--namespace", wva_ns,
+            tmp_dir = Path(tempfile.mkdtemp())
+            (tmp_dir / "kustomization.yaml").write_text(
+                kustomize_yaml.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            uninstall = cmd.kube(
+                "delete",
+                "-k",
+                str(tmp_dir),
                 "--ignore-not-found",
                 check=False,
             )
-            if not uninstall.success and "not found" not in (uninstall.stderr or "").lower():
+            if (
+                not uninstall.success
+                and "not found" not in (uninstall.stderr or "").lower()
+            ):
                 errors.append(
                     f"Failed to uninstall WVA controller in {wva_ns}: "
                     f"{uninstall.stderr}"
                 )
 
+            # Clean up per-namespace resources we created (ServiceAccount, Secret).
+            # ClusterRoleBinding is cluster-scoped so we handle it separately.
+            for kind, name in (
+                ("serviceaccount", "wva-prometheus-auth"),
+                ("secret", "prometheus-auth"),
+            ):
+                result = cmd.kube(
+                    "delete",
+                    kind,
+                    name,
+                    "--namespace",
+                    wva_ns,
+                    "--ignore-not-found=true",
+                    check=False,
+                )
+                if result.success:
+                    context.logger.log_info(
+                        f"  Deleted {kind}/{name} from ns/{wva_ns}", emoji="🗑️"
+                    )
+
+            # Delete the namespace-suffixed ClusterRoleBinding (cluster-scoped).
+            crb_name = f"allow-thanos-querier-api-access-{wva_ns}"
+            result = cmd.kube(
+                "delete",
+                "clusterrolebinding",
+                crb_name,
+                "--ignore-not-found=true",
+                check=False,
+            )
+            if result.success:
+                context.logger.log_info(
+                    f"  Deleted clusterrolebinding/{crb_name}", emoji="🗑️"
+                )
+
+    def _teardown_epp_keda_saturation(
+        self, cmd: CommandExecutor, context: ExecutionContext, errors: list
+    ) -> None:
+        """Tear down EPP+KEDA saturation autoscaling resources (controller-free mode).
+
+        Mirrors _teardown_wva but without the kustomize controller uninstall.
+        Deletes: per-stack ScaledObject, per-namespace ServiceMonitor + RBAC,
+        TriggerAuthentication, prometheus-auth Secret, bearer-token ServiceAccount,
+        and ClusterRoleBindings.
+        """
+        pairs = stacks_enabling_epp_keda_saturation(context.rendered_stacks or [])
+        if not pairs:
+            return
+
+        # Per-stack: delete ScaledObject (rendered as 30_epp-keda-saturation-scaledobject.yaml.j2).
+        # These are not Helm-managed; `kubectl delete` is idempotent.
+        context.logger.log_info("Deleting EPP+KEDA ScaledObjects...")
+        for stack_path, cfg in pairs:
+            epp_keda_cfg = cfg.get("eppKedaSaturation", {}) or {}
+            epp_keda_ns = epp_keda_cfg.get("namespace") or cfg.get("namespace", {}).get(
+                "name", ""
+            )
+            if not epp_keda_ns:
+                continue
+
+            scaledobject_yaml = _find_yaml(
+                stack_path, "30_epp-keda-saturation-scaledobject"
+            )
+            if scaledobject_yaml and _has_yaml_content(scaledobject_yaml):
+                result = cmd.kube(
+                    "delete",
+                    "-f",
+                    str(scaledobject_yaml),
+                    "--namespace",
+                    epp_keda_ns,
+                    "--ignore-not-found=true",
+                    check=False,
+                )
+                if result.success:
+                    context.logger.log_info(
+                        f"  Deleted ScaledObject from ns/{epp_keda_ns}"
+                    )
+
+        # Per-namespace: delete ServiceMonitor + RBAC, TriggerAuthentication, Secret, SA, ClusterRoleBindings.
+        unique_namespaces = unique_epp_keda_saturation_namespaces(pairs)
+        for epp_keda_ns in sorted(unique_namespaces):
+            context.logger.log_info(
+                f"Cleaning up EPP+KEDA resources in ns/{epp_keda_ns}..."
+            )
+
+            # Delete EPP ServiceMonitor + metrics reader RBAC (rendered as 29_epp-keda-saturation-epp-monitoring.yaml.j2).
+            stack_path = unique_namespaces[epp_keda_ns][0]
+            epp_monitoring_yaml = _find_yaml(
+                stack_path, "29_epp-keda-saturation-epp-monitoring"
+            )
+            if epp_monitoring_yaml and _has_yaml_content(epp_monitoring_yaml):
+                result = cmd.kube(
+                    "delete",
+                    "-f",
+                    str(epp_monitoring_yaml),
+                    "--namespace",
+                    epp_keda_ns,
+                    "--ignore-not-found=true",
+                    check=False,
+                )
+                if result.success:
+                    context.logger.log_info(
+                        f"  Deleted EPP ServiceMonitor and metrics RBAC from ns/{epp_keda_ns}"
+                    )
+
+            # Delete per-namespace resources (ServiceAccount, Secret, TriggerAuthentication).
+            for kind, name in (
+                ("serviceaccount", "wva-prometheus-auth"),
+                ("secret", "prometheus-auth"),
+                ("triggerauthentication", "prometheus-auth"),
+            ):
+                result = cmd.kube(
+                    "delete",
+                    kind,
+                    name,
+                    "--namespace",
+                    epp_keda_ns,
+                    "--ignore-not-found=true",
+                    check=False,
+                )
+                if result.success:
+                    context.logger.log_info(
+                        f"  Deleted {kind}/{name} from ns/{epp_keda_ns}", emoji="🗑️"
+                    )
+
+            # Delete cluster-scoped ClusterRoleBindings (thanos-querier + EPP metrics reader).
+            for crb_suffix in ("", "-epp-metrics-reader"):
+                crb_name = f"allow-thanos-querier-api-access-{epp_keda_ns}{crb_suffix}"
+                crb_name_alt = (
+                    f"epp-metrics-reader-{epp_keda_ns}" if crb_suffix else None
+                )
+                for name in [crb_name, crb_name_alt]:
+                    if not name:
+                        continue
+                    result = cmd.kube(
+                        "delete",
+                        "clusterrolebinding",
+                        name,
+                        "--ignore-not-found=true",
+                        check=False,
+                    )
+                    if result.success:
+                        context.logger.log_info(
+                            f"  Deleted clusterrolebinding/{name}", emoji="🗑️"
+                        )
+
     def _delete_download_job(
-        self, cmd: CommandExecutor, context: ExecutionContext,
-        namespace: str
+        self, cmd: CommandExecutor, context: ExecutionContext, namespace: str
     ):
         """Delete the model download job."""
-        context.logger.log_info(
-            f"Deleting download job in {namespace}"
-        )
+        context.logger.log_info(f"Deleting download job in {namespace}")
         result = cmd.kube(
-            "delete", "--namespace", namespace,
+            "delete",
+            "--namespace",
+            namespace,
             "--ignore-not-found=true",
-            "job", "download-model",
+            "job",
+            "download-model",
         )
         if result.success:
-            context.logger.log_info(
-                "  Deleted job/download-model", emoji="🗑️"
-            )
+            context.logger.log_info("  Deleted job/download-model", emoji="🗑️")

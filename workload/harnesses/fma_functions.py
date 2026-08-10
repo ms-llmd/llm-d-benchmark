@@ -15,6 +15,7 @@ import requests
 from kubernetes import client, watch
 from kubernetes.client.exceptions import ApiException
 
+from dpc_log_parser import parse_dpc_log_file
 from nop_functions import (
     BenchmarkResult,
     BenchmarkScenario,
@@ -35,7 +36,12 @@ from nop_functions import (
 logger = logging.getLogger(__name__)
 
 DUAL_LABEL = "dual-pods.llm-d.ai/dual"
+ACCELERATORS_ANNOTATION = "dual-pods.llm-d.ai/accelerators"
 FMA_TIMEOUT = 10.0 * 60.0  # time (seconds) to wait
+
+# Name of the requester container whose start time is the actuation baseline
+# used by the dual-pods controller. Mirrors FMA pkg/api InferenceServerContainerName.
+INFERENCE_SERVER_CONTAINER_NAME = "inference-server"
 
 
 @dataclass
@@ -46,6 +52,8 @@ class FMARequesterInfo:
     creation_timestamp: float = 0.0
     ready_timestamp: float = 0.0
     dual_label_timestamp: float = 0.0
+    container_start_timestamp: float = 0.0
+    gpu_uuids: str = ""
     pod: Any | None = None
 
     def dump(self) -> dict[str, Any]:
@@ -78,6 +86,24 @@ class FMALauncherInfo:  # pylint: disable=too-many-instance-attributes
     vllm_endpoint: str = ""
     ttft: float = 0.0
     actuation_condition: FMAActuationCondition | None = None
+    launcher_creation_timestamp: float = 0.0
+    launcher_node: str = ""
+    t_wake: float | None = None
+    t_instance_create: float | None = None
+    t_cold_launcher: float | None = None
+    # Which baseline produced this iteration's actuation timing, one of:
+    #   "dpc"                 -- DPC "HTTP call done" log (highest fidelity)
+    #   "kube_container_start"-- Kube fallback, requester inference-server
+    #                            container state.running.started_at (matches the
+    #                            dual-pods controller's actuation baseline)
+    #   "kube_pod_create"     -- Kube fallback, container-start unavailable,
+    #                            reverted to requester pod creation_timestamp
+    timing_source: str = "kube_pod_create"
+
+    @property
+    def dpc_timing_available(self) -> bool:
+        """Derived convenience: True only when timing came from the DPC log."""
+        return self.timing_source == "dpc"
 
     def dump(self) -> dict[str, Any]:
         """Convert FMALauncherInfo to dict.
@@ -96,15 +122,19 @@ class FMALauncherInfo:  # pylint: disable=too-many-instance-attributes
                 else value
             )
 
+        # dpc_timing_available is a derived property (not a dataclass field), so
+        # include it explicitly for backward-compatible downstream readers.
+        dump_dict["dpc_timing_available"] = self.dpc_timing_available
+
         return dump_dict
 
 
 class FMAActuationCondition(StrEnum):
     """Type of actuation"""
 
-    T_LUKE_WARM = "T_luke_warm"  # when new launcher created by DPC + new vllm
-    T_WARM = "T_warm"  # when existing launcher creates new vllm
-    T_HOT = "T_hot"  # when waking up sleeping vllm
+    T_COLD_LAUNCHER = "T_cold_launcher"  # DPC creates new launcher + new vllm
+    T_WARM = "T_warm"  # existing launcher creates new vllm
+    T_HOT = "T_hot"  # waking sleeping vllm
 
     def dump(self) -> str:
         """Convert FMAActuationCondition to str.
@@ -121,6 +151,9 @@ class FMAMetricsIteration:
 
     iteration: int
     launcher_infos: list[FMALauncherInfo]
+    hot_hit_rate: float = 0.0
+    warm_hit_rate: float = 0.0
+    cold_launcher_hit_rate: float = 0.0
 
     def dump(self) -> dict[str, Any]:
         """Convert FMAMetricsIteration to dict.
@@ -268,6 +301,12 @@ def get_fma_launcher_infos(  # pylint: disable=too-many-locals,too-many-argument
                 launcher_info.container_name = container.name
                 launcher_info.name = engine.name
                 launcher_info.requester_info = requester_info
+                launcher_info.launcher_creation_timestamp = (
+                    launcher_pod.metadata.creation_timestamp.astimezone(
+                        timezone.utc
+                    ).timestamp()
+                )
+                launcher_info.launcher_node = launcher_pod.spec.node_name or ""
                 launcher_info.launcher_endpoint = (
                     f"http://{launcher_pod_ip}:{fma_launcher_port}"
                 )
@@ -309,13 +348,103 @@ def get_dual_label_timestamp(pod: Any) -> float:
     return 0.0
 
 
+def get_container_start_timestamp(pod: Any) -> float:
+    """Return the requester inference-server container start time as an epoch.
+
+    Mirrors the dual-pods controller's actuation baseline, which reads
+    ``getContainerStatus(requestingPod, "inference-server").State.Running.StartedAt``.
+
+    Returns the ``state.running.started_at`` epoch (float) for the container
+    named ``inference-server``, or 0.0 when the container is missing, not
+    running, or its start time is unavailable.
+    """
+    container_statuses = pod.status.container_statuses
+    if not container_statuses:
+        return 0.0
+    for cs in container_statuses:
+        if cs.name != INFERENCE_SERVER_CONTAINER_NAME:
+            continue
+        state = getattr(cs, "state", None)
+        running = getattr(state, "running", None) if state is not None else None
+        started_at = getattr(running, "started_at", None) if running else None
+        if started_at is None:
+            return 0.0
+        return started_at.astimezone(timezone.utc).timestamp()
+    return 0.0
+
+
+def select_kube_fallback_baseline(
+    requester_info: "FMARequesterInfo",
+) -> tuple[float, str]:
+    """Choose the Kube-timestamp fallback baseline for an actuation.
+
+    This is the fallback used only when DPC-log HTTP timing is unavailable. The
+    three ``timing_source`` values measure three DIFFERENT intervals -- they are
+    not one interval at three fidelities -- because each subtracts from a
+    different start point (all end at the requester's readiness):
+
+    - ``dpc`` (set elsewhere, by DPC-log refinement): duration measured inside
+      the DPC log as ``relay_readiness - httpCallStartTime`` of the wake /
+      instance-create call. Its baseline is the HTTP call start, which occurs
+      *after* the container is already up, so it is the tightest interval
+      (excludes scheduling + container startup).
+    - ``kube_container_start`` (this function, preferred): duration measured as
+      ``requester ready - container state.running.startedAt``. This baseline
+      matches the baseline the dual-pods controller uses for its own actuation
+      metric -- but NOT the ``dpc`` log baseline above; it starts earlier (at
+      container start) and so is a coarser upper bound than ``dpc``.
+    - ``kube_pod_create`` (this function, reverted): duration measured from the
+      requester pod ``creation_timestamp`` -- an even earlier start point, so
+      the coarsest and most degraded of the three. (This was the harness's
+      original baseline before it was aligned to container start.)
+
+    Because the sources measure different intervals, a ``dpc`` number and a
+    ``kube_*`` fallback number for the "same" actuation are not directly
+    comparable; per-iteration ``timing_source`` exists precisely so consumers
+    do not mix them blindly.
+
+    This function is pure (no logging): the tentative ``timing_source`` it
+    returns may be overridden later by DPC-log refinement, so any warning about
+    a ``kube_pod_create`` reversion is deferred until the final source is known
+    (see :func:`warn_on_pod_create_baseline`).
+
+    Returns a ``(baseline_epoch, timing_source)`` tuple where ``timing_source``
+    is ``"kube_container_start"`` or ``"kube_pod_create"``.
+    """
+    if requester_info.container_start_timestamp > 0.0:
+        return requester_info.container_start_timestamp, "kube_container_start"
+
+    return requester_info.creation_timestamp, "kube_pod_create"
+
+
+def warn_on_pod_create_baseline(
+    requester_name: str,
+    logger_: logging.Logger = logger,
+) -> None:
+    """Warn that an actuation's FINAL baseline reverted to pod creation time.
+
+    Emitted only for iterations whose final ``timing_source`` is
+    ``"kube_pod_create"`` (i.e. neither a container-start Kube fallback nor a
+    DPC-log override), so a genuine reversion is never silent while a reversion
+    that DPC refinement later moots produces no spurious warning.
+    """
+    logger_.warning(
+        "Requester '%s': inference-server container start time unavailable; "
+        "reverted Kube-fallback baseline to pod creation_timestamp "
+        "(timing_source=kube_pod_create). This iteration's actuation number is "
+        "measured from an earlier baseline than the dual-pods controller's own "
+        "actuation metric and may be overstated.",
+        requester_name,
+    )
+
+
 def wait_for_requester_pods(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-statements
     v1: client.CoreV1Api,
     namespace: str,
     label_selector: str,
-    rs_uid: str,
+    rs_uid: str | None,
     replicas: int,
-    replicaset_name: str,
+    deployment_name: str,
     timeout: float,
 ) -> list[FMARequesterInfo] | None:
     """
@@ -332,7 +461,7 @@ def wait_for_requester_pods(  # pylint: disable=too-many-arguments,too-many-posi
     ready_requester_pods = set()
 
     for p in pods:
-        if not is_owned_by_rs(p, rs_uid):
+        if rs_uid is not None and not is_owned_by_rs(p, rs_uid):
             continue
 
         requester_info = FMARequesterInfo()
@@ -342,6 +471,10 @@ def wait_for_requester_pods(  # pylint: disable=too-many-arguments,too-many-posi
         ).timestamp()
         requester_info.ready_timestamp = get_ready_timestamp(p)
         requester_info.dual_label_timestamp = get_dual_label_timestamp(p)
+        requester_info.container_start_timestamp = get_container_start_timestamp(p)
+        requester_info.gpu_uuids = (p.metadata.annotations or {}).get(
+            ACCELERATORS_ANNOTATION, ""
+        )
         requester_info.pod = p
         all_requester_pods[p.metadata.name] = requester_info
 
@@ -352,7 +485,7 @@ def wait_for_requester_pods(  # pylint: disable=too-many-arguments,too-many-posi
             ready_requester_pods.add(p.metadata.name)
 
     logger.info(
-        "Initial ReplicaSet Pods: %d, Ready: %d Replicas %d",
+        "Initial Requester Pods: %d, Ready: %d Replicas %d",
         len(all_requester_pods),
         len(ready_requester_pods),
         replicas,
@@ -378,7 +511,7 @@ def wait_for_requester_pods(  # pylint: disable=too-many-arguments,too-many-posi
                 name = pod.metadata.name
                 event_type = event["type"]
 
-                if not is_owned_by_rs(pod, rs_uid):
+                if rs_uid is not None and not is_owned_by_rs(pod, rs_uid):
                     continue
 
                 if event_type == "DELETED":
@@ -393,6 +526,14 @@ def wait_for_requester_pods(  # pylint: disable=too-many-arguments,too-many-posi
                         ).timestamp()
                     )
                     requester_info.ready_timestamp = get_ready_timestamp(pod)
+                    requester_info.container_start_timestamp = (
+                        get_container_start_timestamp(pod)
+                    )
+                    _gpu = (pod.metadata.annotations or {}).get(
+                        ACCELERATORS_ANNOTATION, ""
+                    )
+                    if _gpu:
+                        requester_info.gpu_uuids = _gpu
                     # only calculate if it wasn't already calculated
                     if requester_info.dual_label_timestamp == 0.0:
                         requester_info.dual_label_timestamp = get_dual_label_timestamp(
@@ -409,7 +550,7 @@ def wait_for_requester_pods(  # pylint: disable=too-many-arguments,too-many-posi
                         ready_requester_pods.discard(name)
 
                 logger.info(
-                    "Watch ReplicaSet Pods: %d, Ready: %d Replicas %d",
+                    "Watch Requester Pods: %d, Ready: %d Replicas %d",
                     len(all_requester_pods),
                     len(ready_requester_pods),
                     replicas,
@@ -431,42 +572,42 @@ def wait_for_requester_pods(  # pylint: disable=too-many-arguments,too-many-posi
             w.stop()
             logger.info(
                 "Timed out waiting for requester %s pods to become ready after %.1f secs.",
-                replicaset_name,
+                deployment_name,
                 elapsed,
             )
             return None
 
 
-def wait_for_replicaset_scale(
-    apps_v1: client.AppsV1Api, namespace: str, replicaset_name: str, timeout: float
+def wait_for_deployment_scale(
+    apps_v1: client.AppsV1Api, namespace: str, deployment_name: str, timeout: float
 ) -> bool:
-    """wait for replicaset to scale"""
+    """wait for the requester Deployment to reach its desired replica count"""
 
     start = time.perf_counter()
     while True:
         try:
-            rs = apps_v1.read_namespaced_replica_set(replicaset_name, namespace)
+            dep = apps_v1.read_namespaced_deployment(deployment_name, namespace)
         except ApiException:
             logger.exception(
-                "Error reading ReplicatSet '%s:%s'", namespace, replicaset_name
+                "Error reading Deployment '%s:%s'", namespace, deployment_name
             )
             return False
 
-        desired = rs.spec.replicas or 0
-        actual = rs.status.replicas or 0
+        desired = dep.spec.replicas or 0
+        actual = dep.status.replicas or 0
 
         logger.info(
-            "ReplicatSet '%s:%s' replicas actual %d desired %d",
+            "Deployment '%s:%s' replicas actual %d desired %d",
             namespace,
-            replicaset_name,
+            deployment_name,
             actual,
             desired,
         )
         if actual == desired:
             logger.info(
-                "ReplicatSet '%s:%s' replicas actual %d reached",
+                "Deployment '%s:%s' replicas actual %d reached",
                 namespace,
-                replicaset_name,
+                deployment_name,
                 actual,
             )
             return True
@@ -475,11 +616,11 @@ def wait_for_replicaset_scale(
         if elapsed > timeout:
             logger.info(
                 (
-                    "Timed out waiting for ReplicatSet '%s:%s' "
+                    "Timed out waiting for Deployment '%s:%s' "
                     "to have the desired replicas %d after %d secs."
                 ),
                 namespace,
-                replicaset_name,
+                deployment_name,
                 desired,
                 elapsed,
             )
@@ -489,69 +630,65 @@ def wait_for_replicaset_scale(
     return False
 
 
-def scale_replicaset(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def scale_deployment(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     v1: client.CoreV1Api,
     apps_v1: client.AppsV1Api,
-    replicaset_name: str,
+    deployment_name: str,
     namespace: str,
     replicas: int,
     timeout: float,
 ) -> list[FMARequesterInfo] | None:
-    """scale ReplicaSet and wait for pods to be ready"""
+    """scale the requester Deployment and wait for its pods to be ready."""
 
     if replicas < 0:
         logger.info("Replicas must be >= 0 and not %d", replicas)
         return None
 
-    # Scale ReplicaSet
+    # Scale the Deployment
     try:
-        apps_v1.patch_namespaced_replica_set(
-            name=replicaset_name,
+        apps_v1.patch_namespaced_deployment(
+            name=deployment_name,
             namespace=namespace,
             body={"spec": {"replicas": replicas}},
         )
         logger.info(
-            "Scaled ReplicaSet '%s:%s' to '%d'", namespace, replicaset_name, replicas
+            "Scaled Deployment '%s:%s' to '%d'", namespace, deployment_name, replicas
         )
     except ApiException:
         logger.exception(
-            "Error scaling ReplicatSet '%s:%s' to '%d'",
+            "Error scaling Deployment '%s:%s' to '%d'",
             namespace,
-            replicaset_name,
+            deployment_name,
             replicas,
         )
         return None
 
     if replicas == 0:
-        # wait fot it to set replicas to 0 and then return
+        # wait for it to set replicas to 0 and then return
         return (
             []
-            if wait_for_replicaset_scale(apps_v1, namespace, replicaset_name, timeout)
+            if wait_for_deployment_scale(apps_v1, namespace, deployment_name, timeout)
             else None
         )
 
     label_selector = None
-    rs_uid = None
     try:
-        rs = apps_v1.read_namespaced_replica_set(replicaset_name, namespace)
-        selector = rs.spec.selector.match_labels
+        dep = apps_v1.read_namespaced_deployment(deployment_name, namespace)
+        selector = dep.spec.selector.match_labels
         if not selector:
             logger.info(
-                "ReplicaSet '%s:%s' has no match_labels selector.",
+                "Deployment '%s:%s' has no match_labels selector.",
                 namespace,
-                replicaset_name,
+                deployment_name,
             )
             return None
         label_selector = ",".join(f"{k}={v}" for k, v in selector.items())
-        rs_uid = rs.metadata.uid
     except ApiException:
-        logger.exception(
-            "Error reading ReplicatSet '%s:%s'", namespace, replicaset_name
-        )
+        logger.exception("Error reading Deployment '%s:%s'", namespace, deployment_name)
         return None
 
     return wait_for_requester_pods(
-        v1, namespace, label_selector, rs_uid, replicas, replicaset_name, timeout
+        v1, namespace, label_selector, None, replicas, deployment_name, timeout
     )
 
 
@@ -694,26 +831,26 @@ def benchmark_fma(  # pylint: disable=too-many-arguments,too-many-positional-arg
     domain = urlparse(endpoint_url).netloc
     arr = domain.split(".")
     if len(arr) == 0:
-        raise RuntimeError(f"Unable to extract replicaset name from {domain}.")
+        raise RuntimeError(f"Unable to extract deployment name from {domain}.")
 
-    replicaset_name = arr[0]
-    replicaset = None
+    deployment_name = arr[0]
+    deployment = None
     try:
-        replicaset = apps_v1.read_namespaced_replica_set(
-            name=replicaset_name, namespace=namespace
+        deployment = apps_v1.read_namespaced_deployment(
+            name=deployment_name, namespace=namespace
         )
     except ApiException as e:
-        raise RuntimeError(f"Unable to read replicaset '{replicaset_name}'.") from e
+        raise RuntimeError(f"Unable to read deployment '{deployment_name}'.") from e
 
     # make sure to start with 0 replicas
-    desired = replicaset.spec.replicas or 0
+    desired = deployment.spec.replicas or 0
     if desired > 0:
         # should start with 0 replicas, scale to it
         if (
-            scale_replicaset(v1, apps_v1, replicaset_name, namespace, 0, FMA_TIMEOUT)
+            scale_deployment(v1, apps_v1, deployment_name, namespace, 0, FMA_TIMEOUT)
             is None
         ):
-            raise RuntimeError(f"Unable to scale replicaset {replicaset_name} to 0.")
+            raise RuntimeError(f"Unable to scale deployment {deployment_name} to 0.")
 
     try:  # pylint: disable=too-many-nested-blocks
         fma_metrics = FMAMetrics()
@@ -721,13 +858,13 @@ def benchmark_fma(  # pylint: disable=too-many-arguments,too-many-positional-arg
         for iteration in range(1, iterations + 1):  # pylint: disable=too-many-nested-blocks
             try:
                 logger.info("Benchmark FMA iteration '%d' start...", iteration)
-                # scale replicaset to 1
-                requester_infos = scale_replicaset(
-                    v1, apps_v1, replicaset_name, namespace, 1, FMA_TIMEOUT
+                # scale the requester Deployment to 1
+                requester_infos = scale_deployment(
+                    v1, apps_v1, deployment_name, namespace, 1, FMA_TIMEOUT
                 )
                 if requester_infos is None:
                     raise RuntimeError(
-                        f"Unable to scale replicaset {replicaset_name} to 1."
+                        f"Unable to scale deployment {deployment_name} to 1."
                     )
 
                 launcher_infos = get_fma_launcher_infos(
@@ -765,15 +902,15 @@ def benchmark_fma(  # pylint: disable=too-many-arguments,too-many-positional-arg
                             f"error on benchmark FMA '{launcher_info.name}' launcher"
                         ) from e
 
-                # scale replicaset to 0
+                # scale the requester Deployment back to 0
                 if (
-                    scale_replicaset(
-                        v1, apps_v1, replicaset_name, namespace, 0, FMA_TIMEOUT
+                    scale_deployment(
+                        v1, apps_v1, deployment_name, namespace, 0, FMA_TIMEOUT
                     )
                     is None
                 ):
                     raise RuntimeError(
-                        f"Unable to scale replicaset {replicaset_name} to 0."
+                        f"Unable to scale deployment {deployment_name} to 0."
                     )
 
                 for launcher_info in launcher_infos:
@@ -832,12 +969,55 @@ def benchmark_fma(  # pylint: disable=too-many-arguments,too-many-positional-arg
                                     FMAActuationCondition.T_HOT
                                 )
 
-                        # TODO: Improve the warm/luke_warm check instead of pod name
                         if launcher_info.actuation_condition is None:
-                            launcher_info.actuation_condition = (
-                                FMAActuationCondition.T_WARM
-                                if launcher_info.name.startswith("launcher-fma-")
-                                else FMAActuationCondition.T_LUKE_WARM
+                            if (
+                                launcher_info.launcher_creation_timestamp > 0.0
+                                and launcher_info.requester_info.creation_timestamp
+                                > 0.0
+                                and launcher_info.launcher_creation_timestamp
+                                < launcher_info.requester_info.creation_timestamp
+                            ):
+                                launcher_info.actuation_condition = (
+                                    FMAActuationCondition.T_WARM
+                                )
+                            else:
+                                launcher_info.actuation_condition = (
+                                    FMAActuationCondition.T_COLD_LAUNCHER
+                                )
+
+                        # Compute per-path timing (upper bound via Kube timestamps).
+                        # Anchor hot/warm actuation on the requester
+                        # inference-server container start (matches the dual-pods
+                        # controller's actuation baseline); revert to pod
+                        # creation_timestamp only when the container start is
+                        # unavailable, and record which
+                        # baseline was used via timing_source.
+                        ready_ts = launcher_info.requester_info.ready_timestamp
+                        actuation_baseline, launcher_info.timing_source = (
+                            select_kube_fallback_baseline(launcher_info.requester_info)
+                        )
+                        if (
+                            launcher_info.actuation_condition
+                            == FMAActuationCondition.T_HOT
+                            and ready_ts > 0.0
+                        ):
+                            launcher_info.t_wake = ready_ts - actuation_baseline
+                        elif (
+                            launcher_info.actuation_condition
+                            == FMAActuationCondition.T_WARM
+                            and ready_ts > 0.0
+                        ):
+                            launcher_info.t_instance_create = (
+                                ready_ts - actuation_baseline
+                            )
+                        elif (
+                            launcher_info.actuation_condition
+                            == FMAActuationCondition.T_COLD_LAUNCHER
+                            and ready_ts > 0.0
+                            and launcher_info.launcher_creation_timestamp > 0.0
+                        ):
+                            launcher_info.t_cold_launcher = (
+                                ready_ts - launcher_info.launcher_creation_timestamp
                             )
 
                     except Exception as e:
@@ -845,7 +1025,27 @@ def benchmark_fma(  # pylint: disable=too-many-arguments,too-many-positional-arg
                             f"error on benchmark FMA '{launcher_info.name}' launcher"
                         ) from e
 
-                fma_metrics_iteration = FMAMetricsIteration(iteration, launcher_infos)
+                # Compute hit rates for this iteration
+                total = len(launcher_infos)
+                hot_count = sum(
+                    li.actuation_condition == FMAActuationCondition.T_HOT
+                    for li in launcher_infos
+                )
+                warm_count = sum(
+                    li.actuation_condition == FMAActuationCondition.T_WARM
+                    for li in launcher_infos
+                )
+                cold_count = sum(
+                    li.actuation_condition == FMAActuationCondition.T_COLD_LAUNCHER
+                    for li in launcher_infos
+                )
+                fma_metrics_iteration = FMAMetricsIteration(
+                    iteration,
+                    launcher_infos,
+                    hot_hit_rate=hot_count / total if total > 0 else 0.0,
+                    warm_hit_rate=warm_count / total if total > 0 else 0.0,
+                    cold_launcher_hit_rate=cold_count / total if total > 0 else 0.0,
+                )
                 fma_metrics.iterations.append(fma_metrics_iteration)
             finally:
                 logger.info("Benchmark FMA iteration '%d' end.", iteration)
@@ -862,3 +1062,73 @@ def benchmark_fma(  # pylint: disable=too-many-arguments,too-many-positional-arg
             "app.kubernetes.io/component=launcher-populator",
             requests_dir,
         )
+
+        # Refine per-path timing using DPC log parsing (tighter than Kube timestamps)
+        dpc_records = parse_dpc_log_file(requests_dir)
+        if dpc_records:
+            logger.info(
+                "DPC log parsed: %d requester timing records found.",
+                len(dpc_records),
+            )
+            for fma_iter in fma_metrics.iterations:
+                for launcher_info in fma_iter.launcher_infos:
+                    requester_name = launcher_info.requester_info.name
+                    rec = dpc_records.get(requester_name)
+                    if rec is None:
+                        logger.debug(
+                            "No DPC timing record for requester '%s'.",
+                            requester_name,
+                        )
+                        continue
+
+                    if launcher_info.actuation_condition == FMAActuationCondition.T_HOT:
+                        refined = rec.t_hot()
+                        if refined is not None:
+                            logger.info(
+                                "Requester '%s': T_hot refined %.3fs -> %.3fs",
+                                requester_name,
+                                launcher_info.t_wake or 0.0,
+                                refined,
+                            )
+                            launcher_info.t_wake = refined
+                            launcher_info.timing_source = "dpc"
+                    elif (
+                        launcher_info.actuation_condition
+                        == FMAActuationCondition.T_WARM
+                    ):
+                        refined = rec.t_instance_create()
+                        if refined is not None:
+                            logger.info(
+                                "Requester '%s': T_instance_create refined %.3fs -> %.3fs",
+                                requester_name,
+                                launcher_info.t_instance_create or 0.0,
+                                refined,
+                            )
+                            launcher_info.t_instance_create = refined
+                            launcher_info.timing_source = "dpc"
+                    elif (
+                        launcher_info.actuation_condition
+                        == FMAActuationCondition.T_COLD_LAUNCHER
+                    ):
+                        refined = rec.t_cold_launcher()
+                        if refined is not None:
+                            logger.info(
+                                "Requester '%s': T_cold_launcher refined %.3fs -> %.3fs",
+                                requester_name,
+                                launcher_info.t_cold_launcher or 0.0,
+                                refined,
+                            )
+                            launcher_info.t_cold_launcher = refined
+                            launcher_info.timing_source = "dpc"
+        else:
+            logger.info(
+                "No DPC timing records found; using Kube-timestamp upper bounds."
+            )
+
+        # Now that DPC refinement has run, warn only for iterations whose FINAL
+        # timing_source is kube_pod_create -- so a reversion that DPC refinement
+        # overrode to "dpc" does not emit a spurious "may be overstated" warning.
+        for fma_iter in fma_metrics.iterations:
+            for launcher_info in fma_iter.launcher_infos:
+                if launcher_info.timing_source == "kube_pod_create":
+                    warn_on_pod_create_baseline(launcher_info.requester_info.name)

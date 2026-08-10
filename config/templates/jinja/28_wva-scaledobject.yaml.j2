@@ -1,0 +1,57 @@
+{# ============================================================================
+   28_wva-scaledobject.yaml.j2
+
+   Per-stack KEDA ScaledObject for WVA-managed autoscaling. KEDA queries
+   Prometheus for wva_desired_replicas and scales the Deployment accordingly.
+   Replaces the native HPA + prometheus-adapter external metrics pattern.
+
+   WVA discovers everything via the three opt-in annotations
+   (managed, model-id, variant-cost).
+
+   Only rendered when wva.enabled is true.
+   ============================================================================ #}
+{% if wva is defined and wva.enabled | default(false) %}
+{% if fma is defined and fma.enabled | default(false) %}
+{% set scale_kind = 'Deployment' %}
+{% set scale_name = 'fma-requester-' ~ model_id_label %}
+{% set variant_suffix = 'fma' %}
+{% else %}
+{% set scale_kind = 'Deployment' %}
+{% set scale_name = model_id_label ~ '-decode' %}
+{% set variant_suffix = 'decode' %}
+{% endif %}
+{% set hpa_name = model_id_label ~ '-' ~ variant_suffix %}
+{% set wva_ns = wva.namespace | default(namespace.name, true) %}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ hpa_name }}
+  namespace: {{ wva_ns }}
+  annotations:
+    llm-d.ai/managed: "true"
+    llm-d.ai/model-id: "{{ model.name }}"
+    llm-d.ai/variant-cost: "{{ wva.variantAutoscaling.variantCost | default('10.0') }}"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: {{ scale_kind }}
+    name: {{ scale_name }}
+  minReplicaCount: {{ wva.hpa.minReplicas | default(1) }}
+  maxReplicaCount: {{ wva.hpa.maxReplicas | default(16) }}
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: "{{ wva.prometheus.baseUrl | default('https://thanos-querier.openshift-monitoring.svc.cluster.local') }}:{{ wva.prometheus.port | default(9091) }}"
+      query: |
+        wva_desired_replicas{variant_name="{{ hpa_name }}",exported_namespace="{{ wva_ns }}"}
+      threshold: "{{ wva.hpa.targetAvgValue | default(1) }}"
+      authModes: "bearer"
+    authenticationRef:
+      name: prometheus-auth
+{% if wva.hpa.behavior is defined %}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+{{ wva.hpa.behavior | toyaml | indent(6, first=True) }}
+{% endif %}
+{% endif %}

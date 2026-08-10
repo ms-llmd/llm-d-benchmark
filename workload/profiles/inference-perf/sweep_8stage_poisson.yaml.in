@@ -1,0 +1,38 @@
+# Poisson-RPS twin of sweep_8stage.yaml (smart arm, both models via listModels).
+# Same model/data/shape; open-loop instead of closed-loop. RPS ladder 3.5->21->3.5
+# = per-stage sum of the half legs (8B 2.5->15 + 32B 1->6), so 8B + 32B == combined.
+# interval: 0 = no cooldown between stages.
+load:
+  type: poisson
+  interval: 0
+  request_timeout: 1200
+  stages:
+  - {rate: 3.5,  duration: 300}
+  - {rate: 7.0,  duration: 300}
+  - {rate: 10.5, duration: 300}
+  - {rate: 14.0, duration: 300}
+  - {rate: 17.5, duration: 300}
+  - {rate: 21.0, duration: 300}
+  - {rate: 17.5, duration: 300}
+  - {rate: 14.0, duration: 300}
+  - {rate: 10.5, duration: 300}
+  - {rate: 7.0,  duration: 300}
+  - {rate: 3.5,  duration: 300}
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: "Qwen/Qwen3-8B"
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  pretrained_model_name_or_path: Qwen/Qwen3-8B
+data:
+  type: random
+  input_distribution:  {min: 1024, max: 4096, mean: 2048, std_dev: 512, total_count: 200}
+  output_distribution: {min: 128,  max: 512,  mean: 256,  std_dev: 64,  total_count: 200}
+report:
+  request_lifecycle: {summary: true, per_stage: true, per_request: true}
+storage:
+  local_storage: {path: /workspace}

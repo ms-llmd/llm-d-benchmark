@@ -1,0 +1,38 @@
+# In-cluster IPP log capture: a laptop-side `oc logs -f` drops ~75% of lines under load.
+# Apply with `oc apply -n <namespace> -f`; the container reads its own namespace from the SA.
+# Requires the workload PVC; the ServiceAccount + RBAC it needs are created below.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: ipp-logtail}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: ipp-logtail}
+rules:
+- {apiGroups: [""], resources: ["pods"], verbs: ["get","list","watch"]}
+- {apiGroups: [""], resources: ["pods/log"], verbs: ["get"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: ipp-logtail}
+subjects: [{kind: ServiceAccount, name: ipp-logtail}]
+roleRef: {kind: Role, name: ipp-logtail, apiGroup: rbac.authorization.k8s.io}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ipp-logtail
+  labels: {app: ipp-logtail}
+spec:
+  serviceAccountName: ipp-logtail
+  restartPolicy: Always
+  containers:
+  - name: tail
+    image: ghcr.io/llm-d/llm-d-benchmark:v0.7.0
+    # re-resolves the label each iteration, so it follows payload-processor across rollouts
+    command: ["sh","-c","NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace); mkdir -p /requests/smart-logs; while true; do oc logs -f -l app=payload-processor -n $NS --since=5s --max-log-requests=5 >> /requests/smart-logs/ipp-full-live.log 2>/dev/null; sleep 2; done"]
+    volumeMounts:
+    - {name: requests, mountPath: /requests}
+  volumes:
+  - name: requests
+    persistentVolumeClaim: {claimName: workload-pvc}

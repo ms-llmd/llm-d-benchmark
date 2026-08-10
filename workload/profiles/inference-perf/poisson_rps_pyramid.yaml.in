@@ -1,0 +1,52 @@
+# Poisson (open-loop RPS) 11-stage saturation PYRAMID for the dual-pool 8B scenario.
+# Sized from the measured 50/50 concurrent run: aggregate ceiling ~45 req/s over 5 pods
+# => ~9 req/s per pod, so pool A (2 pods) caps ~18 req/s and pool B (3 pods) caps ~27 req/s.
+# Under a 50/50 split each pool receives R/2, so pool A saturates at R>36, pool B at R>54.
+# Target regimes for the 50/50 split (offered R -> per-pool R/2 vs cap):
+#   s1 R=16  A 8/18(44%)  B 8/27(30%)   neither
+#   s2 R=24  A12/18(67%)  B12/27(44%)   neither
+#   s3 R=32  A16/18(89%)  B16/27(59%)   pool A hot but NOT saturated
+#   s4 R=44  A22/18(122%) B22/27(81%)   pool A SATURATES, pool B does not
+#   s5 R=58  A29/18(161%) B29/27(107%)  BOTH saturate
+#   s6 R=72  A36/18(200%) B36/27(133%)  BOTH saturate harder
+# Same profile also exposes the 60/40 / smart improvement: at s4 a 40/60 split keeps both
+# pools ~98% (holding) while 50/50 has already saturated pool A -- saturation delayed a stage.
+# ponytail: rates hand-calibrated to r~=9 req/s/pod for THIS token mix; re-tune if the
+# input/output distribution or model changes.
+load:
+  type: poisson
+  interval: 0
+  request_timeout: 1200
+  # Symmetric pyramid: ramp up 16->72 then back down 72->16 (11 stages). The descent
+  # re-visits each rate so you can see routing hysteresis (does a pool recover from
+  # saturation at the same rate it entered it?).
+  stages:
+  - {rate: 16.0, duration: 180}
+  - {rate: 24.0, duration: 180}
+  - {rate: 32.0, duration: 180}
+  - {rate: 44.0, duration: 180}
+  - {rate: 58.0, duration: 180}
+  - {rate: 72.0, duration: 180}
+  - {rate: 58.0, duration: 180}
+  - {rate: 44.0, duration: 180}
+  - {rate: 32.0, duration: 180}
+  - {rate: 24.0, duration: 180}
+  - {rate: 16.0, duration: 180}
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: "Qwen/Qwen3-8B"
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  pretrained_model_name_or_path: Qwen/Qwen3-8B
+data:
+  type: random
+  input_distribution:  {min: 1024, max: 4096, mean: 2048, std_dev: 512, total_count: 200}
+  output_distribution: {min: 128,  max: 512,  mean: 256,  std_dev: 64,  total_count: 200}
+report:
+  request_lifecycle: {summary: true, per_stage: true, per_request: true}
+storage:
+  local_storage: {path: /workspace}

@@ -6,6 +6,8 @@ These tests stub the registry resolution so they don't hit the network.
 
 from __future__ import annotations
 
+import json
+from subprocess import CompletedProcess
 from typing import Any
 
 import pytest
@@ -76,6 +78,28 @@ def _images() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Registry tag ordering
+# ---------------------------------------------------------------------------
+
+
+class TestRegistryTagOrdering:
+    def test_skopeo_selects_latest_tag_by_version(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tags = ["v0.20.1", "v0.9.2", "v0.10.0"]
+
+        def _run(*args: Any, **kwargs: Any) -> CompletedProcess[str]:
+            return CompletedProcess(args[0], 0, stdout=json.dumps({"Tags": tags}))
+
+        monkeypatch.setattr(
+            "llmdbenchmark.parser.version_resolver.subprocess.run", _run
+        )
+        resolver = VersionResolver(_StubLogger())
+
+        assert resolver._resolve_via_skopeo("docker.io/vllm/vllm-openai") == ("v0.20.1")
+
+
+# ---------------------------------------------------------------------------
 # imageKey expansion
 # ---------------------------------------------------------------------------
 
@@ -138,9 +162,7 @@ class TestImageStringBackcompat:
 
 
 class TestConfigErrors:
-    def test_both_image_and_imagekey(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_both_image_and_imagekey(self, monkeypatch: pytest.MonkeyPatch) -> None:
         resolver = _make_resolver(monkeypatch)
         owner = {"image": "ghcr.io/foo:v1", "imageKey": "benchmark"}
         with pytest.raises(ImageOverrideConfigError, match="cannot set both"):
@@ -149,9 +171,7 @@ class TestConfigErrors:
     def test_unknown_imagekey(self, monkeypatch: pytest.MonkeyPatch) -> None:
         resolver = _make_resolver(monkeypatch)
         owner = {"imageKey": "doesnotexist"}
-        with pytest.raises(
-            ImageOverrideConfigError, match="does not match any entry"
-        ):
+        with pytest.raises(ImageOverrideConfigError, match="does not match any entry"):
             resolver._resolve_image_override(owner, _images(), "test")
 
     def test_imagekey_to_entry_with_empty_repo(
@@ -159,9 +179,7 @@ class TestConfigErrors:
     ) -> None:
         resolver = _make_resolver(monkeypatch)
         owner = {"imageKey": "broken"}
-        with pytest.raises(
-            ImageOverrideConfigError, match="empty repository or tag"
-        ):
+        with pytest.raises(ImageOverrideConfigError, match="empty repository or tag"):
             resolver._resolve_image_override(owner, _images(), "test")
 
     def test_non_string_imagekey(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -236,9 +254,7 @@ class TestResolveAllErrors:
         resolver = _make_resolver(monkeypatch)
         values = _base_values()
         values["decode"]["initContainers"][0]["imageKey"] = "doesnotexist"
-        with pytest.raises(
-            ImageOverrideConfigError, match="decode.initContainers"
-        ):
+        with pytest.raises(ImageOverrideConfigError, match="decode.initContainers"):
             resolver.resolve_all(values)
 
     def test_init_container_both_fields_raises(
@@ -248,9 +264,7 @@ class TestResolveAllErrors:
         values = _base_values()
         values["decode"]["initContainers"][0]["image"] = "ghcr.io/foo:v1"
         # imageKey: "benchmark" already set in _base_values
-        with pytest.raises(
-            ImageOverrideConfigError, match="cannot set both"
-        ):
+        with pytest.raises(ImageOverrideConfigError, match="cannot set both"):
             resolver.resolve_all(values)
 
     def test_init_container_resolution_failure_warns(
@@ -269,10 +283,9 @@ class TestResolveAllErrors:
         # Tag-resolution stub fails; init-container resolver should warn,
         # not raise.
         result = resolver.resolve_all(values)
-        assert any(
-            "Could not resolve" in w
-            for w in resolver.logger.warnings
-        ), f"Expected resolution warning, got: {resolver.logger.warnings}"
+        assert any("Could not resolve" in w for w in resolver.logger.warnings), (
+            f"Expected resolution warning, got: {resolver.logger.warnings}"
+        )
         # The image should remain unchanged (still :auto)
         decode_ic = result["decode"]["initContainers"][0]
         assert decode_ic["image"] == "ghcr.io/foo/bar:auto"

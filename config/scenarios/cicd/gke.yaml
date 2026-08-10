@@ -34,7 +34,7 @@ scenario:
         cloud.google.com/gke-accelerator: nvidia-h100-80gb
 
     # Disable monitoring for CI/CD
-    inferenceExtension:
+    router:
       monitoring:
         prometheus:
           enabled: false
@@ -108,7 +108,6 @@ scenario:
           --gpu-memory-utilization $VLLM_ACCELERATOR_MEM_UTIL \
           --max-num-seqs $VLLM_MAX_NUM_SEQ \
           --tensor-parallel-size $VLLM_TENSOR_PARALLELISM \
-          --disable-log-requests \
           --disable-uvicorn-access-log \
           --no-enable-prefix-caching
 

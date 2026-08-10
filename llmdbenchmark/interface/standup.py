@@ -45,14 +45,15 @@ def add_subcommands(
         "-t",
         "--methods",
         default=env("LLMDBENCH_METHODS"),
-        help="Standup methods (standalone, modelservice, fma, kustomize).",
+        help="Standup methods (standalone, modelservice, fma, kustomize, nok8s).",
     )
     standup_parser.add_argument(
         "--gateway-class",
         default=env("LLMDBENCH_GATEWAY_CLASS"),
         help=(
             "Override the scenario's gateway.className. Supported values: "
-            "epponly, istio, agentgateway, gke, data-science-gateway-class. "
+            "none, epponly, istio, agentgateway, gke, "
+            "data-science-gateway-class. "
             "Only takes effect on the modelservice deploy path -- ignored "
             "by kustomize/standalone/fma."
         ),
@@ -81,6 +82,12 @@ def add_subcommands(
         action="store_true",
         default=False,
         help="Enable Workload Variant Autoscaler (WVA) for this standup.",
+    )
+    standup_parser.add_argument(
+        "--epp-keda-saturation",
+        action="store_true",
+        default=False,
+        help="Enable EPP+KEDA saturation autoscaling (controller-free alternative to WVA).",
     )
     standup_parser.add_argument(
         "--monitoring",
@@ -123,6 +130,12 @@ def add_subcommands(
         help="Seconds to wait for the vLLM pods to deploy during standup in standalone mode.",
     )
     standup_parser.add_argument(
+        "--nok8s-deploy-timeout",
+        type=int,
+        default=env_int("LLMDBENCH_NOK8S_DEPLOY_TIMEOUT"),
+        help="Seconds to wait for the vLLM/EPP/Envoy containers to become ready in nok8s mode.",
+    )
+    standup_parser.add_argument(
         "--gateway-deploy-timeout",
         type=int,
         default=env_int("LLMDBENCH_GATEWAY_DEPLOY_TIMEOUT"),
@@ -143,6 +156,17 @@ def add_subcommands(
         "default StorageClass on the cluster) fails fast instead of "
         "masquerading as a downstream pod/job timeout. Default: 240 "
         "(some dynamic provisioners take 1-3 minutes per volume).",
+    )
+    standup_parser.add_argument(
+        "--data-access-timeout",
+        type=int,
+        default=env_int("LLMDBENCH_DATA_ACCESS_TIMEOUT"),
+        help="Seconds to wait for the harness data-access pod to become "
+        "Ready. Mirrors the run flag and accepts the same env var "
+        "(LLMDBENCH_DATA_ACCESS_TIMEOUT). On a WaitForFirstConsumer "
+        "StorageClass the unspent --pvc-bind-timeout is added to this "
+        "budget, because the volume is only provisioned once that pod "
+        "schedules. Default: 120.",
     )
     standup_parser.add_argument(
         "--llmd-repo-path",

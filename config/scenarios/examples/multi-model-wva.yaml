@@ -33,7 +33,7 @@
 #     per-stack always wins.
 #
 #   - `scenario:` is a list of N stacks. Each gets its own
-#     `{model_id_label}-ms` and `{model_id_label}-gaie` Helm releases,
+#     `{model_id_label}-ms` and `{model_id_label}-router` Helm releases,
 #     its own VA + HPA, and its own auto-named download Job + PVC.
 #
 #   - One WVA controller per wva.namespace (deduplicated by
@@ -61,7 +61,7 @@
 # To add a third model: copy one of the stack blocks, give it a unique
 # short descriptive `name` and a unique `model.*`. The parser auto-
 # derives unique `downloadJob.name` and
-# `inferenceExtension.monitoring.secretName` values from the model ID
+# `router.monitoring.secretName` values from the model ID
 # label, so nothing else needs per-stack customization.
 
 # ============================================================================
@@ -105,8 +105,10 @@ shared:
     vllmService:
       enabled: false
 
+  # The WVA controller itself is installed from the upstream kustomize
+  # overlay (see wva.image.tag / wva.repoRef above), not a helm chart --
+  # this block only pins helm charts still installed by step_03.
   chartVersions:
-    wva: 0.7.0
     prometheusAdapter: 5.2.0
 
   # --------------------------------------------------------------------------
@@ -133,27 +135,28 @@ shared:
   # flowControl feature gate is required for WVA autoscaling (EPP queue
   # depth drives the scaling signal).
   # --------------------------------------------------------------------------
-  inferenceExtension:
-    pluginsConfigFile: "wva-plugins.yaml"
-    pluginsCustomConfig:
-      wva-plugins.yaml: |
-        apiVersion: inference.networking.x-k8s.io/v1alpha1
-        kind: EndpointPickerConfig
-        featureGates:
-          - flowControl
-        plugins:
-          - type: queue-scorer
-          - type: kv-cache-utilization-scorer
-          - type: prefix-cache-scorer
-        schedulingProfiles:
-          - name: default
-            plugins:
-              - pluginRef: queue-scorer
-                weight: 2
-              - pluginRef: kv-cache-utilization-scorer
-                weight: 2
-              - pluginRef: prefix-cache-scorer
-                weight: 3
+  router:
+    epp:
+      pluginsConfigFile: "wva-plugins.yaml"
+      pluginsCustomConfig:
+        wva-plugins.yaml: |
+          apiVersion: llm-d.ai/v1alpha1
+          kind: EndpointPickerConfig
+          featureGates:
+            - flowControl
+          plugins:
+            - type: queue-scorer
+            - type: kv-cache-utilization-scorer
+            - type: prefix-cache-scorer
+          schedulingProfiles:
+            - name: default
+              plugins:
+                - pluginRef: queue-scorer
+                  weight: 2
+                - pluginRef: kv-cache-utilization-scorer
+                  weight: 2
+                - pluginRef: prefix-cache-scorer
+                  weight: 3
 
   # --------------------------------------------------------------------------
   # VLLM COMMON - same across pools. Individual flags can be overridden
@@ -296,16 +299,16 @@ scenario:
       gpuMemoryUtilization: 0.85
 
     wva:
+      # Only variantCost is consumed (llm-d.ai/variant-cost annotation on the
+      # KEDA ScaledObject). Controller SLO/saturation tuning lives in the
+      # upstream overlay ConfigMaps; no VariantAutoscaling CR is rendered.
       variantAutoscaling:
-        enabled: true
-        minReplicas: 1
-        maxReplicas: 10
         variantCost: "10.0"
-        slo:
-          tpot: 10
-          ttft: 1000
+      # Drives the per-stack KEDA ScaledObject.
       hpa:
-        enabled: true
+        enabled: true                # gates the smoketest's autoscaling-aware
+                                     # replica-range check (rendering is gated
+                                     # on wva.enabled, not this)
         minReplicas: 1
         maxReplicas: 10
         targetAvgValue: 1
@@ -350,16 +353,16 @@ scenario:
       gpuMemoryUtilization: 0.85
 
     wva:
+      # Only variantCost is consumed (llm-d.ai/variant-cost annotation on the
+      # KEDA ScaledObject). Controller SLO/saturation tuning lives in the
+      # upstream overlay ConfigMaps; no VariantAutoscaling CR is rendered.
       variantAutoscaling:
-        enabled: true
-        minReplicas: 1
-        maxReplicas: 10
         variantCost: "10.0"
-        slo:
-          tpot: 10
-          ttft: 1000
+      # Drives the per-stack KEDA ScaledObject.
       hpa:
-        enabled: true
+        enabled: true                # gates the smoketest's autoscaling-aware
+                                     # replica-range check (rendering is gated
+                                     # on wva.enabled, not this)
         minReplicas: 1
         maxReplicas: 10
         targetAvgValue: 1

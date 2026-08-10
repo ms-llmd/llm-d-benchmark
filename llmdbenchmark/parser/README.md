@@ -10,7 +10,9 @@ Render the specification Jinja2 template (`.yaml.j2`), parse the resulting YAML,
 
 ```python
 class RenderSpecification:
-    def __init__(self, specification_file: Path, base_dir: Path | None = None, logger=None): ...
+    def __init__(
+        self, specification_file: Path, base_dir: Path | None = None, logger=None
+    ): ...
     def eval(self) -> dict[str, Any]: ...  # Render, parse, validate, return config dict
 ```
 
@@ -22,11 +24,23 @@ For each stack in the scenario, merge defaults with scenario overrides, apply th
 
 ```python
 class RenderPlans:
-    def __init__(self, template_dir, defaults_file, scenarios_file, output_dir,
-                 logger=None, version_resolver=None, cluster_resource_resolver=None,
-                 cli_namespace=None, cli_model=None, cli_methods=None,
-                 cli_monitoring=False, setup_overrides=None): ...
-    def eval(self) -> RenderResult: ...    # Run full rendering pipeline
+    def __init__(
+        self,
+        template_dir,
+        defaults_file,
+        scenarios_file,
+        output_dir,
+        logger=None,
+        version_resolver=None,
+        cluster_resource_resolver=None,
+        cli_namespace=None,
+        cli_model=None,
+        cli_methods=None,
+        cli_monitoring=False,
+        setup_overrides=None,           # unscoped; applied last (DoE treatments)
+        setup_overrides_by_stack=None,  # {selector: overrides}; --cluster-config + --set
+    ): ...
+    def eval(self) -> RenderResult: ...  # Run full rendering pipeline
     def deep_merge(self, base, override) -> dict: ...  # Recursive dict merge
 ```
 
@@ -57,17 +71,61 @@ For each stack in the scenario:
 1. Merge defaults with the optional top-level `shared:` block (scenario-wide
    settings applied to every stack), then with stack-specific overrides:
    `defaults -> shared -> stack`.
-2. Apply setup overrides (from DoE experiment treatments) if present.
-3. Apply resource preset (if `resourcePreset` is set in the config).
-4. Run the resolver chain (see below).
-5. Validate against the Pydantic config schema.
-6. Inject the scenario-wide sibling summary (`siblingStacks`) and this
+2. Hoist scenario-nested modelservice sections to the top level (see
+   [Modelservice-nested sections](#modelservice-nested-sections)).
+3. Apply scenario overrides if present, resolved once per stack by
+   `_effective_setup_overrides`: the `setup_overrides_by_stack` selector
+   buckets least-specific first (`*`, then fnmatch globs, then exact stack
+   names -- carrying `--cluster-config` and `--set`), then the
+   unscoped `setup_overrides` (DoE experiment treatments) on top. Each
+   applied value is logged as `old -> new`, and an override whose parent
+   path is absent from the merged config warns as a probable typo.
+   Selectors matching no stack in the scenario fail the render in `eval()`.
+4. Apply resource preset (if `resourcePreset` is set in the config).
+5. Run the resolver chain (see below).
+6. Validate against the Pydantic config schema.
+7. Inject the scenario-wide sibling summary (`siblingStacks`) and this
    stack's 1-indexed `stackIndex` into the Jinja values so templates can
    emit cross-stack constructs (e.g. a shared HTTPRoute with N backendRefs)
    or gate cluster-scoped resources on `stackIndex == 1` to avoid races.
-7. Render all templates with the merged values.
-8. Write `config.yaml` with the fully-resolved config (JSON round-trip strips YAML anchors).
-9. Validate all generated YAML files for syntax.
+8. Render all templates with the merged values.
+9. Write `config.yaml` with the fully-resolved config (JSON round-trip strips YAML anchors).
+10. Validate all generated YAML files for syntax.
+
+#### Modelservice-nested sections
+
+`gateway`, `router`, `routing`, and `httpRoute` are consumed only on the
+modelservice deploy path (standalone / kustomize / fma never read them). A
+scenario may express them either flat at the top level, or nested under
+`modelservice:` to document that scope:
+
+```yaml
+modelservice:
+  enabled: true
+  gateway:
+    className: epponly
+  router:
+    epp: { replicas: 2 }
+  httpRoute:
+    requestTimeout: "300s"
+```
+
+`RenderPlans._hoist_modelservice_sections` lifts any nested block back to the
+top level (deep-merged over the defaults, nested wins) before the resolver
+chain runs, then pops the nested copy so `config.yaml` has a single home per
+section. Templates, resolvers and standup steps always read the **top-level**
+keys, so the two spellings render identically -- pick one per section.
+
+Set `gateway.className: none` to skip Gateway and router resources and expose
+decode vLLM directly through a plain Service. The renderer also disables the
+modelservice routing proxy so the resulting lane measures the model server
+without Gateway, EPP, or Envoy overhead.
+
+The hoist runs **before** setup overrides so the precedence stays
+`defaults < scenario < treatment/CLI`: DoE experiment treatments and CLI
+overrides target the **top-level** dotted path (e.g.
+`router.epp.pluginsConfigFile`, `--gateway-class`) and win over a nested
+scenario value.
 
 ### 3. Config Schema Validation (`config_schema.py`)
 
@@ -100,7 +158,7 @@ During plan rendering, the following resolvers execute in order on the merged va
 5. **Namespace resolution** -- Apply CLI `--namespace` override or resolve `"auto"` to default `"llmdbench"`. Supports comma-separated `deploy,harness,wva` format.
 6. **Model resolution** -- Apply CLI `--models` override.
 7. **Model ID label resolution** (`_resolve_model_id_label`) -- Compute `model_id_label` from the model name using the hashed format `{first8}-{sha256_8}-{last8}`. This label is used in all templates for Kubernetes resource naming.
-8. **Per-stack identity resolution** (`_resolve_per_stack_identity`) -- Multi-stack scenarios (N >= 2) only. Auto-suffix shipped-default resource names (`storage.modelPvc.name`, `downloadJob.name`, `inferenceExtension.monitoring.secretName`) with `-{model_id_label}` so each stack gets unique names and Helm releases / PVCs don't collide in a shared namespace. Explicit overrides are preserved. See `_STACK_SCOPED_DEFAULTS` for the full list.
+8. **Per-stack identity resolution** (`_resolve_per_stack_identity`) -- Multi-stack scenarios (N >= 2) only. Auto-suffix shipped-default resource names (`storage.modelPvc.name`, `downloadJob.name`, `router.monitoring.secretName`) with `-{model_id_label}` so each stack gets unique names and Helm releases / PVCs don't collide in a shared namespace. Explicit overrides are preserved. See `_STACK_SCOPED_DEFAULTS` for the full list.
 9. **Custom command conflict warning** -- Warns when CLI `--models` won't propagate into hardcoded `customCommand` values.
 10. **Deploy method resolution** -- Apply CLI `--methods` override (`standalone` or `modelservice`). Only one may be active.
 11. **Monitoring resolution** -- Apply CLI `--monitoring` flag. Enables PodMonitor and metrics scraping.
@@ -156,16 +214,17 @@ In dry-run mode, unresolved fields produce warnings instead of errors.
 ```python
 @dataclass
 class StackErrors:
-    render_errors: list[str]       # Jinja2 template errors
-    yaml_errors: list[str]         # YAML validation errors
-    missing_fields: list[str]      # Missing required fields
-    validation_warnings: list[str] # Config schema warnings
+    render_errors: list[str]  # Jinja2 template errors
+    yaml_errors: list[str]  # YAML validation errors
+    missing_fields: list[str]  # Missing required fields
+    validation_warnings: list[str]  # Config schema warnings
+
 
 @dataclass
 class RenderResult:
-    global_errors: list[str]       # Errors not tied to a specific stack
-    stacks: dict[str, StackErrors] # Per-stack error accumulators
-    rendered_paths: list[Path]     # Successfully rendered stack directories
+    global_errors: list[str]  # Errors not tied to a specific stack
+    stacks: dict[str, StackErrors]  # Per-stack error accumulators
+    rendered_paths: list[Path]  # Successfully rendered stack directories
 ```
 
 ## Files

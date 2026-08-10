@@ -1,12 +1,16 @@
 """Step 06 -- Deploy Fast Model Actuation Controllers."""
 
+import json
+import shlex
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
+
+import yaml
 
 from llmdbenchmark import __version__
-from llmdbenchmark.executor.step import Step, StepResult, Phase
-from llmdbenchmark.executor.context import ExecutionContext
 from llmdbenchmark.executor.command import CommandExecutor
+from llmdbenchmark.executor.context import ExecutionContext
+from llmdbenchmark.executor.step import Phase, Step, StepResult
 
 
 class FMADeployStep(Step):
@@ -132,16 +136,42 @@ class FMADeployStep(Step):
                     f"Standalone deployment pods not ready: {wait_result.stderr}"
                 )
 
+        # Optionally pick a dedicated GPU node and label it, so the LPP and
+        # requester (which select on that label when launcherNodeSelection is
+        # enabled) land only there. Runs before applying the deployment.
+        # Returns the node's GPU count so we can size the requester replica
+        # count to it (one launcher/requester pair per GPU) after apply.
+        selected_gpu_count: int | None = None
+        if len(errors) == 0 and self._launcher_node_selection_enabled(plan_config):
+            selected_gpu_count = self._select_and_label_gpu_node(
+                context, cmd, plan_config, errors
+            )
+
         if len(errors) == 0:
             # Apply deployment
             result = cmd.kube("apply", "-f", str(deploy_yaml))
             if not result.success:
                 errors.append(f"Failed to apply fma deployment: {result.stderr}")
 
+        # Resize the rendered placeholders (launcherCount + requester replicas +
+        # ScaledObject ceiling) to the pinned node's GPU count -- one
+        # launcher/requester pair per GPU. Only when node selection yielded one.
+        if len(errors) == 0 and selected_gpu_count:
+            model_id_label = plan_config.get("model_id_label", "")
+            self._size_fma_to_gpu_count(
+                context,
+                cmd,
+                namespace,
+                model_id_label,
+                selected_gpu_count,
+                stack_path,
+                errors,
+            )
+
         if len(errors) == 0:
             resource_types = (
                 "InferenceServerConfig,LauncherConfig,"
-                "LauncherPopulationPolicy,ReplicaSet,pods"
+                "LauncherPopulationPolicy,deployment,replicaset,pods"
             )
             cmd.kube(
                 "get",
@@ -149,6 +179,57 @@ class FMADeployStep(Step):
                 "--namespace",
                 namespace,
             )
+
+        if len(errors) == 0:
+            # Wait for at least one launcher pod to be Bound (carrying the
+            # ISC labels propagated by the dual-pods-controller). Without
+            # this wait, standup returns immediately after the requester
+            # is Ready -- but the dual-pods-controller binds a launcher
+            # ASYNCHRONOUSLY (typically 30s to several minutes after
+            # requester Ready).
+            #
+            # Skip the wait when fma.requester.replicas == 0. When node
+            # selection resized the requester to the node's GPU count, use that
+            # effective count instead of the rendered placeholder.
+            requester_replicas = selected_gpu_count or (
+                plan_config.get("fma", {}).get("requester", {}).get("replicas", 0)
+            )
+            model_id_label = plan_config.get("model_id_label", "")
+            if requester_replicas == 0:
+                context.logger.log_info(
+                    "    | Skipping bound-launcher wait: "
+                    "fma.requester.replicas=0 (no requester pod to bind to)."
+                )
+            elif model_id_label:
+                label_selector = (
+                    f"llm-d.ai/inferenceServing=true,llm-d.ai/model={model_id_label}"
+                )
+                # How long to wait for the dual-pods-controller to bind a
+                # launcher and for its vLLM to start serving (labels appear
+                # only once serving). Configurable per-scenario via
+                # fma.boundLauncherTimeout; large models on slow storage can
+                # take well over the historical 600s default.
+                bound_launcher_timeout = int(
+                    self._resolve(
+                        plan_config,
+                        "fma.boundLauncherTimeout",
+                        default=600,
+                    )
+                )
+                wait_result = cmd.wait_for_pods(
+                    label=label_selector,
+                    namespace=namespace,
+                    timeout=bound_launcher_timeout,
+                    poll_interval=10,
+                    description=f"FMA bound launcher (model={model_id_label})",
+                )
+                if not wait_result.success:
+                    errors.append(
+                        f"FMA bound launcher pod did not become Ready in "
+                        f"ns/{namespace}: {wait_result.stderr}. The "
+                        f"dual-pods-controller may not have bound a "
+                        f"launcher to the requester yet."
+                    )
 
         self._propagate_standup_parameters(cmd, context, plan_config)
 
@@ -171,6 +252,429 @@ class FMADeployStep(Step):
             message=(f"FMA deployment applied from {stack_path.name}"),
             stack_name=stack_path.name,
         )
+
+    @staticmethod
+    def _launcher_node_selection(plan_config: dict) -> dict:
+        """The fma.launcherNodeSelection block, or {} (guards an explicit null)."""
+        return (plan_config.get("fma", {}) or {}).get("launcherNodeSelection", {}) or {}
+
+    @classmethod
+    def _launcher_node_selection_enabled(cls, plan_config: dict) -> bool:
+        """True when fma.launcherNodeSelection.enabled is set for this stack."""
+        return bool(cls._launcher_node_selection(plan_config).get("enabled", False))
+
+    @classmethod
+    def _node_label(cls, plan_config: dict) -> str:
+        """The node label key to use. `or` guards an explicit null/empty value
+        (the .get default only applies to a MISSING key, not an explicit null)."""
+        return (
+            cls._launcher_node_selection(plan_config).get("nodeLabel") or "fma-hotstart"
+        )
+
+    def _select_and_label_gpu_node(
+        self,
+        context: ExecutionContext,
+        cmd: CommandExecutor,
+        plan_config: dict,
+        errors: list[str],
+    ) -> int | None:
+        """Pick a dedicated GPU node and label it for FMA launcher selection.
+
+        A node qualifies only if it (a) advertises a single GPU product type
+        (``nvidia.com/gpu.product`` label), (b) has FREE GPUs -- allocatable
+        minus the GPUs already requested by pods on the node (NOT
+        ``allocatable == capacity``, which ignores GPUs consumed by other
+        tenants), AND (c) has enough free CPU (allocatable minus committed CPU
+        requests) for one requester per free GPU plus a margin, so we don't pick
+        a CPU-saturated node (which triggers OpenShift's "CPU limits approaching
+        capacity" throttling warning). Nodes failing any check are skipped in
+        favor of another GPU node.
+
+        Among qualifying nodes, a fully-free (dedicated -- no GPUs claimed by
+        any other pod) node is preferred over a partially-used one, then most
+        free GPUs, then most free CPU. The chosen node is labeled
+        ``<nodeLabel>=true`` so the LauncherPopulationPolicy and requester
+        Deployment -- which select on that label when launcherNodeSelection is
+        enabled -- land only there.
+
+        Returns the selected node's FREE GPU count (so the caller sizes the
+        launcher/requester counts to it -- one requester per free GPU), or
+        ``None`` if no node qualified (fatal error appended, standup fails).
+        """
+        node_label = self._node_label(plan_config)
+
+        # In dry-run, `kube` short-circuits to empty stdout; force the read so
+        # node selection can actually inspect the cluster. Skip entirely if the
+        # executor is in dry-run and cannot reach a cluster.
+        result = cmd.kube("get", "nodes", "-o", "json", check=False, force=True)
+        if not result.success or not (result.stdout or "").strip():
+            errors.append(
+                "FMA launcher node selection is enabled but listing cluster "
+                f"nodes failed: {result.stderr or 'no output from get nodes'}"
+            )
+            return None
+
+        try:
+            nodes = json.loads(result.stdout).get("items", [])
+        except (ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"Failed to parse `get nodes -o json`: {exc}")
+            return None
+
+        # Sum CPU + GPU requests of all non-terminal pods per node. A node's
+        # .status.allocatable is TOTAL capacity and does NOT drop as pods consume
+        # the resource, so real headroom is allocatable - committed.
+        committed = self._committed_resources_by_node(cmd, errors)
+        if committed is None:
+            return None
+
+        gpu_resource = "nvidia.com/gpu"
+        gpu_product_label = "nvidia.com/gpu.product"
+        # Reserve one CPU per GPU (each requester requests ~1 CPU) plus a margin
+        # so the node is not driven to its CPU limit.
+        cpu_margin_m = 2000  # 2 cores of slack
+        # (is_dedicated, free_gpu, free_cpu_m, node_name, product)
+        candidates = []
+        for node in nodes:
+            meta = node.get("metadata", {}) or {}
+            status = node.get("status", {}) or {}
+            name = meta.get("name", "")
+            labels = meta.get("labels", {}) or {}
+            product = labels.get(gpu_product_label)
+            if not name or not product:
+                continue  # not a (single-type) GPU node
+
+            allocatable = status.get("allocatable", {}) or {}
+            node_committed = committed.get(name, {"cpu_m": 0, "gpu": 0})
+            try:
+                alloc_gpu = int(allocatable.get(gpu_resource, 0))
+            except (TypeError, ValueError):
+                continue
+
+            # (a) single GPU type; (b) GPUs actually FREE = allocatable minus
+            # GPUs already requested by pods on this node (NOT allocatable ==
+            # capacity, which ignores current consumption by other tenants).
+            free_gpu = alloc_gpu - node_committed["gpu"]
+            if free_gpu <= 0:
+                if alloc_gpu > 0:
+                    context.logger.log_info(
+                        f"    | Skipping GPU node {name}: no free GPUs "
+                        f"({node_committed['gpu']}/{alloc_gpu} already in use)"
+                    )
+                continue
+
+            # (c) enough free CPU: allocatable - committed >= 1 CPU/GPU + margin.
+            alloc_cpu_m = self._cpu_to_millicores(allocatable.get("cpu"))
+            free_cpu_m = alloc_cpu_m - node_committed["cpu_m"]
+            needed_cpu_m = free_gpu * 1000 + cpu_margin_m
+            if free_cpu_m < needed_cpu_m:
+                context.logger.log_info(
+                    f"    | Skipping GPU node {name}: insufficient free CPU "
+                    f"({free_cpu_m}m free < {needed_cpu_m}m needed for {free_gpu} "
+                    "requesters + margin)"
+                )
+                continue
+
+            # Dedicated = no GPUs on this node are claimed by any pod, so FMA
+            # gets the whole node to itself (preferred for a clean hotstart run).
+            is_dedicated = node_committed["gpu"] == 0
+            candidates.append((is_dedicated, free_gpu, free_cpu_m, name, product))
+
+        if not candidates:
+            errors.append(
+                "No target GPU node available for FMA launcher node selection: "
+                "need a node whose GPUs are all one type "
+                f"({gpu_product_label} present) with FREE GPUs (allocatable minus "
+                "GPUs already requested by other pods) AND enough free CPU for "
+                "one requester per free GPU plus margin. All GPU nodes are "
+                "currently occupied."
+            )
+            return None
+
+        # Prefer a fully-free (dedicated) node, then most free GPUs, then most
+        # free CPU; deterministic tie-break by name. `is_dedicated` True sorts
+        # first (not c[0] negated -> use `not`).
+        candidates.sort(key=lambda c: (not c[0], -c[1], -c[2], c[3]))
+        is_dedicated, gpu_count, free_cpu_m, node_name, product = candidates[0]
+
+        # Best-effort: clear the label from any node that still carries it (from
+        # a crashed run or skipped teardown) so exactly ONE node ends up
+        # labeled. `<key>-` removes the key; `-l <key>=true` restricts to nodes
+        # that have it (no-op when none). Not fatal -- labeling the chosen node
+        # below is what matters.
+        clear_result = cmd.kube(
+            "label",
+            "nodes",
+            "-l",
+            f"{node_label}=true",
+            f"{node_label}-",
+            check=False,
+        )
+        if not clear_result.success:
+            context.logger.log_warning(
+                f"    | Could not clear stale {node_label}=true labels before "
+                f"selecting {node_name}: {clear_result.stderr}"
+            )
+
+        label_result = cmd.kube(
+            "label",
+            "node",
+            node_name,
+            f"{node_label}=true",
+            "--overwrite",
+            check=False,
+        )
+        if not label_result.success:
+            errors.append(
+                f"Failed to label GPU node {node_name} with {node_label}=true: "
+                f"{label_result.stderr}"
+            )
+            return None
+
+        context.logger.log_info(
+            f"    | Selected {'dedicated ' if is_dedicated else ''}GPU node "
+            f"{node_name} ({gpu_count} free {product} GPU(s); {free_cpu_m}m free "
+            f"CPU{'' if is_dedicated else ', shared with other GPU workloads'}) "
+            f"for FMA launchers; labeled {node_label}=true"
+        )
+        return gpu_count
+
+    @staticmethod
+    def _cpu_to_millicores(value) -> int:
+        """Parse a k8s CPU quantity ("2", "0.5", "500m") into integer millicores."""
+        if value is None:
+            return 0
+        s = str(value).strip()
+        if not s:
+            return 0
+        try:
+            if s.endswith("m"):
+                return int(float(s[:-1]))
+            return int(float(s) * 1000)
+        except ValueError:
+            return 0
+
+    def _committed_resources_by_node(
+        self, cmd: CommandExecutor, errors: list[str]
+    ) -> dict[str, dict[str, int]] | None:
+        """Sum CPU (millicores) and GPU requests of scheduled, non-terminal pods
+        per node.
+
+        Returns ``{node_name: {"cpu_m": int, "gpu": int}}``, or ``None`` (with a
+        fatal error appended) if the pod list cannot be read. Needed because a
+        node's ``.status.allocatable`` is its TOTAL schedulable capacity and does
+        NOT decrease as pods consume the resource -- so real headroom is
+        ``allocatable - committed``, computed here.
+        """
+        result = cmd.kube(
+            "get", "pods", "--all-namespaces", "-o", "json", check=False, force=True
+        )
+        if not result.success or not (result.stdout or "").strip():
+            errors.append(
+                "FMA launcher node selection: could not list pods to compute "
+                f"resource headroom: {result.stderr or 'no output from get pods'}"
+            )
+            return None
+        try:
+            pods = json.loads(result.stdout).get("items", [])
+        except (ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"Failed to parse `get pods -o json`: {exc}")
+            return None
+
+        gpu_resource = "nvidia.com/gpu"
+        committed: dict[str, dict[str, int]] = {}
+        for pod in pods:
+            spec = pod.get("spec", {}) or {}
+            node = spec.get("nodeName")
+            if not node:
+                continue  # unscheduled -- not committed to any node
+            phase = (pod.get("status", {}) or {}).get("phase", "")
+            if phase in ("Succeeded", "Failed"):
+                continue  # terminal pods do not hold resources
+            acc = committed.setdefault(node, {"cpu_m": 0, "gpu": 0})
+            for container in spec.get("containers", []) or []:
+                res = container.get("resources", {}) or {}
+                requests = res.get("requests", {}) or {}
+                limits = res.get("limits", {}) or {}
+                acc["cpu_m"] += self._cpu_to_millicores(requests.get("cpu"))
+                # For extended resources like GPUs, k8s treats a limit as an
+                # implicit request; count whichever is present.
+                gpu_val = requests.get(gpu_resource, limits.get(gpu_resource))
+                try:
+                    acc["gpu"] += int(gpu_val) if gpu_val is not None else 0
+                except (TypeError, ValueError):
+                    pass
+        return committed
+
+    def _size_fma_to_gpu_count(
+        self,
+        context: ExecutionContext,
+        cmd: CommandExecutor,
+        namespace: str,
+        model_id_label: str,
+        gpu_count: int,
+        stack_path: Path,
+        errors: list[str],
+    ) -> None:
+        """Size FMA to the pinned node's GPU count (one launcher + one requester
+        per GPU) and persist that count to config.yaml for downstream steps.
+
+        Requesters are scaled up FIRST so they reserve the node's GPUs before the
+        slow launcher model load -- closing the window in which another tenant
+        could claim them (the contention the old TOCTOU re-check guarded against).
+        The LPP launcherCount is then set 1:1 so the populator binds one launcher
+        per requester. Also caps the KEDA ScaledObject at gpu_count. Hotstart-only
+        (runs only when node selection did).
+        """
+        if not model_id_label:
+            errors.append("Cannot size FMA to GPU count: model_id_label missing.")
+            return
+
+        deploy_name = f"fma-requester-{model_id_label}"
+        lpp_name = f"fma-{model_id_label}"
+
+        # (1) Scale requesters up FIRST: each requests a GPU + carries the node's
+        # nodeSelector, so they reserve all its GPUs now -- before the slow
+        # launcher load -- leaving no window for another tenant to grab them.
+        scale = cmd.kube(
+            "scale",
+            f"deployment/{deploy_name}",
+            f"--replicas={gpu_count}",
+            "--namespace",
+            namespace,
+            check=False,
+        )
+        if not scale.success:
+            errors.append(
+                f"Failed to scale {deploy_name} to {gpu_count} replicas "
+                f"(node GPU count): {scale.stderr}"
+            )
+            return
+
+        # (2) Set launcherCount to gpu_count (countForLauncher is a single-entry
+        # list, so patch index 0) -- one launcher per requester scheduled above.
+        lpp_patch_body = json.dumps(
+            [
+                {
+                    "op": "replace",
+                    "path": "/spec/countForLauncher/0/launcherCount",
+                    "value": gpu_count,
+                }
+            ]
+        )
+        lpp_patch = cmd.kube(
+            "patch",
+            f"launcherpopulationpolicy.fma.llm-d.ai/{lpp_name}",
+            "--namespace",
+            namespace,
+            "--type",
+            "json",
+            "-p",
+            # cmd.kube space-joins args into a shell command, so the JSON
+            # (quotes/spaces/braces) must be shell-quoted or the shell mangles it.
+            shlex.quote(lpp_patch_body),
+            check=False,
+        )
+        if not lpp_patch.success:
+            errors.append(
+                f"Failed to set LauncherPopulationPolicy {lpp_name} "
+                f"launcherCount to {gpu_count} (node GPU count): "
+                f"{lpp_patch.stderr}"
+            )
+            return
+
+        # (3) Wait for launchers to be Ready (the slow vLLM model load); the
+        # requesters already hold the GPUs, so nothing can be lost here.
+        launcher_wait = cmd.wait_for_pods(
+            label="app.kubernetes.io/component=launcher",
+            namespace=namespace,
+            timeout=900,
+            poll_interval=10,
+            description=f"FMA launchers ({gpu_count} expected, one per GPU)",
+        )
+        if not launcher_wait.success:
+            errors.append(
+                f"FMA launcher pods did not become Ready in ns/{namespace}: "
+                f"{launcher_wait.stderr}"
+            )
+            return
+
+        # Cap the ScaledObject at gpu_count so KEDA's HPA can't exceed the node's
+        # GPUs. It's applied later (step_09), so edit the rendered manifest here.
+        self._cap_scaledobject_max_replicas(context, stack_path, gpu_count)
+
+        # Persist the effective count so run-phase / smoketest steps that read
+        # fma.requester.replicas (e.g. the hot-start rollout wait and sleeping
+        # count) use it instead of the rendered placeholder.
+        self._persist_requester_replicas(context, stack_path, gpu_count)
+
+        context.logger.log_info(
+            f"    | Sized FMA to {gpu_count} launcher/requester pairs "
+            f"(LauncherPopulationPolicy {lpp_name} launcherCount + "
+            f"{deploy_name} replicas), one pair per GPU on the pinned node"
+        )
+
+    @staticmethod
+    def _cap_scaledobject_max_replicas(
+        context: ExecutionContext, stack_path: Path, gpu_count: int
+    ) -> None:
+        """Lower maxReplicaCount to min(rendered, gpu_count) in the rendered
+        28_wva-scaledobject manifest (clamping minReplicaCount to match) so
+        step_09 applies an object capped to node GPU capacity. Best-effort.
+        """
+        so_file = next(stack_path.glob("28_wva-scaledobject*"), None)
+        if so_file is None:
+            return
+        try:
+            with open(so_file, encoding="utf-8") as fh:
+                doc = yaml.safe_load(fh) or {}
+            spec = doc.get("spec")
+            if not isinstance(spec, dict):
+                return
+            # Lower-only: never raise the scenario's configured ceiling.
+            rendered_max = int(spec.get("maxReplicaCount", gpu_count) or gpu_count)
+            spec["maxReplicaCount"] = min(rendered_max, gpu_count)
+            if int(spec.get("minReplicaCount", 1) or 1) > spec["maxReplicaCount"]:
+                spec["minReplicaCount"] = spec["maxReplicaCount"]
+            with open(so_file, "w", encoding="utf-8") as fh:
+                yaml.safe_dump(doc, fh, default_flow_style=False, sort_keys=False)
+            context.logger.log_info(
+                f"    | Capped {so_file.name} maxReplicaCount="
+                f"{spec['maxReplicaCount']} (min of rendered {rendered_max} and "
+                f"pinned-node GPU count {gpu_count})"
+            )
+        except (OSError, yaml.YAMLError, ValueError) as exc:
+            context.logger.log_warning(
+                f"    | Could not cap ScaledObject maxReplicaCount to {gpu_count} "
+                f"in {so_file}: {exc}"
+            )
+
+    @staticmethod
+    def _persist_requester_replicas(
+        context: ExecutionContext, stack_path: Path, replicas: int
+    ) -> None:
+        """Write fma.requester.replicas into the stack's config.yaml so later
+        steps (loaded via _load_stack_config) read the pinned-node count.
+
+        Best-effort: a write failure is a warning, not fatal -- the live
+        Deployment is already scaled correctly; only downstream config-derived
+        counts would be stale.
+        """
+        config_file = stack_path / "config.yaml"
+        try:
+            with open(config_file, encoding="utf-8") as fh:
+                cfg = yaml.safe_load(fh) or {}
+            cfg.setdefault("fma", {}).setdefault("requester", {})["replicas"] = replicas
+            with open(config_file, "w", encoding="utf-8") as fh:
+                yaml.safe_dump(cfg, fh, default_flow_style=False, sort_keys=False)
+            context.logger.log_info(
+                f"    | Updated fma.requester.replicas={replicas} in "
+                f"{config_file.name} (pinned-node GPU count)"
+            )
+        except (OSError, yaml.YAMLError) as exc:
+            context.logger.log_warning(
+                f"    | Could not persist fma.requester.replicas={replicas} to "
+                f"{config_file}: {exc}"
+            )
 
     def _install_fma_crds(
         self, context: ExecutionContext, plan_config: dict, errors: list[str]
@@ -259,7 +763,7 @@ class FMADeployStep(Step):
             "tool_name": "llm-d-benchmark",
             "tool_version": __version__,
             "deployed_by": context.username or "unknown",
-            "deployed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "deployed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "cluster_name": context.cluster_name or "",
             "platform_type": context.platform_type,
             "namespace": context.namespace or "",

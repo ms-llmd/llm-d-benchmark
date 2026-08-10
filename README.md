@@ -3,6 +3,7 @@
 [![Release Status](https://img.shields.io/badge/Version-0.6-yellow)](https://github.com/llm-d/llm-d/releases)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 [![Join Slack](https://img.shields.io/badge/Join_Slack-blue?logo=slack)](https://llm-d.ai/slack)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-benchmark.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-benchmark?ref=badge_shield)
 
 [![.github/workflows/ci-nightly-benchmark-build-image.yaml](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-build-image.yaml/badge.svg)](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-build-image.yaml)
 
@@ -10,7 +11,7 @@
 |----------------------------|:-----------------------------:|:-----------------------------:|:---------:|
 | Standalone                 | [![.github/workflows/ci-nightly-benchmark-gke-standalone.yaml](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-gke-standalone.yaml/badge.svg)](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-gke-standalone.yaml) | [![.github/workflows/ci-nightly-benchmark-cks-standalone.yaml](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-cks-standalone.yaml/badge.svg)](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-cks-standalone.yaml) | [![.github/workflows/ci-nightly-benchmark-ocp-standalone.yaml](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-ocp-standalone.yaml/badge.svg)](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-ocp-standalone.yaml) |
 | Modelservice               | [![.github/workflows/ci-nightly-benchmark-gke-modelservice.yaml](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-gke-modelservice.yaml/badge.svg)](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-gke-modelservice.yaml) | [![.github/workflows/ci-nightly-benchmark-cks-modelservice.yaml](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-cks-modelservice.yaml/badge.svg)](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-cks-modelservice.yaml) | [![.github/workflows/ci-nightly-benchmark-ocp-modelservice.yaml](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-ocp-modelservice.yaml/badge.svg)](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-ocp-modelservice.yaml) |
-| Fast Model Actuator        | [![.github/workflows/ci-nightly-benchmark-gke-fma.yaml](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-gke-fma.yaml/badge.svg)](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-gke-fma.yaml) | [![.github/workflows/ci-nightly-benchmark-cks-fma.yaml](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-cks-fma.yaml/badge.svg)](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-cks-fma.yaml) | [![.github/workflows/ci-nightly-benchmark-ocp-fma.yaml](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-ocp-fma.yaml/badge.svg)](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-ocp-fma.yaml)|
+| Fast Model Actuation        | NA                            |                            NA | [![.github/workflows/ci-nightly-benchmark-ocp-fma.yaml](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-ocp-fma.yaml/badge.svg)](https://github.com/llm-d/llm-d-benchmark/actions/workflows/ci-nightly-benchmark-ocp-fma.yaml)|
 | Kustomize                  | NA                            |                             NA |        NA |
 
 This repository provides an automated workflow for benchmarking LLM inference using the `llm-d` stack. It includes tools for deployment, experiment execution, data collection, and teardown across multiple environments and deployment styles.
@@ -85,11 +86,11 @@ Two supported entry points depending on what you have access to:
 Run the full `standup -> smoketest -> run -> teardown` lifecycle on a local [Kind](https://kind.sigs.k8s.io/) cluster using a simulated inference engine. No accelerators, no cloud account, no cluster operator required. It uses the same `cicd/kind-sim` scenario that CI runs on every PR, so if it works locally it works in CI.
 
 - **Requirements:** Docker (or Podman/Colima) with **4 CPUs / 8 GiB RAM** and Python 3.11+
-- **Continue with Quick Start Guide:** [Quickstart on Kind](docs/quickstart.md)
+- **Continue with Quick Start Guide:** [Quickstart on Kind](docs/quickstart.md) (or try the simpler [EPP+KEDA Saturation Autoscaling](docs/workload-variant-autoscaler.md) guide)
 
 **🚀 Access to Compute cluster with Accelerators - full pipeline**
 
-Deploy against a Kubernetes cluster with Accelerators (OpenShift, GKE, EKS, CKS, etc.). Use one of the built-in specs or a well-lit path guide tuned for your hardware.
+Deploy against a Kubernetes cluster with Accelerators (OpenShift, GKE, EKS, CKS, Intel XPU, etc.). Use one of the built-in specs or a well-lit path guide tuned for your hardware.
 
 - **Requirements:** cluster admin to install infra  (or utilize an namespace admin with infra pre-installed), kubeconfig, compute nodes
 - **Continue below** with [Choose a specification](#choose-a-specification) and [Deploy and benchmark](#deploy-and-benchmark-full-pipeline)
@@ -99,13 +100,14 @@ Deploy against a Kubernetes cluster with Accelerators (OpenShift, GKE, EKS, CKS,
 Every command takes a `--spec` that selects the configuration for your cluster and GPU type. Specs are Jinja2 templates under `config/specification/`:
 
 ```bash
---spec gpu                              # NVIDIA GPU setup (config/specification/examples/gpu.yaml.j2)
---spec guides/optimized-baseline        # optimized baseline guide (formerly inference-scheduling)
---spec guides/workload-autoscaling      # optimized baseline + WVA autoscaling
---spec multi-model-wva                  # multi-model WVA: N pools, 1 gateway, 1 shared HTTPRoute
---spec pd-disaggregation               # prefill-decode disaggregation guide
+--spec gpu                                      # NVIDIA GPU setup (config/specification/examples/gpu.yaml.j2)
+--spec guides/optimized-baseline                # optimized baseline guide (formerly inference-scheduling)
+--spec guides/workload-autoscaling              # optimized baseline + WVA autoscaling
+--spec guides/epp-keda-saturation               # optimized baseline + direct EPP+KEDA autoscaling (no WVA controller)
+--spec multi-model-wva                          # multi-model WVA: N pools, 1 gateway, 1 shared HTTPRoute
+--spec pd-disaggregation                       # prefill-decode disaggregation guide
 ...
---spec /full/path/to/my-spec.yaml.j2    # custom spec
+--spec /full/path/to/my-spec.yaml.j2            # custom spec
 ```
 
 If the name is ambiguous or not found, the CLI lists all available specs and exits.
@@ -302,7 +304,7 @@ This uses the same harness, profile rendering, and result collection pipeline --
 > [!TIP]
 > `run` can also be used in debug mode (`-d` / `--debug`) which starts the harness pod with `sleep infinity` so you can exec into it and run commands interactively. See [this example](docs/tutorials/run/run_interactively_example.md).
 
-See [workload/README.md](workload/README.md) for the full experiment file format and all pre-built experiments, as well as advanced functionality.
+See [workload/README.md](workload/README.md) for the full experiment file format and all pre-built experiments, as well as advanced functionality. Worked examples for sweeping the EPP plugins config (`router.epp.pluginsConfigFile`) and the Kubernetes pod scheduler (`schedulerName`) -- including the kustomize propagation caveat and a dry-run verification one-liner -- live under [workload/README.md#sweeping-epp-plugins-config-routerepppluginsconfigfile](workload/README.md#sweeping-epp-plugins-config-routerepppluginsconfigfile).
 
 ## Next Steps
 
@@ -310,7 +312,7 @@ See [workload/README.md](workload/README.md) for the full experiment file format
 |-------|---------------|
 | Configuration system, defaults, scenarios, overrides | [config/README.md](config/README.md) |
 | Multi-model scenarios and the `shared:` block | [config/README.md](config/README.md#method-1-scenario-file-recommended-for-deployment-specific-config), [developer-guide](docs/developer-guide.md#multi-stack-scenarios-and-the-shared-block) |
-| Workload-variant-autoscaler, including multi-pool setup | [docs/workload-variant-autoscaler.md](docs/workload-variant-autoscaler.md) |
+| Workload-variant-autoscaler & EPP+KEDA saturation autoscaling | [docs/workload-variant-autoscaler.md](docs/workload-variant-autoscaler.md) |
 | Workloads, harnesses, profiles, experiments | [workload/README.md](workload/README.md) |
 | Standup phase, deployment methods, step details | [llmdbenchmark/standup/README.md](llmdbenchmark/standup/README.md) |
 | Smoketests, per-scenario validation, adding validators | [llmdbenchmark/smoketests/README.md](llmdbenchmark/smoketests/README.md) |
@@ -403,6 +405,8 @@ llmdbenchmark --version
 | `--non-admin` / `-i` | `LLMDBENCH_NON_ADMIN` | Skip admin-only steps |
 | `--dry-run` / `-n` | `LLMDBENCH_DRY_RUN` | Generate YAML without applying to cluster |
 | `--verbose` / `-v` | `LLMDBENCH_VERBOSE` | Enable debug logging |
+| `--cluster-config FILE` / `--cc` | | YAML of cluster-specific overrides (storage class, service account, ...), deep-merged on top of the scenario. Not committed -- each user keeps their own. See [openshift-setup.md](docs/openshift-setup.md). |
+| `--set KEY=VALUE` | `LLMDBENCH_SET` | Scenario override(s) as `[stack:]dotted.key=value`, comma-separated and repeatable. Deep-merged on top of the scenario, so a variant differing in a few fields needs no separate YAML file. Prefix with a stack name or glob to scope it in a multi-stack scenario. Available on every subcommand that renders templates. **Distinct from `run`/`experiment`'s `-o`, which overrides the workload profile — the two can be combined.** See [standup.md](docs/standup.md#overriding-scenario-values-from-the-cli---set). |
 | `--version` | | Show version |
 
 ### Plan Options
@@ -412,7 +416,7 @@ llmdbenchmark --version
 | `-p NS` | `LLMDBENCH_NAMESPACE` | Namespace(s) to render into the plan |
 | `-m MODELS` | `LLMDBENCH_MODELS` | Model to render the plan for |
 | `-t METHODS` | `LLMDBENCH_METHODS` | Deployment method (`standalone`, `modelservice`) |
-| `--gateway-class CLASS` | `LLMDBENCH_GATEWAY_CLASS` | Override the scenario's `gateway.className`. Accepted on the modelservice path: `epponly`, `istio`, `agentgateway`, `gke`, `data-science-gateway-class`. Ignored (any value accepted, including `none`) when the active deploy method is `kustomize`, `standalone`, or `fma`. |
+| `--gateway-class CLASS` | `LLMDBENCH_GATEWAY_CLASS` | Override the scenario's `gateway.className`. Accepted on the modelservice path: `none`, `epponly`, `istio`, `agentgateway`, `gke`, `data-science-gateway-class`. `none` exposes decode vLLM directly through a plain Service with no Gateway, EPP, Envoy, or routing proxy. Ignored when the active deploy method is `kustomize`, `standalone`, or `fma`. |
 | `-f` / `--monitoring` | | Enable monitoring in rendered templates (PodMonitor, EPP verbosity) |
 | `-k FILE` | `LLMDBENCH_KUBECONFIG` / `KUBECONFIG` | Kubeconfig path (used for cluster resource auto-detection) |
 
@@ -435,6 +439,8 @@ llmdbenchmark --version
 | `--affinity` | `LLMDBENCH_AFFINITY` | Node affinity / tolerations label |
 | `--annotations` | `LLMDBENCH_ANNOTATIONS` | Extra annotations for deployed resources |
 | `--wva` | `LLMDBENCH_WVA` | Workload Variant Autoscaler config |
+| `--epp-keda-saturation` | `LLMDBENCH_EPP_KEDA_SATURATION` | Direct EPP+KEDA saturation autoscaling (controller-free) |
+| `--set KEY=VALUE` | `LLMDBENCH_SET` | Scenario override(s) -- see [Global Options](#global-options). E.g. `--set kustomize.acceleratorBackend=gpu/sglang` or `--set 'llama-31-8b:decode.replicas=4'`. |
 
 ### Teardown Options
 
@@ -464,7 +470,7 @@ llmdbenchmark --version
 | `-f` / `--monitoring` | | Enable monitoring during standup and run phases |
 | `-l HARNESS` | `LLMDBENCH_HARNESS` | Harness name |
 | `-w PROFILE` | `LLMDBENCH_WORKLOAD` | Workload profile |
-| `-o OVERRIDES` | `LLMDBENCH_OVERRIDES` | Workload parameter overrides |
+| `-o OVERRIDES` | `LLMDBENCH_OVERRIDES` | **Workload profile** parameter overrides (`param=value,...`). For *scenario* overrides use the global `--set`; a `setup.treatments` value beats `--set` on the same key. |
 | `-r DEST` | `LLMDBENCH_OUTPUT` | Results destination (local, gs://, s3://) |
 | `-j N` | `LLMDBENCH_PARALLELISM` | Parallel harness pods |
 | `--wait-timeout N` | `LLMDBENCH_WAIT_TIMEOUT` | Seconds to wait for harness completion |
@@ -485,8 +491,9 @@ llmdbenchmark --version
 | `-k FILE` | `LLMDBENCH_KUBECONFIG` / `KUBECONFIG` | Kubeconfig path |
 | `-l HARNESS` | `LLMDBENCH_HARNESS` | Harness name (inference-perf, guidellm, vllm-benchmark) |
 | `-w PROFILE` | `LLMDBENCH_WORKLOAD` | Workload profile YAML |
+| `--workload-file-path FILE` | `LLMDBENCH_WORKLOAD_FILE_PATH` | Local workload profile file path |
 | `-e FILE` | `LLMDBENCH_EXPERIMENTS` | Experiment treatments YAML for parameter sweeping |
-| `-o OVERRIDES` | `LLMDBENCH_OVERRIDES` | Workload parameter overrides (param=value,...) |
+| `-o OVERRIDES` | `LLMDBENCH_OVERRIDES` | **Workload profile** parameter overrides (`param=value,...`). For *scenario* overrides use the global `--set` -- on `run` the two are separate flags. |
 | `-r DEST` | `LLMDBENCH_OUTPUT` | Results destination (local, gs://, s3://) |
 | `-j N` | `LLMDBENCH_PARALLELISM` | Parallel harness pods |
 | `-U URL` | `LLMDBENCH_ENDPOINT_URL` | Explicit endpoint URL (run-only mode) |
@@ -582,7 +589,7 @@ Both paths share steps 00-05 (infrastructure, namespaces, secrets) and step 10 (
 | 05 | harness_namespace | Per-stack | Harness namespace (PVC, data access pod, preprocess) |
 | 06 | standalone_deploy | Per-stack | Standalone vLLM deployment (Deployment + Service) |
 | 07 | deploy_setup | Per-stack | Helm repos and gateway infrastructure (helmfile) |
-| 08 | deploy_gaie | Per-stack | GAIE inference extension deployment |
+| 08 | deploy_router | Per-stack | llm-d router (EPP + provider resources) deployment |
 | 09 | deploy_modelservice | Per-stack | Modelservice deployment (helmfile + LWS) |
 | 10 | smoketest | Per-stack | Health check, inference test, per-scenario config validation |
 | 11 | inference_test | Per-stack | Sample inference request with demo curl command |
@@ -751,7 +758,7 @@ The analysis pipeline generates per-request distribution plots, cross-treatment 
 ## Dependencies
 
 - [llm-d-infra](https://github.com/llm-d-incubation/llm-d-infra.git)
-- [llm-d-modelservice](https://github.com/llm-d/llm-d-model-service.git)
+- [llm-d-modelservice v0.4.14](https://github.com/llm-d/llm-d-model-service.git)
 - [inference-perf](https://github.com/kubernetes-sigs/inference-perf)
 - [guidellm](https://github.com/vllm-project/guidellm.git)
 - [vllm](https://github.com/vllm-project/vllm.git)
@@ -773,13 +780,17 @@ The analysis pipeline generates per-request distribution plots, cross-treatment 
 - [Design of Experiments (DoE)](docs/doe.md)
 - [Lifecycle](docs/lifecycle.md)
 - [Run](docs/run.md)
+- [Agentic evaluation (eval-containers)](docs/agentic_eval.md)
+- [Running eval-containers on OpenShift](docs/openshift-setup.md)
 - [Standup](docs/standup.md)
 - [Kustomize deploy method](docs/kustomize.md)
+- [Benchmarking SGLang](docs/sglang.md)
+- [No-Kubernetes (nok8s) deploy method](docs/nok8s.md)
 - [Reproducibility](docs/reproducibility.md)
 - [Observability](docs/observability.md)
 - [Quickstart](docs/quickstart.md)
 - [Resource Requirements](docs/resource_requirements.md)
-- [WVA (Workload Variant Autoscaler)](docs/workload-variant-autoscaler.md)
+- [Autoscaling: WVA & EPP+KEDA Saturation](docs/workload-variant-autoscaler.md)
 - [Upstream Versions](docs/upstream-versions.md)
 - [FAQ](docs/faq.md)
 
@@ -818,3 +829,6 @@ See [tests/README.md](tests/README.md) for unit test details.
 ## License
 
 Licensed under Apache License 2.0. See [LICENSE](LICENSE) for details.
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-benchmark.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-benchmark?ref=badge_large)

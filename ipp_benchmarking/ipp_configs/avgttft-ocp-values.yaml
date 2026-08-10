@@ -1,0 +1,50 @@
+# IPP helm values: queue-ttft scorer (arm B of the A/B/C comparison).
+# queue-ttft-scorer (predicted effectiveTTFT per model) + max-score-picker, NO filter,
+# listModels = BOTH (model-selector takes candidates from listModels). Reads the
+# ttft-percentile datalayer. Image :tracechunk = the build with response-chunk
+# logging at TRACE (avoids the PVC log flood at --v=4).
+provider:
+  name: istio
+inferenceGateway:
+  name: infra-llmdbench-inference-gateway
+payloadProcessor:
+  image:
+    # Build the IPP yourself and supply your own registry, e.g.
+    #   --set payloadProcessor.image.registry=ghcr.io/<you>
+    # The tag below names the IPP build this arm requires.
+    tag: tracechunk           # reduced logs
+    pullPolicy: Always
+  flags:
+    v: 4                          # log per-model queue-ttft score
+  listModels:
+    - Qwen/Qwen3-8B
+    - Qwen/Qwen3-32B
+  customConfig:
+    plugins:
+    - type: body-field-to-header
+      parameters:
+        fieldName: model
+        headerName: X-Gateway-Model-Name
+    - type: base-model-to-header
+    - type: model-selector        # no model-name-filter; model-selector parses the array
+    - type: queue-ttft-scorer
+    - type: max-score-picker
+    - type: ttft-percentile-extractor
+    - type: model-config-datasource
+      parameters:
+        modelsPath: /config/models.json
+    profiles:
+    - name: default
+      plugins:
+        request:
+        - pluginRef: model-selector
+        - pluginRef: queue-ttft-scorer
+          weight: 1.0
+        - pluginRef: max-score-picker
+        - pluginRef: body-field-to-header
+        - pluginRef: base-model-to-header
+    datalayer:
+      extractors:
+      - pluginRef: ttft-percentile-extractor
+      datasources:
+      - pluginRef: model-config-datasource
