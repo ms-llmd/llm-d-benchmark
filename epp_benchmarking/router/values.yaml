@@ -1,0 +1,134 @@
+# Cluster-scoped router EPP -- llm-d-router-standalone chart (EPP + Envoy sidecar).
+# Its endpoints are peer clusters, not pods (llm-d/llm-d-router#2232).
+#
+# Two arms live here; pick one at install time:
+#   --set router.epp.pluginsConfigFile=mc-smart.yaml    (scored routing)
+#   --set router.epp.pluginsConfigFile=mc-random.yaml   (baseline, ~50/50)
+#
+# Expects a `mc-clusters` ConfigMap holding clusters.yaml, built from live
+# ClusterIPs -- see step 4 of the README.
+
+router:
+  # File discovery supplies the endpoints, so this selector is required by the
+  # chart but intentionally matches nothing.
+  modelServers:
+    matchLabels:
+      llm-d.ai/multicluster-router: "true"
+
+  epp:
+    image:
+      registry: ghcr.io/llm-d
+      repository: llm-d-router-endpoint-picker
+      # NOT v0.9.0 -- that release predates #2232 and has no multicluster plugins.
+      tag: main
+      pullPolicy: IfNotPresent
+
+    flags:
+      # Every multicluster variant is registered Alpha; EPP refuses to start otherwise.
+      allow-experimental-plugins: true
+
+    pluginsConfigFile: mc-smart.yaml
+
+    volumes:
+      - name: clusters
+        configMap:
+          name: mc-clusters
+    volumeMounts:
+      - name: clusters
+        mountPath: /etc/epp/clusters
+        readOnly: true
+
+    pluginsCustomConfig:
+      mc-smart.yaml: |
+        apiVersion: llm-d.ai/v1alpha1
+        kind: EndpointPickerConfig
+        plugins:
+          - type: multicluster-file-discovery
+            name: discovery
+            parameters:
+              path: /etc/epp/clusters/clusters.yaml
+          # Peer EPP metrics are plain HTTP in-cluster; the plugin defaults to https.
+          - type: multicluster-metrics-data-source
+            name: metrics-source
+            parameters:
+              scheme: http
+          - type: multicluster-metrics-extractor
+            name: metrics-extractor
+          - type: multicluster-kv-cache-utilization-scorer
+            name: kv-cache
+          - type: multicluster-queue-scorer
+            name: queue
+          - type: max-score-picker
+            name: picker
+          - type: single-profile-handler
+            name: profile-handler
+        # Without an explicit profile the scorers are never invoked -- an empty
+        # schedulingProfiles list passes validation and silently scores nothing.
+        schedulingProfiles:
+          - name: default
+            plugins:
+              - pluginRef: kv-cache
+                weight: 1
+              - pluginRef: queue
+                weight: 1
+              - pluginRef: picker
+        dataLayer:
+          discovery:
+            pluginRef: discovery
+          sources:
+            - pluginRef: metrics-source
+              extractors:
+                - pluginRef: metrics-extractor
+
+      mc-random.yaml: |
+        apiVersion: llm-d.ai/v1alpha1
+        kind: EndpointPickerConfig
+        plugins:
+          - type: multicluster-file-discovery
+            name: discovery
+            parameters:
+              path: /etc/epp/clusters/clusters.yaml
+          - type: multicluster-metrics-data-source
+            name: metrics-source
+            parameters:
+              scheme: http
+          - type: multicluster-metrics-extractor
+            name: metrics-extractor
+          - type: random-picker
+            name: picker
+          - type: single-profile-handler
+            name: profile-handler
+        # Same datalayer as the smart arm, so the only delta is the scoring.
+        schedulingProfiles:
+          - name: default
+            plugins:
+              - pluginRef: picker
+        dataLayer:
+          discovery:
+            pluginRef: discovery
+          sources:
+            - pluginRef: metrics-source
+              extractors:
+                - pluginRef: metrics-extractor
+
+    resources:
+      requests:
+        cpu: "100m"
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+  proxy:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+
+  monitoring:
+    prometheus:
+      auth:
+        enabled: false

@@ -1,0 +1,26 @@
+# Peer clusters for multicluster-file-discovery.
+#
+# `address` MUST be an IP: the router's Envoy resolves the picked endpoint via
+# ORIGINAL_DST from the x-gateway-destination-endpoint header, which is parsed
+# as IP:port. A Service DNS name here returns "no healthy upstream" (503).
+# `metricsAddress` is scraped by the EPP itself, so a DNS name would work there
+# -- it is kept an IP for symmetry.
+#
+# Hence the placeholders: ClusterIPs are not known until the leaves are stood
+# up. Render with envsubst, see step 4 of the README.
+#
+# `address` is the leaf's GATEWAY (where requests go); `metricsAddress` is that
+# leaf's EPP (where pool-aggregate metrics are read). Two different Services.
+endpoints:
+  - name: ${MC_A_NS}
+    address: ${MC_A_GW_IP}
+    port: "${MC_A_GW_PORT}"
+    labels:
+      metricsAddress: ${MC_A_EPP_IP}
+      metricsPort: "9090"
+  - name: ${MC_B_NS}
+    address: ${MC_B_GW_IP}
+    port: "${MC_B_GW_PORT}"
+    labels:
+      metricsAddress: ${MC_B_EPP_IP}
+      metricsPort: "9090"
