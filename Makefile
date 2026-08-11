@@ -352,6 +352,10 @@ SIM_COSTGUARD_GROUP_PROFILE ?= kind-costguard-group.yaml
 # Root under which each `sim-costguard-group-run` archives its collected logs
 # in a timestamped subdir. Override for CI, e.g. SIM_COSTGUARD_ARCHIVE_DIR=/tmp/ipp-runs.
 SIM_COSTGUARD_ARCHIVE_DIR   ?= collected-logs-archive
+# IPP values file to snapshot alongside each archived run so post-mortem
+# analysis can tell exactly what config was deployed. Matches the default in
+# ipp_deploy.sh; override to whatever you last passed to `make ipp-deploy`.
+SIM_IPP_VALUES              ?= ipp_benchmarking/ipp_configs/kind-costguard/costguard-kind-values.yaml
 
 # Full simulation environment (bootstrap + IPP deploy) as one command.
 # End state: Colima up, kind cluster stood up with two asymmetric sim stacks
@@ -416,12 +420,18 @@ models-patch-kind: ## Patch models.json in the payload-processor cm from IPP_VAL
 #      ("auto/fast" request-body model) against the two-sim stack.
 #   2. collect_logs.sh gathers payload-processor + related pod logs and the
 #      benchmark run's results/analysis dirs into ./collected-logs-<N>.
-#   3. The newly-created collected-logs-<N> is renamed into a timestamped
+#   3. Snapshot the IPP config alongside the logs so the archive is
+#      self-describing: SIM_IPP_VALUES on disk (ipp-values.yaml), the
+#      payload-processor ConfigMap as the pod saw it (ipp-configmap.yaml),
+#      and the running deployment's image tag (ipp-image.txt). Missing
+#      sources are skipped with a warning -- never fails the archive step.
+#   4. The newly-created collected-logs-<N> is renamed into a timestamped
 #      subdir of $(SIM_COSTGUARD_ARCHIVE_DIR)/, so runs never overwrite each
 #      other and can be diffed side-by-side.
 #
 # Override any of SIM_COSTGUARD_GROUP_SPEC / SIM_COSTGUARD_GROUP_PROFILE /
-# SIM_COSTGUARD_ARCHIVE_DIR on the command line if you're driving a variant.
+# SIM_COSTGUARD_ARCHIVE_DIR / SIM_IPP_VALUES on the command line if you're
+# driving a variant.
 .PHONY: sim-costguard-group-run
 sim-costguard-group-run: ## Run CostGuard group-routing harness, collect IPP logs, archive to timestamped dir
 	@printf "\033[33;1m==== Running llmdbenchmark for $(SIM_COSTGUARD_GROUP_SPEC) ($(SIM_COSTGUARD_GROUP_PROFILE)) ====\033[0m\n"
@@ -438,6 +448,20 @@ sim-costguard-group-run: ## Run CostGuard group-routing harness, collect IPP log
 	  exit 1; \
 	fi; \
 	src="collected-logs-$$new_max"; \
+	if [ -f "$(SIM_IPP_VALUES)" ]; then \
+	  cp "$(SIM_IPP_VALUES)" "$$src/ipp-values.yaml"; \
+	else \
+	  echo "⚠️  SIM_IPP_VALUES=$(SIM_IPP_VALUES) not found; skipping ipp-values.yaml snapshot"; \
+	fi; \
+	if ! kubectl get cm $(SIM_RELEASE) -n $(SIM_NAMESPACE) -o yaml >"$$src/ipp-configmap.yaml" 2>/dev/null; then \
+	  rm -f "$$src/ipp-configmap.yaml"; \
+	  echo "⚠️  cm/$(SIM_RELEASE) not found in ns/$(SIM_NAMESPACE); skipping ipp-configmap.yaml snapshot"; \
+	fi; \
+	if ! kubectl get deploy $(SIM_RELEASE) -n $(SIM_NAMESPACE) \
+	     -o jsonpath='{.spec.template.spec.containers[0].image}' >"$$src/ipp-image.txt" 2>/dev/null; then \
+	  rm -f "$$src/ipp-image.txt"; \
+	  echo "⚠️  deploy/$(SIM_RELEASE) not found in ns/$(SIM_NAMESPACE); skipping ipp-image.txt snapshot"; \
+	fi; \
 	stamp="$$(date +%Y%m%dT%H%M%S)"; \
 	dest="$(SIM_COSTGUARD_ARCHIVE_DIR)/$${stamp}-costguard-group"; \
 	mkdir -p "$(SIM_COSTGUARD_ARCHIVE_DIR)"; \
