@@ -1,0 +1,17 @@
+# Single-endpoint cluster list, for the TTFT prediction-accuracy experiment.
+#
+# Predictions only exist inside the router EPP, so the load has to go through
+# the router -- but with two candidates the router splits the ladder between
+# them and neither model gets a clean sweep. With one candidate the scorer still
+# fits its curve and still logs predictedTTFT for every request; it just always
+# picks the same endpoint. So one model gets the whole ladder, idle to saturated.
+#
+# Same envsubst contract as clusters.yaml, using only the MC_A_* variables --
+# point those at whichever leaf you are calibrating.
+endpoints:
+  - name: ${MC_A_NS}
+    address: ${MC_A_GW_IP}
+    port: "${MC_A_GW_PORT}"
+    labels:
+      metricsAddress: ${MC_A_EPP_IP}
+      metricsPort: "9090"

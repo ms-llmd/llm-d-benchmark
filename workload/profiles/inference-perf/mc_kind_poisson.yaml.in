@@ -1,0 +1,61 @@
+# Saturating Poisson ladder for the Kind multi-cluster routing experiment.
+#
+# Open-loop, always. A closed-loop client only sends a new request once an old
+# one returns, so it self-throttles: no backlog forms, queue depth and KV stay
+# near zero however slow the leaves get, and the multicluster scorers -- which
+# read exactly those -- tie on every arm. Offering a fixed rate is what makes a
+# falling-behind leaf visible.
+#
+# Sized for the slowed sims (--time-to-first-token=2000 --inter-token-latency=100
+# --max-num-seqs=2). Each pod serves 2 at a time at ~5.2s each, so a pod is
+# ~0.385 req/s and the 1+3 fleet is ~1.54 req/s. Split evenly, the 1-pod leaf is
+# the first to break, at ~0.77 req/s offered -- the ladder crosses that early
+# and keeps climbing, so the scored arms have room to show they can carry more
+# than the even split can.
+#
+# `interval: 0` carries each rung's backlog into the next; the descent is not
+# decoration, since a router that only sheds load one way looks correct on the
+# way up.
+#
+# Prompts stay short because the sim scenario pins maxModelLen: 1024.
+load:
+  type: poisson
+  interval: 0
+  stages:
+    - {rate: 0.5, duration: 120}
+    - {rate: 1.0, duration: 120}
+    - {rate: 1.5, duration: 120}
+    - {rate: 2.5, duration: 120}
+    - {rate: 4.0, duration: 120}
+    - {rate: 2.5, duration: 120}
+    - {rate: 1.0, duration: 120}
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  pretrained_model_name_or_path: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+data:
+  type: random
+  input_distribution:
+    min: 128
+    max: 256
+    mean: 192
+    std: 32
+  output_distribution:
+    min: 16
+    max: 48
+    mean: 32
+    std: 8
+report:
+  request_lifecycle:
+    summary: true
+    per_stage: true
+    per_request: true
+storage:
+  local_storage:
+    path: /workspace

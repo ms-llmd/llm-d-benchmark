@@ -1,0 +1,55 @@
+# Saturation ladder for the TTFT prediction-accuracy experiment: one model,
+# one endpoint, load swept from idle to well past the knee.
+#
+# The point is not throughput but coverage. The scorer fits TTFT as a function
+# of an endpoint's in-flight count, so the ladder has to visit the whole range
+# of in-flight counts the curve claims to cover -- including past saturation,
+# where queueing dominates and the fit is extrapolating beyond its highest
+# measured point. On one H100 Qwen3-8B takes ~12 req/s, so this runs 2 -> 24.
+#
+# `interval: 0` lets each rung's backlog carry into the next, which widens the
+# in-flight range further rather than resetting it.
+#
+# 180s per rung: the observer's short window is the last 100 observations, so
+# even the 2 req/s rung contributes several full windows rather than measuring
+# its own warm-up.
+load:
+  type: poisson
+  interval: 0
+  stages:
+    - {rate: 2,  duration: 180}
+    - {rate: 4,  duration: 180}
+    - {rate: 8,  duration: 180}
+    - {rate: 12, duration: 180}
+    - {rate: 16, duration: 180}
+    - {rate: 20, duration: 180}
+    - {rate: 24, duration: 180}
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  pretrained_model_name_or_path: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+data:
+  type: random
+  # Far more distinct prompts than the other profiles use. At total_count: 200
+  # a 15k-request ladder reuses every prompt ~75 times, so prefix-cache hits
+  # make prefill nearly free and TTFT stops reflecting the load it is supposed
+  # to be a function of.
+  input_distribution:  {min: 1024, max: 4096, mean: 2048, std_dev: 512, total_count: 4000}
+  output_distribution: {min: 128,  max: 512,  mean: 256,  std_dev: 64,  total_count: 4000}
+report:
+  request_lifecycle:
+    summary: true
+    per_stage: true
+    # Off on purpose. Predicted and actual both come from the EPP log, so the
+    # multi-GB per-request dump buys nothing here -- and collecting it is what
+    # hung two earlier runs.
+    per_request: false
+storage:
+  local_storage:
+    path: /workspace

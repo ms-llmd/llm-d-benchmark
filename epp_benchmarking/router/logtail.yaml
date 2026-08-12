@@ -1,0 +1,69 @@
+# Complete capture of the router EPP's routing decisions at --v=4.
+#
+# Two things make this hard, and the filter is what solves both:
+#
+#  - At --v=4 the EPP logs once per response body chunk, so 256-token outputs
+#    put an arm into the millions of lines. kubelet rotates the container log at
+#    10Mi and `kubectl logs` only ever reads the current file, so a laptop-side
+#    read loses most of a run silently -- a 400-request Kind arm came back as
+#    250 routing decisions, and an in-cluster `logs -f` restart loop did worse.
+#  - Reading the node's rotated files directly does work on Kind but not on
+#    OpenShift: SELinux denies /var/log/pods even to a root container under
+#    hostmount-anyuid.
+#
+# So this follows the stream in-cluster and greps it down to the routing record
+# BEFORE writing. The interesting lines are a rounding error next to the chunk
+# flood, so the captured file stays small and the follower never falls behind.
+# `--tail=-1` on reconnect re-reads the whole current file rather than a time
+# window, so a rotation cannot open a gap; collect_epp_log.sh drops the repeats.
+#
+#   kubectl apply -n <router-ns> -f epp_benchmarking/router/logtail.yaml
+#   epp_benchmarking/tools/collect_epp_log.sh <router-ns> <out.log>
+#
+# Requires the router EPP to be running with --set router.epp.flags.v=4. The
+# selector below assumes the chart was installed as release `mc-router`; a
+# different release name needs the same edit here, or the log stays empty.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: epp-logtail}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: epp-logtail}
+rules:
+- {apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"]}
+- {apiGroups: [""], resources: ["pods/log"], verbs: ["get"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: epp-logtail}
+subjects: [{kind: ServiceAccount, name: epp-logtail}]
+roleRef: {kind: Role, name: epp-logtail, apiGroup: rbac.authorization.k8s.io}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: epp-logtail
+  labels: {app: epp-logtail}
+spec:
+  serviceAccountName: epp-logtail
+  restartPolicy: Always
+  containers:
+  - name: tail
+    image: ghcr.io/llm-d/llm-d-benchmark:v0.7.0
+    # Re-resolves the label each iteration, so it follows the EPP across the
+    # rollouts that switch arms. grep must be --line-buffered or matches sit in
+    # its buffer while the run finishes.
+    command: ["sh", "-c", "NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace);
+      mkdir -p /logs;
+      while true; do
+        kubectl logs -f --tail=-1 -l llm-d-router-gateway=mc-router-epp -c epp -n $NS --max-log-requests=5 2>/dev/null
+          | grep --line-buffered -E 'Completed running picker plugin successfully|ttft-aware score|ttft-observation|Calculated score|\"level\":\"(error|warn|dpanic|panic|fatal)\"'
+          >> /logs/epp.log;
+        sleep 1;
+      done"]
+    volumeMounts:
+    - {name: logs, mountPath: /logs}
+  volumes:
+  - name: logs
+    emptyDir: {}

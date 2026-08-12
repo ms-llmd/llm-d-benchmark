@@ -1,0 +1,54 @@
+# Poisson ladder for the 2+3 asymmetric-capacity routing experiment.
+#
+# Rates come from this repo's own measurement: the Qwen3-8B calibration ladder
+# put one H100 pod's knee between 12 and 16 req/s (7s median TTFT at 12, 65s at
+# 16). Call it ~12 req/s per pod, so a 2+3 layout is ~24 req/s on the small leaf,
+# ~36 on the large, ~60 for the fleet.
+#
+# The window that matters is 48 -> 60 req/s. Split evenly, the 2-pod leaf takes
+# half and breaks at 48 offered while the fleet still has a fifth of its capacity
+# spare; split in proportion to capacity (40/60), nothing breaks until 60. The
+# ladder crosses that whole window and comes back down.
+#
+# This layout is a harder test than the 1+3 one. There the right answer is 25/75
+# and a random picker's 50/50 is obviously wrong; here the right answer is 40/60,
+# close enough to even that a router can look roughly correct by accident. Read
+# the latency and throughput, not just the split.
+load:
+  type: poisson
+  interval: 0
+  stages:
+    - {rate: 12, duration: 180}
+    - {rate: 24, duration: 180}
+    - {rate: 36, duration: 180}
+    - {rate: 48, duration: 180}
+    - {rate: 60, duration: 180}
+    - {rate: 48, duration: 180}
+    - {rate: 24, duration: 180}
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  pretrained_model_name_or_path: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+data:
+  type: random
+  input_distribution:  {min: 1024, max: 4096, mean: 2048, std_dev: 512, total_count: 4000}
+  output_distribution: {min: 128,  max: 512,  mean: 256,  std_dev: 64,  total_count: 4000}
+report:
+  request_lifecycle:
+    summary: true
+    per_stage: true
+    # Off, and it must stay off at these rates. This ladder offers 45,360
+    # requests; holding a full per-request record for each OOM-killed the
+    # harness pod (exit 137) right at the end of a 33-minute run, losing the
+    # summary. The routing split survives regardless -- it comes from the leaf
+    # counters -- but throughput and p90 do not.
+    per_request: false
+storage:
+  local_storage:
+    path: /workspace

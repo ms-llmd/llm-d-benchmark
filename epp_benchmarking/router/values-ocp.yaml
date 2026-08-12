@@ -1,0 +1,31 @@
+# Sizing overlay for the OpenShift run. Apply AFTER values.yaml:
+#
+#   helm ... -f epp_benchmarking/router/values.yaml \
+#            -f epp_benchmarking/router/values-ocp.yaml
+#
+# Nothing about the routing changes -- plugins, image and mounts all come from
+# values.yaml. Only the resources do: its numbers are laptop-sized, while here
+# one Envoy carries the whole fleet's traffic and the EPP scrapes on the hot
+# path. These restore the chart's own defaults for the proxy.
+#
+# Every field is restated in full, including ones that look unchanged: helm
+# deep-merges the two files, so a key omitted here keeps values.yaml's value.
+# Dropping `cpu` from limits would silently leave the Envoy throttled at 1 core.
+router:
+  epp:
+    resources:
+      requests:
+        cpu: "2"
+        memory: 2Gi
+      limits:
+        cpu: "4"
+        memory: 4Gi
+
+  proxy:
+    resources:
+      requests:
+        cpu: "4"
+        memory: 8Gi
+      limits:
+        cpu: "8"
+        memory: 16Gi
