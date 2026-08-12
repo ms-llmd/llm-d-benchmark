@@ -1,0 +1,97 @@
+# cost-scorer (from the costaware package in IPP) + model-cost-extractor,
+# wired for the kind-sim-multi stack that ipp_deploy.sh stands up.
+#
+# This file is the authoritative values file consumed by:
+#   SCORER=costaware ipp_benchmarking/tools/ipp_deploy.sh
+#
+# The plugin list mirrors the CostGuard values file at
+#   ipp_benchmarking/ipp_configs/kind-costguard/costguard-kind-values.yaml
+# byte-for-byte except:
+#   * `type: costguard`      -> `type: cost-scorer`
+#   * `pluginRef: costguard` -> `pluginRef: cost-scorer`
+#
+# The type string is `cost-scorer` (per llm-d-inference-payload-processor
+# pkg/framework/plugins/modelselector/scorer/costaware/plugin.go:40, const
+# CostScorerType); the directory / package is named `costaware`. The plugin
+# is registered under `cost-scorer`, so that is what the request pipeline
+# must reference.
+#
+# How cost-scorer scores (see plugin.go Score()):
+#   * Reads model.GetAttributes().Get(pricing.TokenPricesAttributeKey), where
+#     model-cost-extractor is what puts the pricing attribute there. This is
+#     why model-cost-extractor is still required in the pipeline below.
+#   * Uses InputTokenPrice = inputPerMillion / 1e6 (chart auto-converts, so
+#     the on-disk `inputPerMillion` / `outputPerMillion` fields below stay
+#     the same as CostGuard's).
+#   * Score formula: 1 - price / sum(prices). Cheaper models get higher
+#     scores. Stateless: no epoch bookkeeping, no per-request centroids.
+#     A single-model candidate list gets a neutral 0.5.
+#
+# Why keep flags.v: 4 despite cost-scorer being stateless:
+#   model-cost-extractor still emits its per-request DEBUG log events
+#   ("request-cost-metadata observation") under v=4, so a post-mortem can
+#   still see which per-request costs entered the datalayer even though
+#   cost-scorer itself never accumulates them and does NOT emit the
+#   "epoch-end digest" line that CostGuard produces.
+payloadProcessor:
+  listModels:
+    - facebook/opt-125m
+    - facebook/opt-350m
+  # Runner verbosity. v=4 (= logutil.DEBUG in
+  # pkg/common/observability/logging/const.go) enables the DEBUG-gated
+  # per-request cost-metadata log events emitted by the
+  # request-cost-metadata extractor (IPP PR #269). Chart default is v=3;
+  # anything below 4 silences the DEBUG stream. Kept at 4 here so
+  # `model-cost-extractor` observations are visible in the pod log for
+  # post-mortem analysis, even though cost-scorer itself is stateless
+  # and does not emit epoch-end events.
+  flags:
+    v: 4
+  customConfig:
+    plugins:
+    - type: body-field-to-header
+      parameters:
+        fieldName: model
+        headerName: X-Gateway-Model-Name
+    - type: base-model-to-header
+    - type: model-selector
+    - type: model-group-name-filter
+    - type: cost-scorer
+    - type: max-score-picker
+    - type: model-cost-extractor
+    - type: model-config-datasource
+      parameters:
+        modelsPath: /config/models.json
+    profiles:
+    - name: default
+      plugins:
+        request:
+        - pluginRef: model-selector
+        - pluginRef: model-group-name-filter
+        - pluginRef: cost-scorer
+          weight: 1.0
+        - pluginRef: max-score-picker
+        - pluginRef: body-field-to-header
+        - pluginRef: base-model-to-header
+    datalayer:
+      extractors:
+      - pluginRef: model-cost-extractor
+      datasources:
+      - pluginRef: model-config-datasource
+  # Rendered by chart PR #277 into /config/models.json inside the pod.
+  # model-config-datasource reads this to populate the datastore's model
+  # set; the two entries here mirror listModels above and the BaseModel
+  # ConfigMaps applied by ipp_deploy.sh.
+  models:
+    models:
+      - name: facebook/opt-125m
+        pricing:
+          inputPerMillion: 0.1
+          outputPerMillion: 0.3
+      - name: facebook/opt-350m
+        pricing:
+          inputPerMillion: 0.5
+          outputPerMillion: 1.5
+    groups:
+      - name: fast
+        models: [facebook/opt-125m, facebook/opt-350m]

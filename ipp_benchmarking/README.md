@@ -233,9 +233,41 @@ individual invocations:
   is retained; add `colima delete default` to reclaim it.
 
 Defaults (`SIM_KIND_CLUSTER_NAME=ipp-e2e`, `SIM_NAMESPACE=llmdbench`,
-`SIM_SPEC=cicd/kind-sim-multi`, `SIM_RELEASE=payload-processor`) match what
-the underlying scripts use internally and can be overridden on the make
-command line.
+`SIM_SPEC=cicd/kind-sim-multi`, `SIM_RELEASE=payload-processor`,
+`SIM_SCORER=costguard`) match what the underlying scripts use internally and
+can be overridden on the make command line.
+
+**Choosing a scorer: `costguard` vs `costaware`.** The Kind sim environment
+supports two scorers behind a single `SIM_SCORER` selector. `ipp_deploy.sh`
+picks the matching values file at `ipp_configs/kind-<scorer>/<scorer>-kind-values.yaml`
+and Phase E verifies the correct plugin loaded in the pod.
+
+| Aspect | `costguard` (default) | `costaware` (cost-scorer) |
+|---|---|---|
+| Plugin type in values file | `costguard` | `cost-scorer` (the type registered by the `costaware` package) |
+| Score mechanism | Stateful: epoch centroids over per-request costs, explore/exploit | Stateless: `1 - price / sum(prices)` on input-token pricing |
+| Emits `epoch-end digest` in pod log | Yes | No (no epochs) |
+| Emits `request-cost-metadata observation` in pod log | Yes (via `model-cost-extractor`, gated on `flags.v: 4`) | Yes (same extractor — both values files keep `v: 4`) |
+| Values file | [`kind-costguard/costguard-kind-values.yaml`](./ipp_configs/kind-costguard/costguard-kind-values.yaml) | [`kind-costaware/costaware-kind-values.yaml`](./ipp_configs/kind-costaware/costaware-kind-values.yaml) |
+| Sim-run target | `make sim-costguard-group-run` | `make sim-costaware-group-run` |
+| Archive subdir suffix | `<ts>-costguard-group/` | `<ts>-costaware-group/` |
+
+Same scenario and workload profile drive both scorers (`cicd/kind-sim-multi-costguard-group` + `kind-costguard-group.yaml`, since the harness sends `model: "auto/fast"` regardless). Same archive root (`collected-logs-archive/`), so `ls collected-logs-archive/` shows costguard and costaware runs interleaved by timestamp — direct A/B comparison without hunting between directories.
+
+A/B workflow:
+
+```bash
+# costguard baseline
+make ipp-deploy IPP_PATH=... SIM_SCORER=costguard   # default; SIM_SCORER can be omitted
+make sim-costguard-group-run
+make ipp-undeploy
+
+# costaware comparison
+make ipp-deploy IPP_PATH=... SIM_SCORER=costaware
+make sim-costaware-group-run
+```
+
+The `models-patch-kind` target is scorer-agnostic — it patches the running pod's `models.json` from whichever values file is currently deployed. Override `IPP_VALUES=<path>` if you want to point it at a different file.
 
 **Exercising the CostGuard cost signal (large `max_tokens`).** The upstream
 `sanity_random.yaml` profile is a generic smoke test — it samples
