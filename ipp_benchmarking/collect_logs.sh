@@ -7,9 +7,22 @@ shopt -s nullglob
 
 NAMESPACE="${NAMESPACE:-llmdbench}"
 
+# SCORER labels the working dir so `sim-costguard-group-run` and
+# `sim-costaware-group-run` can produce structurally identical sibling
+# archives without stepping on each other's directory numbering. Accepted:
+# `costguard` (default) or `costaware`. Anything else fails loud.
+SCORER="${SCORER:-costguard}"
+case "$SCORER" in
+  costguard|costaware) ;;
+  *)
+    echo "❌ SCORER must be 'costguard' or 'costaware', got: '$SCORER'" >&2
+    exit 2
+    ;;
+esac
+
 id=1
-while [[ -d "./collected-logs-${id}" ]]; do (( id++ )); done
-LOG_DIR="./collected-logs-${id}"
+while [[ -d "./collected-logs-${SCORER}-${id}" ]]; do (( id++ )); done
+LOG_DIR="./collected-logs-${SCORER}-${id}"
 mkdir -p "${LOG_DIR}"
 
 for sel in \

@@ -1,11 +1,20 @@
 #!/opt/homebrew/bin/bash
 #
 # ipp_deploy.sh -- build a local IPP image, load it into the kind cluster,
-# render a CostGuard + model-cost-extractor values file, and helm-install the
+# render a scorer + model-cost-extractor values file, and helm-install the
 # payload-processor on top of an already-stood-up ipp_benchmarking cluster.
 #
 # Follows the phase/color/sleep conventions of mac_colima_bootstrap.sh so a
 # human can follow progress in the terminal.
+#
+# Scorer selection (SCORER env, default `costguard`):
+#   * `costguard` -- CostGuard scorer with epoch-based cost centroids.
+#                    Values file: ipp_configs/kind-costguard/costguard-kind-values.yaml
+#   * `costaware` -- cost-scorer plugin (stateless input-token pricing).
+#                    Values file: ipp_configs/kind-costaware/costaware-kind-values.yaml
+# The `model-cost-extractor` extractor is present under BOTH scorers -- costguard
+# consumes its per-request events for epoch bookkeeping; cost-scorer reads the
+# same TokenPricesAttributeKey the extractor populates.
 #
 # Preconditions:
 #   * mac_colima_bootstrap.sh has run successfully (kind cluster + standup +
@@ -18,6 +27,7 @@
 #     ./ipp_benchmarking/tools/ipp_deploy.sh
 #
 # Environment overrides (all optional):
+#   SCORER              costguard | costaware, default: costguard
 #   KIND_CLUSTER_NAME   kind cluster to target, default: ipp-e2e (must match
 #                       the bootstrap's KIND_CLUSTER_NAME)
 #   NAMESPACE           k8s namespace with the standup, default: llmdbench
@@ -25,15 +35,14 @@
 #                       default: ghcr.io/llm-d/llm-d-inference-payload-processor
 #   IPP_IMAGE_TAG       image tag the chart references, default: e2e (matches
 #                       IPP Makefile's E2E_IMAGE ?= $(IMAGE):e2e)
-#   IPP_VALUES          Helm values file for CostGuard + extractor, default:
-#                       $BUNDLE_DIR/ipp_configs/kind-costguard/costguard-kind-values.yaml
-#                       (auto-generated when missing; user overrides are
-#                       respected). The file carries both the CostGuard scorer
-#                       and the model-cost-extractor extractor -- no separate
+#   IPP_VALUES          Helm values file, default: scorer-specific path (see
+#                       above). Auto-generated when missing; user overrides
+#                       are respected. The file carries both the scorer and
+#                       the model-cost-extractor extractor -- no separate
 #                       values file is needed.
 #   RELEASE             Helm release name, default: payload-processor
 #
-# All generated artifacts live under ipp_benchmarking/ipp_configs/kind-costguard/
+# All generated artifacts live under ipp_benchmarking/ipp_configs/kind-<scorer>/
 # so nothing is written into the IPP repo checkout at $IPP_PATH -- $IPP_PATH is
 # used ONLY for reads (make image-kind, helm chart path).
 #
@@ -44,6 +53,15 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+SCORER="${SCORER:-costguard}"
+case "$SCORER" in
+  costguard|costaware) ;;
+  *)
+    echo "❌ SCORER must be 'costguard' or 'costaware', got: '$SCORER'" >&2
+    exit 2
+    ;;
+esac
+
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-ipp-e2e}"
 NAMESPACE="${NAMESPACE:-llmdbench}"
 IPP_IMAGE_REPO="${IPP_IMAGE_REPO:-ghcr.io/llm-d/llm-d-inference-payload-processor}"
@@ -84,19 +102,21 @@ show_help() {
   cat <<EOF
 Usage: IPP_PATH=/path/to/llm-d-inference-payload-processor $0 [-h|--help]
 
-Builds and deploys the payload-processor Helm chart with CostGuard +
-model-cost-extractor plugins into the kind cluster stood up by
-mac_colima_bootstrap.sh.
+Builds and deploys the payload-processor Helm chart with the selected
+scorer (SCORER=costguard|costaware) plus the model-cost-extractor
+extractor into the kind cluster stood up by mac_colima_bootstrap.sh.
 
 Required environment:
   IPP_PATH             path to the llm-d-inference-payload-processor checkout
 
 Optional environment (defaults in parentheses):
+  SCORER               scorer to deploy               (costguard)
+                       Accepted: costguard | costaware
   KIND_CLUSTER_NAME    kind cluster name              (ipp-e2e)
   NAMESPACE            k8s namespace                  (llmdbench)
   IPP_IMAGE_REPO       image repo the chart uses      (ghcr.io/llm-d/llm-d-inference-payload-processor)
   IPP_IMAGE_TAG        image tag the chart uses       (e2e)
-  IPP_VALUES           Helm values file               (ipp_configs/kind-costguard/costguard-kind-values.yaml)
+  IPP_VALUES           Helm values file               (ipp_configs/kind-\$SCORER/\$SCORER-kind-values.yaml)
   RELEASE              Helm release name              (payload-processor)
 
 Flags:
@@ -141,7 +161,8 @@ if [[ ! -d "$IPP_PATH/config/charts/payload-processor" ]]; then
   exit 1
 fi
 
-IPP_VALUES="${IPP_VALUES:-$BUNDLE_DIR/ipp_configs/kind-costguard/costguard-kind-values.yaml}"
+# Scorer-specific default. User-set IPP_VALUES wins (existing precedence).
+IPP_VALUES="${IPP_VALUES:-$BUNDLE_DIR/ipp_configs/kind-${SCORER}/${SCORER}-kind-values.yaml}"
 
 # Verify the kind cluster this script targets actually exists.
 if ! kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER_NAME"; then
@@ -166,6 +187,7 @@ if ! kubectl get svc "$GATEWAY_SVC" -n "$NAMESPACE" >/dev/null 2>&1; then
   exit 1
 fi
 
+echo -e "${GREEN}▶   SCORER:             $SCORER${NC}"
 echo -e "${GREEN}▶   IPP_PATH:           $IPP_PATH${NC}"
 echo -e "${GREEN}▶   KIND_CLUSTER_NAME:  $KIND_CLUSTER_NAME${NC}"
 echo -e "${GREEN}▶   NAMESPACE:          $NAMESPACE${NC}"
@@ -243,25 +265,39 @@ if [[ "$post_refs" != "$expected" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Phase C -- render CostGuard values file (only if missing)
+# Phase C -- render scorer values file (only if missing)
 # ---------------------------------------------------------------------------
 echo
-echo -e "${GREEN}▶ Phase C -- render CostGuard values file (if missing)...${NC}"
+echo -e "${GREEN}▶ Phase C -- render ${SCORER} values file (if missing)...${NC}"
 sleep 2
 
-# One authoritative values file: CostGuard scorer in the request pipeline,
+# One authoritative values file: the selected scorer in the request pipeline,
 # model-cost-extractor under datalayer.extractors. Both plugins configured
 # with default parameters (no explicit `parameters:` blocks). No second file
 # is needed -- Helm merges by replacing lists, so splitting them would only
 # invite clobbering.
+#
+# The type/pluginRef string is scorer-specific:
+#   costguard -> `costguard`
+#   costaware -> `cost-scorer` (per IPP costaware/plugin.go const CostScorerType)
 
 if [[ -f "$IPP_VALUES" ]]; then
   echo -e "${YELLOW}▶   $IPP_VALUES already exists -- reusing (delete it to regenerate).${NC}"
 else
   mkdir -p "$(dirname "$IPP_VALUES")"
-  cat > "$IPP_VALUES" <<'EOF'
-# Auto-generated by ipp_deploy.sh. CostGuard scorer + requestcostmetadata
-# extractor (both with default parameters), wired for the kind-sim-multi stack.
+  # SCORER_PLUGIN is the on-the-wire `type:`/`pluginRef:` string. For SCORER=
+  # costguard it is literally `costguard`; for SCORER=costaware it is
+  # `cost-scorer` (the plugin is registered under that name -- the package
+  # directory is called `costaware`, but the registered type is
+  # `cost-scorer`).
+  case "$SCORER" in
+    costguard) SCORER_PLUGIN=costguard ;;
+    costaware) SCORER_PLUGIN=cost-scorer ;;
+  esac
+  cat > "$IPP_VALUES" <<EOF
+# Auto-generated by ipp_deploy.sh (SCORER=${SCORER}).
+# ${SCORER_PLUGIN} scorer + model-cost-extractor (both with default parameters),
+# wired for the kind-sim-multi stack.
 # Delete this file to regenerate; edit it to customize.
 payloadProcessor:
   listModels:
@@ -269,9 +305,10 @@ payloadProcessor:
     - facebook/opt-350m
   # Runner verbosity. v=4 (= logutil.DEBUG) enables the DEBUG-gated
   # per-request cost-metadata log events emitted by the
-  # request-cost-metadata extractor (IPP PR #269) -- required for
-  # post-mortem CostGuard analysis. Chart default is v=3; anything below
-  # 4 silences the DEBUG stream.
+  # request-cost-metadata extractor (IPP PR #269). Chart default is v=3;
+  # anything below 4 silences the DEBUG stream. Kept at 4 under both
+  # scorers so model-cost-extractor observations are visible in the pod
+  # log for post-mortem analysis.
   flags:
     v: 4
   customConfig:
@@ -283,7 +320,7 @@ payloadProcessor:
     - type: base-model-to-header
     - type: model-selector
     - type: model-group-name-filter
-    - type: costguard
+    - type: ${SCORER_PLUGIN}
     - type: max-score-picker
     - type: model-cost-extractor
     - type: model-config-datasource
@@ -295,7 +332,7 @@ payloadProcessor:
         request:
         - pluginRef: model-selector
         - pluginRef: model-group-name-filter
-        - pluginRef: costguard
+        - pluginRef: ${SCORER_PLUGIN}
           weight: 1.0
         - pluginRef: max-score-picker
         - pluginRef: body-field-to-header
@@ -416,8 +453,14 @@ if ! logs=$(kubectl logs "$pod" -n "$NAMESPACE" 2>&1); then
   exit 1
 fi
 
+# Scorer-specific plugin name (as registered in the IPP plugin registry).
+case "$SCORER" in
+  costguard) SCORER_PLUGIN=costguard ;;
+  costaware) SCORER_PLUGIN=cost-scorer ;;
+esac
+
 missing=""
-for plugin in "costguard" "model-cost-extractor"; do
+for plugin in "$SCORER_PLUGIN" "model-cost-extractor"; do
   if ! grep -q -- "$plugin" <<<"$logs"; then
     missing="$missing $plugin"
   fi
@@ -428,7 +471,7 @@ if [[ -n "$missing" ]]; then
   echo "$logs"
   exit 1
 fi
-echo -e "${GREEN}▶   both plugins present in loaded config: costguard, model-cost-extractor${NC}"
+echo -e "${GREEN}▶   both plugins present in loaded config: ${SCORER_PLUGIN}, model-cost-extractor${NC}"
 
 # ---------------------------------------------------------------------------
 # Phase F -- banner
@@ -441,12 +484,13 @@ cat <<EOF
 
 $(printf "${GREEN}▶ IPP deploy complete.${NC}\n")
 
+  Scorer:           ${SCORER} (plugin type: ${SCORER_PLUGIN})
   Release:          ${RELEASE}
   Namespace:        ${NAMESPACE}
   Deployed image:   ${deployed_image}
   Values file:      ${IPP_VALUES}
   Gateway service:  ${GATEWAY_SVC} (ClusterIP, NodePort-exposed)
-  Plugins verified: costguard, model-cost-extractor
+  Plugins verified: ${SCORER_PLUGIN}, model-cost-extractor
 
   Send a completion through the Gateway from the mac (IPP now injects
   the model header, so the client no longer needs X-Gateway-Base-Model-Name).

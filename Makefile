@@ -345,6 +345,11 @@ SIM_NAMESPACE         ?= llmdbench
 SIM_SPEC              ?= cicd/kind-sim-multi
 SIM_RELEASE           ?= payload-processor
 
+# Scorer to deploy under ipp-deploy: `costguard` (default) or `costaware`.
+# Passed through to ipp_deploy.sh via SCORER; the script picks the matching
+# values file at ipp_configs/kind-<scorer>/<scorer>-kind-values.yaml.
+SIM_SCORER            ?= costguard
+
 # CostGuard group-routing evaluation (auto/fast). Overridable on the command
 # line if you author a variant scenario/profile pair.
 SIM_COSTGUARD_GROUP_SPEC    ?= cicd/kind-sim-multi-costguard-group
@@ -356,6 +361,19 @@ SIM_COSTGUARD_ARCHIVE_DIR   ?= collected-logs-archive
 # analysis can tell exactly what config was deployed. Matches the default in
 # ipp_deploy.sh; override to whatever you last passed to `make ipp-deploy`.
 SIM_IPP_VALUES              ?= ipp_benchmarking/ipp_configs/kind-costguard/costguard-kind-values.yaml
+
+# costaware (cost-scorer) group-routing evaluation. Structural sibling of the
+# SIM_COSTGUARD_* block above -- same scenario and profile (harness sends
+# `model: "auto/fast"` regardless of which scorer is deployed), different
+# archive-subdir suffix. Runs land in the same archive root so `ls
+# collected-logs-archive/` shows costguard + costaware runs interleaved by
+# timestamp for easy A/B comparison.
+SIM_COSTAWARE_GROUP_SPEC    ?= cicd/kind-sim-multi-costguard-group
+SIM_COSTAWARE_GROUP_PROFILE ?= kind-costguard-group.yaml
+SIM_COSTAWARE_ARCHIVE_DIR   ?= collected-logs-archive
+# costaware sibling of SIM_IPP_VALUES: values file to snapshot alongside each
+# archived costaware run.
+SIM_COSTAWARE_IPP_VALUES    ?= ipp_benchmarking/ipp_configs/kind-costaware/costaware-kind-values.yaml
 
 # Full simulation environment (bootstrap + IPP deploy) as one command.
 # End state: Colima up, kind cluster stood up with two asymmetric sim stacks
@@ -376,16 +394,21 @@ bootstrap-colima: ## Set up Colima, Kind cluster, and simulators
 
 # Install IPP into the already-stood-up namespace via ipp_deploy.sh (builds the
 # IPP image from $$IPP_PATH, side-loads it into kind, helm-installs the chart
-# with CostGuard values). Requires IPP_PATH to point at a checkout of
-# llm-d-inference-payload-processor.
+# with the SIM_SCORER-selected scorer's values file). Requires IPP_PATH to
+# point at a checkout of llm-d-inference-payload-processor.
+#
+# Select the scorer with SIM_SCORER on the command line:
+#   make ipp-deploy IPP_PATH=... SIM_SCORER=costguard   # default
+#   make ipp-deploy IPP_PATH=... SIM_SCORER=costaware
 .PHONY: ipp-deploy
-ipp-deploy: ## Install IPP (builds image from $$IPP_PATH, helm-installs the chart with CostGuard values)
-	@printf "\033[33;1m==== Running ipp_deploy.sh ====\033[0m\n"
+ipp-deploy: ## Install IPP (builds image from $$IPP_PATH, helm-installs the chart; SIM_SCORER selects scorer)
+	@printf "\033[33;1m==== Running ipp_deploy.sh (SCORER=$(SIM_SCORER)) ====\033[0m\n"
 	@if [ -z "$$IPP_PATH" ]; then \
 	  echo "❌ IPP_PATH is unset. Export it, e.g.: export IPP_PATH=/path/to/llm-d-inference-payload-processor"; \
 	  exit 1; \
 	fi
-	KIND_CLUSTER_NAME=$(SIM_KIND_CLUSTER_NAME) NAMESPACE=$(SIM_NAMESPACE) RELEASE=$(SIM_RELEASE) \
+	KIND_CLUSTER_NAME=$(SIM_KIND_CLUSTER_NAME) NAMESPACE=$(SIM_NAMESPACE) \
+	  RELEASE=$(SIM_RELEASE) SCORER=$(SIM_SCORER) \
 	  ./ipp_benchmarking/tools/ipp_deploy.sh
 
 # Undeploy IPP (Helm release only). Leaves the sim standup and Colima/kind
@@ -412,22 +435,24 @@ models-patch-kind: ## Patch models.json in the payload-processor cm from IPP_VAL
 # subsequent run does not overwrite them.
 #
 # Preconditions: `make sim-colima IPP_PATH=...` (or equivalent) has completed
-# and payload-processor is Running in ns/$(SIM_NAMESPACE). This target does
-# NOT install IPP -- run `make ipp-deploy` first if it isn't already.
+# and payload-processor is Running in ns/$(SIM_NAMESPACE) -- specifically with
+# CostGuard deployed (i.e. `make ipp-deploy SIM_SCORER=costguard`, the default).
+# This target does NOT install IPP.
 #
 # Flow:
 #   1. `llmdbenchmark run` fires the kind-costguard-group workload profile
 #      ("auto/fast" request-body model) against the two-sim stack.
-#   2. collect_logs.sh gathers payload-processor + related pod logs and the
-#      benchmark run's results/analysis dirs into ./collected-logs-<N>.
+#   2. collect_logs.sh (SCORER=costguard) gathers payload-processor + related
+#      pod logs and the benchmark run's results/analysis dirs into
+#      ./collected-logs-costguard-<N>.
 #   3. Snapshot the IPP config alongside the logs so the archive is
 #      self-describing: SIM_IPP_VALUES on disk (ipp-values.yaml), the
 #      payload-processor ConfigMap as the pod saw it (ipp-configmap.yaml),
 #      and the running deployment's image tag (ipp-image.txt). Missing
 #      sources are skipped with a warning -- never fails the archive step.
-#   4. The newly-created collected-logs-<N> is renamed into a timestamped
-#      subdir of $(SIM_COSTGUARD_ARCHIVE_DIR)/, so runs never overwrite each
-#      other and can be diffed side-by-side.
+#   4. The newly-created collected-logs-costguard-<N> is renamed into a
+#      timestamped subdir of $(SIM_COSTGUARD_ARCHIVE_DIR)/, so runs never
+#      overwrite each other and can be diffed side-by-side.
 #
 # Override any of SIM_COSTGUARD_GROUP_SPEC / SIM_COSTGUARD_GROUP_PROFILE /
 # SIM_COSTGUARD_ARCHIVE_DIR / SIM_IPP_VALUES on the command line if you're
@@ -437,17 +462,18 @@ sim-costguard-group-run: ## Run CostGuard group-routing harness, collect IPP log
 	@printf "\033[33;1m==== Running llmdbenchmark for $(SIM_COSTGUARD_GROUP_SPEC) ($(SIM_COSTGUARD_GROUP_PROFILE)) ====\033[0m\n"
 	llmdbenchmark --spec $(SIM_COSTGUARD_GROUP_SPEC) run \
 	  -l inference-perf -w $(SIM_COSTGUARD_GROUP_PROFILE)
-	@printf "\033[33;1m==== Collecting IPP post-mortem logs ====\033[0m\n"
-	@# Snapshot the highest existing collected-logs-<N> BEFORE running collect,
-	@# so we can identify the freshly-created dir without racing another run.
-	@existing_max="$$(ls -d collected-logs-* 2>/dev/null | sed -n 's/^collected-logs-\([0-9]\{1,\}\)$$/\1/p' | sort -n | tail -1)"; \
-	NAMESPACE=$(SIM_NAMESPACE) ./ipp_benchmarking/collect_logs.sh; \
-	new_max="$$(ls -d collected-logs-* 2>/dev/null | sed -n 's/^collected-logs-\([0-9]\{1,\}\)$$/\1/p' | sort -n | tail -1)"; \
+	@printf "\033[33;1m==== Collecting IPP post-mortem logs (SCORER=costguard) ====\033[0m\n"
+	@# Snapshot the highest existing collected-logs-costguard-<N> BEFORE
+	@# running collect, so we can identify the freshly-created dir without
+	@# racing another run.
+	@existing_max="$$(ls -d collected-logs-costguard-* 2>/dev/null | sed -n 's/^collected-logs-costguard-\([0-9]\{1,\}\)$$/\1/p' | sort -n | tail -1)"; \
+	NAMESPACE=$(SIM_NAMESPACE) SCORER=costguard ./ipp_benchmarking/collect_logs.sh; \
+	new_max="$$(ls -d collected-logs-costguard-* 2>/dev/null | sed -n 's/^collected-logs-costguard-\([0-9]\{1,\}\)$$/\1/p' | sort -n | tail -1)"; \
 	if [ -z "$$new_max" ] || [ "$$new_max" = "$$existing_max" ]; then \
-	  echo "❌ collect_logs.sh did not create a new collected-logs-<N> directory"; \
+	  echo "❌ collect_logs.sh did not create a new collected-logs-costguard-<N> directory"; \
 	  exit 1; \
 	fi; \
-	src="collected-logs-$$new_max"; \
+	src="collected-logs-costguard-$$new_max"; \
 	if [ -f "$(SIM_IPP_VALUES)" ]; then \
 	  cp "$(SIM_IPP_VALUES)" "$$src/ipp-values.yaml"; \
 	else \
@@ -467,6 +493,49 @@ sim-costguard-group-run: ## Run CostGuard group-routing harness, collect IPP log
 	mkdir -p "$(SIM_COSTGUARD_ARCHIVE_DIR)"; \
 	mv "$$src" "$$dest"; \
 	printf "\033[32;1m✅ sim-costguard-group-run: archived %s -> %s\033[0m\n" "$$src" "$$dest"
+
+# Structural sibling of sim-costguard-group-run for the costaware (cost-scorer)
+# scorer. Same three-phase flow (llmdbenchmark run -> collect_logs.sh ->
+# rename into timestamped archive), same scenario + profile (the harness is
+# scorer-agnostic), same archive root -- only the SCORER and the archive
+# subdir suffix differ. Keeping the two recipes step-for-step aligned is what
+# makes their outputs directly comparable in `collected-logs-archive/`.
+#
+# Preconditions: `make ipp-deploy SIM_SCORER=costaware IPP_PATH=...` has been
+# run and payload-processor is Running with the cost-scorer plugin loaded.
+.PHONY: sim-costaware-group-run
+sim-costaware-group-run: ## Run costaware (cost-scorer) group-routing harness, collect IPP logs, archive to timestamped dir
+	@printf "\033[33;1m==== Running llmdbenchmark for $(SIM_COSTAWARE_GROUP_SPEC) ($(SIM_COSTAWARE_GROUP_PROFILE)) ====\033[0m\n"
+	llmdbenchmark --spec $(SIM_COSTAWARE_GROUP_SPEC) run \
+	  -l inference-perf -w $(SIM_COSTAWARE_GROUP_PROFILE)
+	@printf "\033[33;1m==== Collecting IPP post-mortem logs (SCORER=costaware) ====\033[0m\n"
+	@existing_max="$$(ls -d collected-logs-costaware-* 2>/dev/null | sed -n 's/^collected-logs-costaware-\([0-9]\{1,\}\)$$/\1/p' | sort -n | tail -1)"; \
+	NAMESPACE=$(SIM_NAMESPACE) SCORER=costaware ./ipp_benchmarking/collect_logs.sh; \
+	new_max="$$(ls -d collected-logs-costaware-* 2>/dev/null | sed -n 's/^collected-logs-costaware-\([0-9]\{1,\}\)$$/\1/p' | sort -n | tail -1)"; \
+	if [ -z "$$new_max" ] || [ "$$new_max" = "$$existing_max" ]; then \
+	  echo "❌ collect_logs.sh did not create a new collected-logs-costaware-<N> directory"; \
+	  exit 1; \
+	fi; \
+	src="collected-logs-costaware-$$new_max"; \
+	if [ -f "$(SIM_COSTAWARE_IPP_VALUES)" ]; then \
+	  cp "$(SIM_COSTAWARE_IPP_VALUES)" "$$src/ipp-values.yaml"; \
+	else \
+	  echo "⚠️  SIM_COSTAWARE_IPP_VALUES=$(SIM_COSTAWARE_IPP_VALUES) not found; skipping ipp-values.yaml snapshot"; \
+	fi; \
+	if ! kubectl get cm $(SIM_RELEASE) -n $(SIM_NAMESPACE) -o yaml >"$$src/ipp-configmap.yaml" 2>/dev/null; then \
+	  rm -f "$$src/ipp-configmap.yaml"; \
+	  echo "⚠️  cm/$(SIM_RELEASE) not found in ns/$(SIM_NAMESPACE); skipping ipp-configmap.yaml snapshot"; \
+	fi; \
+	if ! kubectl get deploy $(SIM_RELEASE) -n $(SIM_NAMESPACE) \
+	     -o jsonpath='{.spec.template.spec.containers[0].image}' >"$$src/ipp-image.txt" 2>/dev/null; then \
+	  rm -f "$$src/ipp-image.txt"; \
+	  echo "⚠️  deploy/$(SIM_RELEASE) not found in ns/$(SIM_NAMESPACE); skipping ipp-image.txt snapshot"; \
+	fi; \
+	stamp="$$(date +%Y%m%dT%H%M%S)"; \
+	dest="$(SIM_COSTAWARE_ARCHIVE_DIR)/$${stamp}-costaware-group"; \
+	mkdir -p "$(SIM_COSTAWARE_ARCHIVE_DIR)"; \
+	mv "$$src" "$$dest"; \
+	printf "\033[32;1m✅ sim-costaware-group-run: archived %s -> %s\033[0m\n" "$$src" "$$dest"
 
 # Full teardown of everything sim-colima brought up: IPP release, sim stacks
 # (via llmdbenchmark teardown), kind cluster, and Colima VM (stopped, not
